@@ -33,6 +33,10 @@
   .pill.artist{background:rgba(212,175,106,0.18); color:#D4AF6A;}
   .pill.consumer{background:rgba(110,69,168,0.2); color:#b79bea;}
   .pill.verified{background:rgba(30,132,73,0.2); color:#7ee6a8;}
+  .pill.active{background:rgba(30,132,73,0.2); color:#7ee6a8;}
+  .pill.pending{background:rgba(212,175,106,0.18); color:#D4AF6A;}
+  .pill.expired{background:rgba(122,32,32,0.25); color:#f29a9a;}
+  .urgent{color:#f29a9a; font-weight:700;}
   .cover-thumb{width:44px; height:44px; border-radius:6px; background-size:cover; background-position:center; background-color:#222;}
 </style>
 </head>
@@ -45,6 +49,7 @@
 
   <div class="tabs">
     <button class="tab-btn active" data-tab="activate">💳 Activer un Pass</button>
+    <button class="tab-btn" data-tab="subs">💰 Argent à encaisser</button>
     <button class="tab-btn" data-tab="cert">🏅 Certifications</button>
     <button class="tab-btn" data-tab="tracks">🎵 Morceaux</button>
     <button class="tab-btn" data-tab="users">👥 Utilisateurs</button>
@@ -66,6 +71,13 @@
       <button class="primary" style="margin-top:14px; width:100%;" onclick="activate()">Activer et envoyer le code par email</button>
       <div id="act-msg"></div>
     </div>
+  </div>
+
+  <!-- ONGLET : ARGENT À ENCAISSER -->
+  <div class="pane" id="pane-subs">
+    <button class="secondary" onclick="loadSubscriptions()">Charger les abonnements</button>
+    <div id="subs-summary" style="margin-top:14px;"></div>
+    <div id="subs-list" style="margin-top:14px;"></div>
   </div>
 
   <!-- ONGLET 2 : CERTIFICATIONS -->
@@ -195,6 +207,50 @@
         const typePill = u.account_type === 'artist' ? '<span class="pill artist">Artiste</span>' : '<span class="pill consumer">Consommateur</span>';
         const verified = u.is_verified ? ' <span class="pill verified">✓</span>' : '';
         html += '<tr><td>'+name+verified+'</td><td>'+u.email+'</td><td>'+typePill+'</td><td>'+(u.plan||'—')+'</td><td>'+(u.subscription_status||'—')+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+new Date(u.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
+      });
+      html += '</table>';
+      list.innerHTML = html;
+    }catch(e){ list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function loadSubscriptions(){
+    const summary = document.getElementById('subs-summary');
+    const list = document.getElementById('subs-list');
+    summary.innerHTML = '';
+    list.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/subscriptions', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ list.innerHTML = '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>'; return; }
+      if(!data.subscriptions.length){ list.innerHTML = '<p class="muted">Aucun Pass payant pour le moment.</p>'; return; }
+
+      const pendingCount = data.subscriptions.filter(s=>s.subscription_status==='pending').length;
+      const activeCount = data.subscriptions.filter(s=>s.subscription_status==='active').length;
+      const soonCount = data.subscriptions.filter(s=> s.subscription_status==='active' && s.days_remaining!=null && s.days_remaining<=3).length;
+      summary.innerHTML = '<div class="row" style="gap:10px;">'
+        + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#D4AF6A;">'+pendingCount+'</div><div class="muted">en attente de paiement</div></div>'
+        + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#7ee6a8;">'+activeCount+'</div><div class="muted">Pass actifs</div></div>'
+        + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#f29a9a;">'+soonCount+'</div><div class="muted">expirent dans ≤3 jours</div></div>'
+        + '</div>';
+
+      let html = '<table><tr><th>Client</th><th>Email</th><th>Pass</th><th>Statut</th><th>Échéance</th></tr>';
+      data.subscriptions.forEach(s=>{
+        const name = s.account_type === 'artist' ? (s.artist_name || s.first_name) : (s.first_name+' '+s.last_name);
+        const planLabel = s.plan === 'artist' ? 'Pass Artiste' : 'Pass Consommateur';
+        let statusPill, echeance;
+        if(s.subscription_status === 'pending'){
+          statusPill = '<span class="pill pending">En attente</span>';
+          echeance = '<span class="muted">Paiement non confirmé</span>';
+        } else if(s.subscription_status === 'expired'){
+          statusPill = '<span class="pill expired">Expiré</span>';
+          echeance = '<span class="muted">Expiré le '+(s.subscription_expires_at ? new Date(s.subscription_expires_at).toLocaleDateString('fr-FR') : '—')+'</span>';
+        } else {
+          statusPill = '<span class="pill active">Actif</span>';
+          const d = s.days_remaining;
+          const urgent = (d!=null && d<=3);
+          echeance = '<span class="'+(urgent?'urgent':'')+'">'+(d!=null ? (d<=0 ? 'Expire aujourd\'hui' : d+' jour(s) restant(s)') : '—')+'</span>';
+        }
+        html += '<tr><td>'+name+'</td><td>'+s.email+'</td><td>'+planLabel+'</td><td>'+statusPill+'</td><td>'+echeance+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
