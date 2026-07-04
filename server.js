@@ -42,6 +42,20 @@ const insertClip = db.prepare(`
   VALUES (@artist_id, @title, @thumb_url, @video_url, @scheduled_release_at, @published)
 `);
 
+// Verrouillage automatique : si la date d'expiration est dépassée, on repasse le compte en "expired"
+// tout seul — même si personne n'a eu le temps d'intervenir manuellement. Appelée avant chaque lecture
+// de compte sensible (connexion, /api/me, listes admin), donc l'écart avec la vraie expiration ne peut
+// jamais dépasser le temps entre deux consultations.
+const expireOverdueSubscriptions = db.prepare(`
+  UPDATE users SET subscription_status = 'expired'
+  WHERE subscription_status = 'active'
+    AND subscription_expires_at IS NOT NULL
+    AND subscription_expires_at < datetime('now')
+`);
+function enforceSubscriptionExpiry() {
+  try { expireOverdueSubscriptions.run(); } catch (e) { /* ne bloque jamais une requête si ça échoue */ }
+}
+
 // ---------- Validation helpers ----------
 function isEmail(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v || ''); }
 function required(obj, fields) {
@@ -101,6 +115,7 @@ app.post('/api/register', async (req, res) => {
 
 // Connexion
 app.post('/api/login', async (req, res) => {
+  enforceSubscriptionExpiry();
   const { email, password } = req.body;
   const user = findUserByEmail.get(email || '');
   if (!user) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
@@ -112,6 +127,7 @@ app.post('/api/login', async (req, res) => {
 
 // Profil courant
 app.get('/api/me', authMiddleware, (req, res) => {
+  enforceSubscriptionExpiry();
   const user = findUserById.get(req.user.id);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
   res.json({ user: publicUser(withArtistStats(user)) });
@@ -298,6 +314,7 @@ app.post('/api/verification/request', authMiddleware, (req, res) => {
 // Liste de tous les utilisateurs inscrits (admin)
 app.get('/api/admin/users', (req, res) => {
   if (!checkAdminKey(req, res)) return;
+  enforceSubscriptionExpiry();
   const rows = db.prepare(`
     SELECT u.id, u.account_type, u.first_name, u.last_name, u.email, u.artist_name,
            u.plan, u.subscription_status, u.is_verified, u.verification_status, u.created_at,
@@ -307,6 +324,25 @@ app.get('/api/admin/users', (req, res) => {
     ORDER BY u.created_at DESC
   `).all();
   res.json({ users: rows });
+});
+
+// Onglet "Argent à encaisser" : tous les Pass payants (actifs ou en attente), avec échéance d'expiration.
+// Le verrouillage automatique (enforceSubscriptionExpiry) tourne juste avant, donc ce que l'admin voit
+// ici est toujours à jour — un abonnement expiré n'apparaît plus jamais comme "actif" par erreur.
+app.get('/api/admin/subscriptions', (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  enforceSubscriptionExpiry();
+  const rows = db.prepare(`
+    SELECT id, first_name, last_name, email, account_type, artist_name, plan,
+           subscription_status, subscription_started_at, subscription_expires_at,
+           CAST((julianday(subscription_expires_at) - julianday('now')) AS INTEGER) as days_remaining
+    FROM users
+    WHERE subscription_status IN ('active','pending','expired') AND plan != 'discovery'
+    ORDER BY
+      CASE subscription_status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+      subscription_expires_at ASC
+  `).all();
+  res.json({ subscriptions: rows });
 });
 
 app.get('/api/admin/verification/pending', (req, res) => {
@@ -368,6 +404,11 @@ setInterval(() => {
   db.prepare(`UPDATE tracks SET published = 1 WHERE published = 0 AND scheduled_release_at <= datetime('now')`).run();
   db.prepare(`UPDATE clips SET published = 1 WHERE published = 0 AND scheduled_release_at <= datetime('now')`).run();
 }, 60 * 1000);
+
+// ---------- Verrouillage automatique des abonnements expirés (en plus du contrôle à chaque connexion) ----------
+// Couvre aussi les comptes que personne ne consulte activement pendant un moment.
+enforceSubscriptionExpiry();
+setInterval(enforceSubscriptionExpiry, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`NUNI backend en écoute sur http://localhost:${PORT}`));
