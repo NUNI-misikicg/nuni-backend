@@ -50,6 +50,7 @@
   <div class="tabs">
     <button class="tab-btn active" data-tab="activate">💳 Activer un Pass</button>
     <button class="tab-btn" data-tab="subs">💰 Argent à encaisser</button>
+    <button class="tab-btn" data-tab="promo">🎁 Codes promo</button>
     <button class="tab-btn" data-tab="cert">🏅 Certifications</button>
     <button class="tab-btn" data-tab="tracks">🎵 Morceaux</button>
     <button class="tab-btn" data-tab="users">👥 Utilisateurs</button>
@@ -68,6 +69,8 @@
         <option value="90" selected>3 mois (90 jours)</option>
         <option value="365">1 an (365 jours)</option>
       </select>
+      <label>Code promo (optionnel)</label>
+      <input id="act-promo" type="text" placeholder="Ex : NUNI5" style="text-transform:uppercase;">
       <button class="primary" style="margin-top:14px; width:100%;" onclick="activate()">Activer et envoyer le code par email</button>
       <div id="act-msg"></div>
     </div>
@@ -78,6 +81,31 @@
     <button class="secondary" onclick="loadSubscriptions()">Charger les abonnements</button>
     <div id="subs-summary" style="margin-top:14px;"></div>
     <div id="subs-list" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- ONGLET : CODES PROMO -->
+  <div class="pane" id="pane-promo">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🎁 Créer un nouveau code</b>
+      <label>Code (ex : NUNI10)</label>
+      <input id="promo-code" type="text" placeholder="NUNI10" style="text-transform:uppercase;">
+      <label>Réduction (%)</label>
+      <input id="promo-pct" type="number" min="1" max="100" placeholder="10">
+      <label>S'applique à</label>
+      <select id="promo-plan">
+        <option value="">Les deux Pass</option>
+        <option value="consumer">Pass Consommateur uniquement</option>
+        <option value="artist">Pass Artiste uniquement</option>
+      </select>
+      <label>Nombre d'utilisations max</label>
+      <input id="promo-max" type="number" min="1" value="100">
+      <label>Expire le (optionnel)</label>
+      <input id="promo-expires" type="date">
+      <button class="primary" style="margin-top:14px; width:100%;" onclick="createPromo()">Créer le code</button>
+      <div id="promo-msg"></div>
+    </div>
+    <button class="secondary" onclick="loadPromoCodes()">Charger les codes existants</button>
+    <div id="promo-list" style="margin-top:14px;"></div>
   </div>
 
   <!-- ONGLET 2 : CERTIFICATIONS -->
@@ -120,16 +148,21 @@
     const email = document.getElementById('act-email').value.replace(/\s+/g, '');
     const plan = document.getElementById('act-plan').value;
     const durationDays = document.getElementById('act-duration').value;
+    const promoCode = document.getElementById('act-promo').value.trim();
     const msg = document.getElementById('act-msg');
     msg.innerHTML = '<div class="msg">Activation en cours…</div>';
     try{
       const res = await fetch('/api/admin/activate-by-email', {
         method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
-        body: JSON.stringify({ email, plan, durationDays: Number(durationDays) })
+        body: JSON.stringify({ email, plan, durationDays: Number(durationDays), promoCode: promoCode || undefined })
       });
       const data = await res.json();
       if(!res.ok){ msg.innerHTML = '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>'; return; }
-      msg.innerHTML = '<div class="msg ok">✅ '+data.message+'</div><div class="card" style="text-align:center; font-size:22px; letter-spacing:4px; font-weight:700; color:#D4AF6A;">'+data.access_code+'</div>';
+      let extra = '<div class="muted" style="margin-top:8px;">Montant encaissé : <b style="color:#7ee6a8;">'+data.amount_fcfa.toLocaleString('fr-FR')+' FCFA</b>';
+      if(data.promoApplied) extra += ' (code '+data.promoApplied+' appliqué)';
+      extra += '</div>';
+      if(data.promoWarning) extra += '<div class="muted" style="color:#f29a9a; margin-top:4px;">⚠️ Code promo ignoré : '+data.promoWarning+'</div>';
+      msg.innerHTML = '<div class="msg ok">✅ '+data.message+'</div><div class="card" style="text-align:center; font-size:22px; letter-spacing:4px; font-weight:700; color:#D4AF6A;">'+data.access_code+'</div>'+extra;
     }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
   }
 
@@ -227,16 +260,18 @@
       const pendingCount = data.subscriptions.filter(s=>s.subscription_status==='pending').length;
       const activeCount = data.subscriptions.filter(s=>s.subscription_status==='active').length;
       const soonCount = data.subscriptions.filter(s=> s.subscription_status==='active' && s.days_remaining!=null && s.days_remaining<=3).length;
-      summary.innerHTML = '<div class="row" style="gap:10px;">'
+      summary.innerHTML = '<div class="card" style="text-align:center; margin-bottom:10px;"><div style="font-size:26px; font-weight:700; color:#D4AF6A;">'+Number(data.total_collected_fcfa||0).toLocaleString('fr-FR')+' FCFA</div><div class="muted">total encaissé depuis le début</div></div>'
+        + '<div class="row" style="gap:10px;">'
         + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#D4AF6A;">'+pendingCount+'</div><div class="muted">en attente de paiement</div></div>'
         + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#7ee6a8;">'+activeCount+'</div><div class="muted">Pass actifs</div></div>'
         + '<div class="card" style="flex:1; text-align:center;"><div style="font-size:22px; font-weight:700; color:#f29a9a;">'+soonCount+'</div><div class="muted">expirent dans ≤3 jours</div></div>'
         + '</div>';
 
-      let html = '<table><tr><th>Client</th><th>Email</th><th>Pass</th><th>Statut</th><th>Échéance</th></tr>';
+      let html = '<table><tr><th>Client</th><th>Email</th><th>Pass</th><th>Montant</th><th>Statut</th><th>Échéance</th></tr>';
       data.subscriptions.forEach(s=>{
         const name = s.account_type === 'artist' ? (s.artist_name || s.first_name) : (s.first_name+' '+s.last_name);
         const planLabel = s.plan === 'artist' ? 'Pass Artiste' : 'Pass Consommateur';
+        const montant = s.last_amount_fcfa!=null ? Number(s.last_amount_fcfa).toLocaleString('fr-FR')+' FCFA' : '—';
         let statusPill, echeance;
         if(s.subscription_status === 'pending'){
           statusPill = '<span class="pill pending">En attente</span>';
@@ -250,11 +285,66 @@
           const urgent = (d!=null && d<=3);
           echeance = '<span class="'+(urgent?'urgent':'')+'">'+(d!=null ? (d<=0 ? 'Expire aujourd\'hui' : d+' jour(s) restant(s)') : '—')+'</span>';
         }
-        html += '<tr><td>'+name+'</td><td>'+s.email+'</td><td>'+planLabel+'</td><td>'+statusPill+'</td><td>'+echeance+'</td></tr>';
+        html += '<tr><td>'+name+'</td><td>'+s.email+'</td><td>'+planLabel+'</td><td>'+montant+'</td><td>'+statusPill+'</td><td>'+echeance+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
     }catch(e){ list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function createPromo(){
+    const code = document.getElementById('promo-code').value.trim();
+    const discount_pct = document.getElementById('promo-pct').value;
+    const applies_to_plan = document.getElementById('promo-plan').value;
+    const max_uses = document.getElementById('promo-max').value;
+    const expires_at = document.getElementById('promo-expires').value;
+    const msg = document.getElementById('promo-msg');
+    if(!code || !discount_pct){ msg.innerHTML = '<div class="msg err">❌ Code et pourcentage obligatoires.</div>'; return; }
+    msg.innerHTML = '<div class="msg">Création…</div>';
+    try{
+      const res = await fetch('/api/admin/promo-codes', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ code, discount_pct, applies_to_plan, max_uses, expires_at })
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>'; return; }
+      msg.innerHTML = '<div class="msg ok">✅ '+data.message+'</div>';
+      document.getElementById('promo-code').value = '';
+      document.getElementById('promo-pct').value = '';
+      loadPromoCodes();
+    }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function loadPromoCodes(){
+    const list = document.getElementById('promo-list');
+    list.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/promo-codes', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ list.innerHTML = '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>'; return; }
+      if(!data.codes.length){ list.innerHTML = '<p class="muted">Aucun code promo créé pour le moment.</p>'; return; }
+      let html = '<table><tr><th>Code</th><th>Réduction</th><th>Pass</th><th>Utilisations</th><th>Expire</th><th>Statut</th><th></th></tr>';
+      data.codes.forEach(c=>{
+        const planLabel = c.applies_to_plan === 'artist' ? 'Artiste' : (c.applies_to_plan === 'consumer' ? 'Consommateur' : 'Les deux');
+        const statusPill = c.active ? '<span class="pill active">Actif</span>' : '<span class="pill expired">Désactivé</span>';
+        const expLabel = c.expires_at ? new Date(c.expires_at).toLocaleDateString('fr-FR') : '—';
+        html += '<tr><td><b>'+c.code+'</b></td><td>-'+c.discount_pct+'%</td><td>'+planLabel+'</td><td>'+c.used_count+' / '+c.max_uses+'</td><td>'+expLabel+'</td><td>'+statusPill+'</td><td><button class="secondary" onclick="togglePromo(\''+c.code+'\')">'+(c.active?'Désactiver':'Réactiver')+'</button></td></tr>';
+      });
+      html += '</table>';
+      list.innerHTML = html;
+    }catch(e){ list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function togglePromo(code){
+    try{
+      const res = await fetch('/api/admin/promo-codes/toggle', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ code })
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      loadPromoCodes();
+    }catch(e){ alert('Erreur de connexion au serveur.'); }
   }
 
   window.addEventListener('load', ()=>{ const k = localStorage.getItem('nuniAdminKey'); if(k) document.getElementById('key').value = k; });

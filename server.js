@@ -41,6 +41,43 @@ const insertClip = db.prepare(`
   INSERT INTO clips (artist_id, title, thumb_url, video_url, scheduled_release_at, published)
   VALUES (@artist_id, @title, @thumb_url, @video_url, @scheduled_release_at, @published)
 `);
+const findPromoCode = db.prepare('SELECT * FROM promo_codes WHERE code = ?');
+const incrementPromoUsage = db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = ?');
+const insertPromoCode = db.prepare(`
+  INSERT INTO promo_codes (code, discount_pct, applies_to_plan, max_uses, expires_at)
+  VALUES (@code, @discount_pct, @applies_to_plan, @max_uses, @expires_at)
+`);
+const insertPayment = db.prepare(`
+  INSERT INTO payments (user_id, plan, duration_days, amount_fcfa, promo_code)
+  VALUES (@user_id, @plan, @duration_days, @amount_fcfa, @promo_code)
+`);
+
+// Prix de référence par Pass/durée (mêmes montants que ceux affichés sur le site).
+// Pour une durée non listée exactement, le prix est calculé au prorata du tarif à 90 jours,
+// pour ne jamais tomber sur un montant à 0 FCFA par erreur.
+const PRICE_TABLE = {
+  consumer: { 30: 650, 90: 1000, 365: 3500 },
+  artist:   { 90: 5000, 365: 10000 },
+};
+function basePriceFor(plan, durationDays) {
+  const table = PRICE_TABLE[plan] || PRICE_TABLE.consumer;
+  if (table[durationDays] != null) return table[durationDays];
+  const refDays = table[90] ? 90 : 365;
+  const ref = table[refDays] || Object.values(table)[0] || 0;
+  return Math.round((ref / refDays) * durationDays);
+}
+
+// Vérifie un code promo : existe, actif, pas expiré, pas épuisé, compatible avec le Pass choisi.
+function resolvePromoDiscount(code, plan) {
+  if (!code) return { pct: 0, valid: true, code: null };
+  const promo = findPromoCode.get(String(code).toUpperCase().trim());
+  if (!promo) return { pct: 0, valid: false, error: 'Code promo introuvable.' };
+  if (!promo.active) return { pct: 0, valid: false, error: 'Code promo désactivé.' };
+  if (promo.expires_at && new Date(promo.expires_at) < new Date()) return { pct: 0, valid: false, error: 'Code promo expiré.' };
+  if (promo.used_count >= promo.max_uses) return { pct: 0, valid: false, error: "Ce code a atteint sa limite d'utilisation." };
+  if (promo.applies_to_plan && promo.applies_to_plan !== plan) return { pct: 0, valid: false, error: "Ce code ne s'applique pas à ce Pass." };
+  return { pct: promo.discount_pct, valid: true, code: promo.code };
+}
 
 // Verrouillage automatique : si la date d'expiration est dépassée, on repasse le compte en "expired"
 // tout seul — même si personne n'a eu le temps d'intervenir manuellement. Appelée avant chaque lecture
@@ -146,8 +183,9 @@ app.post('/api/subscribe/request', authMiddleware, (req, res) => {
   });
 });
 
-// Fonction commune : génère le code, active l'abonnement et envoie l'email à l'admin.
-async function activateAndNotify(user, plan, durationDays) {
+// Fonction commune : génère le code, active l'abonnement, calcule le montant encaissé
+// (avec code promo éventuel), l'enregistre, et envoie l'email à l'admin.
+async function activateAndNotify(user, plan, durationDays, promoCode) {
   const access_code = generateAccessCode();
   activateSubscription.run({
     id: user.id,
@@ -155,10 +193,28 @@ async function activateAndNotify(user, plan, durationDays) {
     duration: `+${durationDays} days`,
     access_code,
   });
+
+  const promoResult = resolvePromoDiscount(promoCode, plan);
+  const base = basePriceFor(plan, durationDays);
+  const amount_fcfa = (promoResult.valid && promoResult.pct)
+    ? Math.round(base * (1 - promoResult.pct / 100))
+    : base;
+
+  insertPayment.run({
+    user_id: user.id, plan, duration_days: durationDays,
+    amount_fcfa, promo_code: (promoResult.valid && promoResult.code) ? promoResult.code : null,
+  });
+  if (promoResult.valid && promoResult.code) incrementPromoUsage.run(promoResult.code);
+
   const mailResult = await sendAccessCodeEmail({
     user, plan, accessCode: access_code, durationDays,
   });
-  return { access_code, emailSent: mailResult.sent, emailReason: mailResult.reason };
+  return {
+    access_code, emailSent: mailResult.sent, emailReason: mailResult.reason,
+    amount_fcfa,
+    promoApplied: (promoResult.valid && promoResult.code) ? promoResult.code : null,
+    promoWarning: (!promoResult.valid && promoCode) ? promoResult.error : null,
+  };
 }
 
 function checkAdminKey(req, res) {
@@ -174,16 +230,19 @@ function checkAdminKey(req, res) {
 // et envoie automatiquement un email récapitulatif à EMAIL_USER (nunimisiki@gmail.com).
 app.post('/api/admin/activate', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
-  const { userId, plan, durationDays } = req.body;
+  const { userId, plan, durationDays, promoCode } = req.body;
   const user = findUserById.get(userId);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
 
-  const result = await activateAndNotify(user, plan || user.plan || 'consumer', durationDays || 90);
+  const result = await activateAndNotify(user, plan || user.plan || 'consumer', durationDays || 90, promoCode);
   res.json({
     message: 'Abonnement activé.',
     access_code: result.access_code,
     emailSent: result.emailSent,
     sentTo: process.env.EMAIL_USER,
+    amount_fcfa: result.amount_fcfa,
+    promoApplied: result.promoApplied,
+    promoWarning: result.promoWarning,
   });
 });
 
@@ -191,18 +250,21 @@ app.post('/api/admin/activate', async (req, res) => {
 // (pas besoin de connaître l'id interne du client, juste son email d'inscription).
 app.post('/api/admin/activate-by-email', async (req, res) => {
   if (!checkAdminKey(req, res)) return;
-  const { email, plan, durationDays } = req.body;
+  const { email, plan, durationDays, promoCode } = req.body;
   if (!isEmail(email)) return res.status(400).json({ error: 'Email invalide.' });
 
   const user = findUserByEmail.get(email);
   if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
 
-  const result = await activateAndNotify(user, plan || user.plan || 'consumer', durationDays || 90);
+  const result = await activateAndNotify(user, plan || user.plan || 'consumer', durationDays || 90, promoCode);
   res.json({
     message: 'Abonnement activé.',
     access_code: result.access_code,
     emailSent: result.emailSent,
     sentTo: process.env.EMAIL_USER,
+    amount_fcfa: result.amount_fcfa,
+    promoApplied: result.promoApplied,
+    promoWarning: result.promoWarning,
   });
 });
 
@@ -333,16 +395,61 @@ app.get('/api/admin/subscriptions', (req, res) => {
   if (!checkAdminKey(req, res)) return;
   enforceSubscriptionExpiry();
   const rows = db.prepare(`
-    SELECT id, first_name, last_name, email, account_type, artist_name, plan,
-           subscription_status, subscription_started_at, subscription_expires_at,
-           CAST((julianday(subscription_expires_at) - julianday('now')) AS INTEGER) as days_remaining
-    FROM users
-    WHERE subscription_status IN ('active','pending','expired') AND plan != 'discovery'
+    SELECT u.id, u.first_name, u.last_name, u.email, u.account_type, u.artist_name, u.plan,
+           u.subscription_status, u.subscription_started_at, u.subscription_expires_at,
+           CAST((julianday(u.subscription_expires_at) - julianday('now')) AS INTEGER) as days_remaining,
+           (SELECT p.amount_fcfa FROM payments p WHERE p.user_id = u.id ORDER BY p.created_at DESC LIMIT 1) as last_amount_fcfa
+    FROM users u
+    WHERE u.subscription_status IN ('active','pending','expired') AND u.plan != 'discovery'
     ORDER BY
-      CASE subscription_status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
-      subscription_expires_at ASC
+      CASE u.subscription_status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+      u.subscription_expires_at ASC
   `).all();
-  res.json({ subscriptions: rows });
+  const totalRow = db.prepare('SELECT COALESCE(SUM(amount_fcfa),0) as total FROM payments').get();
+  res.json({ subscriptions: rows, total_collected_fcfa: totalRow.total });
+});
+
+// Codes promo — liste (admin)
+app.get('/api/admin/promo-codes', (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = db.prepare('SELECT * FROM promo_codes ORDER BY id DESC').all();
+  res.json({ codes: rows });
+});
+
+// Codes promo — création (admin)
+app.post('/api/admin/promo-codes', (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { code, discount_pct, applies_to_plan, max_uses, expires_at } = req.body;
+  if (!code || !discount_pct) return res.status(400).json({ error: 'Le code et le pourcentage de réduction sont obligatoires.' });
+  try {
+    insertPromoCode.run({
+      code: String(code).toUpperCase().trim(),
+      discount_pct: Number(discount_pct),
+      applies_to_plan: applies_to_plan || null,
+      max_uses: Number(max_uses) || 1,
+      expires_at: expires_at || null,
+    });
+  } catch (e) {
+    return res.status(400).json({ error: 'Ce code existe déjà.' });
+  }
+  res.json({ message: 'Code promo créé.' });
+});
+
+// Codes promo — activer/désactiver (admin)
+app.post('/api/admin/promo-codes/toggle', (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const promo = findPromoCode.get(String(req.body.code || '').toUpperCase().trim());
+  if (!promo) return res.status(404).json({ error: 'Code introuvable.' });
+  db.prepare('UPDATE promo_codes SET active = ? WHERE code = ?').run(promo.active ? 0 : 1, promo.code);
+  res.json({ message: promo.active ? 'Code désactivé.' : 'Code réactivé.' });
+});
+
+// Codes promo — vérification publique (utilisée par l'écran des Pass sur le site)
+app.post('/api/promo/validate', (req, res) => {
+  const { code, plan } = req.body;
+  const result = resolvePromoDiscount(code, plan);
+  if (!result.valid) return res.status(400).json({ error: result.error || 'Code promo invalide.' });
+  res.json({ discount_pct: result.pct, code: result.code });
 });
 
 app.get('/api/admin/verification/pending', (req, res) => {

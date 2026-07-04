@@ -79,6 +79,16 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(follower_id, artist_id)
   );
+
+  CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    plan TEXT NOT NULL,
+    duration_days INTEGER NOT NULL,
+    amount_fcfa INTEGER NOT NULL,
+    promo_code TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // Migration : ajoute la colonne de statut de certification si elle n'existe pas encore
