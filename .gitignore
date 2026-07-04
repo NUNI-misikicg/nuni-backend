@@ -5,3 +5,4 @@ node_modules/
 !.env.example
 nuni.db
 nuni.db-*
+nuni-backend/

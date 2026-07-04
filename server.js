@@ -11,7 +11,7 @@ const { sendAccessCodeEmail } = require('./mailer');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' })); // limite augmentée pour accepter les fichiers audio/pochette encodés
 app.use(express.static(path.join(__dirname, 'public'))); // sert /admin.html
 
 // ---------- Prepared statements ----------
@@ -230,6 +230,18 @@ app.post('/api/clips', authMiddleware, (req, res) => {
     scheduled_release_at: scheduledReleaseAt || null, published: isFuture ? 0 : 1,
   });
   res.status(201).json({ id: info.lastInsertRowid, scheduled: isFuture });
+});
+
+// Liste publique des morceaux publiés (tous artistes confondus)
+app.get('/api/tracks', (req, res) => {
+  const rows = db.prepare(`
+    SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url,
+           t.streams, t.likes, t.created_at, u.artist_name, u.is_verified
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= datetime('now'))
+    ORDER BY t.created_at DESC
+  `).all();
+  res.json({ tracks: rows });
 });
 
 // Liste publique des clips publiés (aléatoire, tous artistes confondus)
