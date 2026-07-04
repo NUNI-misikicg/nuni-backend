@@ -105,7 +105,7 @@
   });
 
   async function activate(){
-    const email = document.getElementById('act-email').value;
+    const email = document.getElementById('act-email').value.replace(/\s+/g, '');
     const plan = document.getElementById('act-plan').value;
     const durationDays = document.getElementById('act-duration').value;
     const msg = document.getElementById('act-msg');
@@ -154,7 +154,7 @@
   }
 
   async function resetCert(){
-    const email = document.getElementById('reset-email').value;
+    const email = document.getElementById('reset-email').value.trim();
     try{
       const res = await fetch('/api/admin/verification/reset', {
         method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
