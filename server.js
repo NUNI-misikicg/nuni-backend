@@ -419,6 +419,35 @@ app.get('/api/clips', (req, res) => {
   res.json({ clips: rows });
 });
 
+const findExistingClipView = db.prepare('SELECT id FROM clip_views WHERE clip_id = ? AND viewer_id = ?');
+
+// Enregistre une vraie vue de clip — même règle que les streams : une seule fois par spectateur,
+// jamais pour l'artiste qui regarde son propre clip, jamais sans être connecté.
+app.post('/api/clips/:id/view', (req, res) => {
+  const clipId = Number(req.params.id);
+  const clip = db.prepare('SELECT id, artist_id, views FROM clips WHERE id = ?').get(clipId);
+  if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
+
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const payload = token ? verifyToken(token) : null;
+  const viewerId = payload ? payload.id : null;
+
+  if (!viewerId) {
+    return res.json({ counted: false, reason: 'Connectez-vous pour que votre vue soit comptée.', views: clip.views });
+  }
+  if (viewerId === clip.artist_id) {
+    return res.json({ counted: false, reason: "Une vue de son propre clip n'est pas comptée.", views: clip.views });
+  }
+  if (findExistingClipView.get(clipId, viewerId)) {
+    return res.json({ counted: false, reason: 'Déjà compté lors de votre première vue de ce clip.', views: clip.views });
+  }
+
+  db.prepare('INSERT INTO clip_views (clip_id, viewer_id) VALUES (?, ?)').run(clipId, viewerId);
+  db.prepare('UPDATE clips SET views = views + 1 WHERE id = ?').run(clipId);
+  res.json({ counted: true, views: clip.views + 1 });
+});
+
 // ================= CERTIFICATION ARTISTE =================
 
 // L'artiste demande sa certification (badge vérifié)

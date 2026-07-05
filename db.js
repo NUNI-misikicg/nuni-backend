@@ -95,6 +95,20 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS plays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL REFERENCES tracks(id),
+    listener_id INTEGER REFERENCES users(id),
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS clip_views (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id INTEGER NOT NULL REFERENCES clips(id),
+    viewer_id INTEGER REFERENCES users(id),
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // Migration : ajoute la colonne de statut de certification si elle n'existe pas encore
