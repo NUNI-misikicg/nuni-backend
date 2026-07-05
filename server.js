@@ -34,8 +34,8 @@ const activateSubscription = db.prepare(`
   WHERE id = @id
 `);
 const insertTrack = db.prepare(`
-  INSERT INTO tracks (artist_id, title, album, genre, release_type, cover_url, audio_url, scheduled_release_at, published)
-  VALUES (@artist_id, @title, @album, @genre, @release_type, @cover_url, @audio_url, @scheduled_release_at, @published)
+  INSERT INTO tracks (artist_id, title, album, genre, release_type, cover_url, audio_url, lyrics, scheduled_release_at, published)
+  VALUES (@artist_id, @title, @album, @genre, @release_type, @cover_url, @audio_url, @lyrics, @scheduled_release_at, @published)
 `);
 const insertClip = db.prepare(`
   INSERT INTO clips (artist_id, title, thumb_url, video_url, scheduled_release_at, published)
@@ -286,12 +286,13 @@ app.post('/api/subscribe/redeem', authMiddleware, (req, res) => {
 
 app.post('/api/tracks', authMiddleware, (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
-  const { title, album, genre, releaseType, coverUrl, audioUrl, scheduledReleaseAt } = req.body;
+  const { title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
   const info = insertTrack.run({
     artist_id: req.user.id, title, album: album || null, genre: genre || null,
     release_type: releaseType || 'Single', cover_url: coverUrl || null, audio_url: audioUrl || null,
+    lyrics: lyrics || null,
     scheduled_release_at: scheduledReleaseAt || null, published: isFuture ? 0 : 1,
   });
   res.status(201).json({ id: info.lastInsertRowid, scheduled: isFuture });
@@ -312,7 +313,7 @@ app.post('/api/clips', authMiddleware, (req, res) => {
 // Liste publique des morceaux publiés (tous artistes confondus)
 app.get('/api/tracks', (req, res) => {
   const rows = db.prepare(`
-    SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url,
+    SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url, t.lyrics,
            t.streams, t.likes, t.created_at, u.id as artist_id, u.artist_name, u.is_verified
     FROM tracks t JOIN users u ON u.id = t.artist_id
     WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= datetime('now'))

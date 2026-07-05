@@ -1,8 +1,21 @@
 // auth.js — Utilitaires d'authentification NUNI
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const db = require('./db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_IN_PRODUCTION_' + Math.random();
+// Clé secrète stable : utilise la variable d'environnement JWT_SECRET si elle est configurée
+// (meilleure pratique), sinon en génère une seule fois et la conserve en base — pour ne
+// jamais déconnecter tout le monde silencieusement à chaque redémarrage du serveur.
+function getOrCreateJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get('jwt_secret');
+  if (row && row.value) return row.value;
+  const generated = crypto.randomBytes(48).toString('hex');
+  db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)').run('jwt_secret', generated);
+  return generated;
+}
+const JWT_SECRET = getOrCreateJwtSecret();
 
 async function hashPassword(plain) {
   return bcrypt.hash(plain, 12);

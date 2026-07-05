@@ -41,6 +41,7 @@ db.exec(`
     release_type TEXT DEFAULT 'Single',
     cover_url TEXT,
     audio_url TEXT,
+    lyrics TEXT,
     scheduled_release_at TEXT,
     published INTEGER DEFAULT 1,
     streams INTEGER DEFAULT 0,
@@ -89,11 +90,23 @@ db.exec(`
     promo_code TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
 `);
 
 // Migration : ajoute la colonne de statut de certification si elle n'existe pas encore
 try {
   db.exec(`ALTER TABLE users ADD COLUMN verification_status TEXT DEFAULT 'none'`);
+} catch (e) {
+  // La colonne existe déjà — rien à faire.
+}
+
+// Migration : ajoute la colonne paroles aux morceaux déjà existants en base
+try {
+  db.exec(`ALTER TABLE tracks ADD COLUMN lyrics TEXT`);
 } catch (e) {
   // La colonne existe déjà — rien à faire.
 }
