@@ -23,6 +23,7 @@
   .reject{background:#7a2020; color:#fff;}
   .primary{background:linear-gradient(135deg,#D4AF6A,#8E63C9); color:#141220;}
   .secondary{background:#7a5c20; color:#fff;}
+  .danger{background:#7a2020; color:#fff;}
   .msg{font-size:13px; margin-top:10px; padding:8px 12px; border-radius:8px;}
   .msg.ok{background:rgba(30,132,73,0.2); color:#7ee6a8;}
   .msg.err{background:rgba(122,32,32,0.25); color:#f29a9a;}
@@ -81,6 +82,17 @@
     <button class="secondary" onclick="loadSubscriptions()">Charger les abonnements</button>
     <div id="subs-summary" style="margin-top:14px;"></div>
     <div id="subs-list" style="margin-top:14px;"></div>
+
+    <!-- Déconnexion manuelle d'un compte : ne supprime rien (compte, morceaux, clips conservés),
+         mais coupe son abonnement actif et invalide son code d'accès. -->
+    <div class="card" style="margin-top:20px;">
+      <b style="color:#D4AF6A; font-size:13px;">🔒 Déconnecter un compte manuellement</b>
+      <div class="muted" style="margin-top:4px;">Coupe l'abonnement actif d'un compte, sans supprimer le compte ni son contenu. L'utilisateur devra repasser par un Pass pour se réactiver.</div>
+      <label>Email du compte à déconnecter</label>
+      <input id="deactivate-email" type="text" placeholder="email@exemple.com">
+      <button class="danger" style="margin-top:10px;" onclick="deactivateSubscription()">🔒 Déconnecter ce compte</button>
+      <div id="deactivate-msg"></div>
+    </div>
   </div>
 
   <!-- ONGLET : CODES PROMO -->
@@ -163,6 +175,22 @@
       extra += '</div>';
       if(data.promoWarning) extra += '<div class="muted" style="color:#f29a9a; margin-top:4px;">⚠️ Code promo ignoré : '+data.promoWarning+'</div>';
       msg.innerHTML = '<div class="msg ok">✅ '+data.message+'</div><div class="card" style="text-align:center; font-size:22px; letter-spacing:4px; font-weight:700; color:#D4AF6A;">'+data.access_code+'</div>'+extra;
+    }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function deactivateSubscription(){
+    const email = document.getElementById('deactivate-email').value.trim();
+    const msg = document.getElementById('deactivate-msg');
+    if(!email){ msg.innerHTML = '<div class="msg err">❌ Email obligatoire.</div>'; return; }
+    msg.innerHTML = '<div class="msg">Déconnexion en cours…</div>';
+    try{
+      const res = await fetch('/api/admin/subscription/deactivate', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      msg.innerHTML = res.ok ? '<div class="msg ok">✅ '+data.message+'</div>' : '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>';
+      if(res.ok) document.getElementById('deactivate-email').value = '';
     }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
   }
 
