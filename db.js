@@ -1,128 +1,151 @@
-// db.js — Couche base de données NUNI (SQLite intégré à Node.js)
-const { DatabaseSync } = require('node:sqlite');
-const path = require('path');
+// db.js — Couche base de données NUNI (Postgres / Neon, via le package "pg")
+//
+// Remplace la version SQLite (node:sqlite). Toutes les requêtes sont maintenant
+// asynchrones (Promises). server.js et auth.js doivent utiliser await/async.
+//
+// Variable d'environnement requise sur Render : DATABASE_URL (fournie par Neon).
 
-const db = new DatabaseSync(path.join(__dirname, 'nuni.db'));
+const { Pool } = require('pg');
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
-
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist')),
-    first_name TEXT NOT NULL,
-    last_name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    phone TEXT,
-    password_hash TEXT NOT NULL,
-    age INTEGER,
-    address TEXT,
-    city TEXT,
-    country TEXT,
-    -- champs spécifiques artiste
-    artist_name TEXT,
-    label_or_manager TEXT,
-    is_verified INTEGER DEFAULT 0,
-    -- abonnement
-    plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist')),
-    subscription_status TEXT DEFAULT 'inactive' CHECK(subscription_status IN ('inactive','pending','active','expired')),
-    subscription_started_at TEXT,
-    subscription_expires_at TEXT,
-    access_code TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS tracks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    artist_id INTEGER NOT NULL REFERENCES users(id),
-    title TEXT NOT NULL,
-    album TEXT,
-    genre TEXT,
-    release_type TEXT DEFAULT 'Single',
-    cover_url TEXT,
-    audio_url TEXT,
-    lyrics TEXT,
-    scheduled_release_at TEXT,
-    published INTEGER DEFAULT 1,
-    streams INTEGER DEFAULT 0,
-    likes INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS clips (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    artist_id INTEGER NOT NULL REFERENCES users(id),
-    title TEXT NOT NULL,
-    thumb_url TEXT,
-    video_url TEXT,
-    scheduled_release_at TEXT,
-    published INTEGER DEFAULT 1,
-    views INTEGER DEFAULT 0,
-    likes INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS promo_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL,
-    discount_pct INTEGER NOT NULL,
-    applies_to_plan TEXT,
-    max_uses INTEGER DEFAULT 1,
-    used_count INTEGER DEFAULT 0,
-    expires_at TEXT,
-    active INTEGER DEFAULT 1
-  );
-
-  CREATE TABLE IF NOT EXISTS follows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    follower_id INTEGER NOT NULL REFERENCES users(id),
-    artist_id INTEGER NOT NULL REFERENCES users(id),
-    created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(follower_id, artist_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    plan TEXT NOT NULL,
-    duration_days INTEGER NOT NULL,
-    amount_fcfa INTEGER NOT NULL,
-    promo_code TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS app_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS plays (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    track_id INTEGER NOT NULL REFERENCES tracks(id),
-    listener_id INTEGER REFERENCES users(id),
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS clip_views (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    clip_id INTEGER NOT NULL REFERENCES clips(id),
-    viewer_id INTEGER REFERENCES users(id),
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-`);
-
-// Migration : ajoute la colonne de statut de certification si elle n'existe pas encore
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN verification_status TEXT DEFAULT 'none'`);
-} catch (e) {
-  // La colonne existe déjà — rien à faire.
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL manquante — ajoute-la dans Render (Environment) avec la chaîne de connexion Neon.');
 }
 
-// Migration : ajoute la colonne paroles aux morceaux déjà existants en base
-try {
-  db.exec(`ALTER TABLE tracks ADD COLUMN lyrics TEXT`);
-} catch (e) {
-  // La colonne existe déjà — rien à faire.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // requis par Neon
+});
+
+// Petit raccourci : query(text, params) -> retourne les lignes (comme .all() en SQLite)
+async function query(text, params = []) {
+  const result = await pool.query(text, params);
+  return result.rows;
 }
 
-module.exports = db;
+// get(text, params) -> une seule ligne ou undefined (comme .get() en SQLite)
+async function get(text, params = []) {
+  const rows = await query(text, params);
+  return rows[0];
+}
+
+// run(text, params) -> exécute sans retour de lignes utile (comme .run() en SQLite),
+// mais si la requête contient RETURNING, renvoie aussi les lignes.
+async function run(text, params = []) {
+  const result = await pool.query(text, params);
+  return { rowCount: result.rowCount, rows: result.rows };
+}
+
+// ---------- Création des tables (équivalent Postgres du schéma SQLite) ----------
+async function initSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist')),
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      phone TEXT,
+      password_hash TEXT NOT NULL,
+      age INTEGER,
+      address TEXT,
+      city TEXT,
+      country TEXT,
+      artist_name TEXT,
+      label_or_manager TEXT,
+      is_verified INTEGER DEFAULT 0,
+      plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist')),
+      subscription_status TEXT DEFAULT 'inactive' CHECK(subscription_status IN ('inactive','pending','active','expired')),
+      subscription_started_at TIMESTAMPTZ,
+      subscription_expires_at TIMESTAMPTZ,
+      access_code TEXT,
+      verification_status TEXT DEFAULT 'none',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS tracks (
+      id SERIAL PRIMARY KEY,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      album TEXT,
+      genre TEXT,
+      release_type TEXT DEFAULT 'Single',
+      cover_url TEXT,
+      audio_url TEXT,
+      lyrics TEXT,
+      scheduled_release_at TIMESTAMPTZ,
+      published INTEGER DEFAULT 1,
+      streams INTEGER DEFAULT 0,
+      likes INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS clips (
+      id SERIAL PRIMARY KEY,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      thumb_url TEXT,
+      video_url TEXT,
+      scheduled_release_at TIMESTAMPTZ,
+      published INTEGER DEFAULT 1,
+      views INTEGER DEFAULT 0,
+      likes INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      discount_pct INTEGER NOT NULL,
+      applies_to_plan TEXT,
+      max_uses INTEGER DEFAULT 1,
+      used_count INTEGER DEFAULT 0,
+      expires_at TIMESTAMPTZ,
+      active INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS follows (
+      id SERIAL PRIMARY KEY,
+      follower_id INTEGER NOT NULL REFERENCES users(id),
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(follower_id, artist_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      plan TEXT NOT NULL,
+      duration_days INTEGER NOT NULL,
+      amount_fcfa INTEGER NOT NULL,
+      promo_code TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS plays (
+      id SERIAL PRIMARY KEY,
+      track_id INTEGER NOT NULL REFERENCES tracks(id),
+      listener_id INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS clip_views (
+      id SERIAL PRIMARY KEY,
+      clip_id INTEGER NOT NULL REFERENCES clips(id),
+      viewer_id INTEGER REFERENCES users(id),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Ces colonnes existaient déjà via ALTER TABLE en SQLite — ici elles sont dans le
+  // CREATE TABLE directement, mais on garde IF NOT EXISTS par sécurité si la table
+  // existait déjà sans elles (ex: relance après une création partielle).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS lyrics TEXT;`);
+}
+
+module.exports = { pool, query, get, run, initSchema };
