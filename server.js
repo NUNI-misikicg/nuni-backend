@@ -281,6 +281,58 @@ app.post('/api/subscribe/redeem', authMiddleware, h(async (req, res) => {
 
 // ================= MUSIQUE & CLIPS (artiste) =================
 
+// ---------- Soutien direct (Mobile Money) — don volontaire du fan vers l'artiste ----------
+// NUNI ne traite jamais ce paiement et ne prend aucune commission dessus : c'est un simple
+// transfert Mobile Money classique entre le fan et l'artiste, hors de la plateforme. NUNI se
+// contente d'afficher le numéro que l'artiste a bien voulu renseigner (totalement facultatif).
+app.put('/api/artist/momo', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const { momoNumber } = req.body;
+  const cleaned = (momoNumber || '').trim();
+  if (cleaned && !/^[0-9+ ]{6,20}$/.test(cleaned)) {
+    return res.status(400).json({ error: 'Numéro invalide — utilisez uniquement des chiffres, espaces et le signe +.' });
+  }
+  await db.run('UPDATE users SET momo_number = $1 WHERE id = $2', [cleaned || null, req.user.id]);
+  res.json({ message: cleaned ? 'Numéro Mobile Money enregistré.' : 'Numéro Mobile Money retiré.', momo_number: cleaned || null });
+}));
+
+app.get('/api/artist/:id/support-info', h(async (req, res) => {
+  const artist = await db.get(
+    'SELECT id, account_type, artist_name, first_name, momo_number FROM users WHERE id = $1',
+    [Number(req.params.id)],
+  );
+  if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
+  res.json({
+    artist_name: artist.artist_name || artist.first_name,
+    momo_number: artist.momo_number || null,
+  });
+}));
+
+// ---------- Historique des paiements — calculé en direct depuis les vraies écoutes ----------
+// Avant : deux lignes ("Mai 2026", "Juin 2026") codées en dur, identiques pour tout le monde.
+// Maintenant : regroupement réel des écoutes (table plays) par mois, pour les morceaux de
+// CET artiste précis. Pas de fausse mention "Payé/En attente" inventée : les vrais versements
+// se font manuellement par NUNI, donc on affiche seulement les vrais chiffres calculés.
+app.get('/api/artist/payments-history', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const rows = await db.query(`
+    SELECT to_char(date_trunc('month', p.created_at), 'YYYY-MM') as month, COUNT(*)::int as streams
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = $1
+    GROUP BY date_trunc('month', p.created_at)
+    ORDER BY date_trunc('month', p.created_at) DESC
+    LIMIT 12
+  `, [req.user.id]);
+
+  const history = rows.map((r) => {
+    const gross = r.streams * NUNI_PRICE_PER_STREAM_FCFA;
+    const artistShare = Math.round(gross * NUNI_ARTIST_SHARE_PCT / 100);
+    return { month: r.month, streams: r.streams, artist_share_fcfa: artistShare };
+  });
+  res.json({ history });
+}));
+
 app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const { title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt } = req.body;

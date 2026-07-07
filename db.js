@@ -146,6 +146,7 @@ async function initSchema() {
   //   - 'suspended' : login TOTALEMENT bloqué par l'admin, quel que soit le Pass
   //   - 'deleted'   : filet de sécurité si une suppression partielle a eu lieu
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active';`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS momo_number TEXT;`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 }
 
