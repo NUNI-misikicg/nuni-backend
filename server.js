@@ -424,6 +424,64 @@ app.post('/api/tracks/:id/play', h(async (req, res) => {
   res.json({ counted: true, streams: track.streams + 1 });
 }));
 
+// ---------- Likes réels sur les morceaux (persistés, un seul like par personne) ----------
+app.post('/api/tracks/:id/like', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const track = await db.get('SELECT id, likes FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+
+  const existing = await db.get('SELECT id FROM track_likes WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
+  let liked;
+  if (existing) {
+    await db.run('DELETE FROM track_likes WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
+    await db.run('UPDATE tracks SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [trackId]);
+    liked = false;
+  } else {
+    await db.run('INSERT INTO track_likes (user_id, track_id) VALUES ($1,$2)', [req.user.id, trackId]);
+    await db.run('UPDATE tracks SET likes = likes + 1 WHERE id = $1', [trackId]);
+    liked = true;
+  }
+  const fresh = await db.get('SELECT likes FROM tracks WHERE id = $1', [trackId]);
+  res.json({ liked, likes: fresh.likes });
+}));
+
+// Liste des morceaux likés par l'utilisateur connecté — sert à resynchroniser les cœurs
+// (Favoris) après une reconnexion ou sur un autre appareil, au lieu de repartir de zéro.
+app.get('/api/me/liked-tracks', authMiddleware, h(async (req, res) => {
+  const rows = await db.query('SELECT track_id FROM track_likes WHERE user_id = $1', [req.user.id]);
+  res.json({ track_ids: rows.map((r) => r.track_id) });
+}));
+
+// ---------- Likes réels sur les clips ----------
+app.post('/api/clips/:id/like', authMiddleware, h(async (req, res) => {
+  const clipId = Number(req.params.id);
+  const clip = await db.get('SELECT id, likes FROM clips WHERE id = $1', [clipId]);
+  if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
+
+  const existing = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  let liked;
+  if (existing) {
+    await db.run('DELETE FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [clipId]);
+    liked = false;
+  } else {
+    await db.run('INSERT INTO clip_likes (user_id, clip_id) VALUES ($1,$2)', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET likes = likes + 1 WHERE id = $1', [clipId]);
+    liked = true;
+  }
+  const fresh = await db.get('SELECT likes FROM clips WHERE id = $1', [clipId]);
+  res.json({ liked, likes: fresh.likes });
+}));
+
+// ---------- Statut de suivi réel — pour afficher "Suivre" / "Suivi ✓" au bon état à l'ouverture ----------
+// Avant : le bouton affichait toujours "Suivre" par défaut, même si le compte connecté suivait déjà
+// cet artiste — jamais vérifié contre la vraie base au moment d'ouvrir la page.
+app.get('/api/follow/:artistId/status', authMiddleware, h(async (req, res) => {
+  const artistId = Number(req.params.artistId);
+  const existing = await db.get('SELECT id FROM follows WHERE follower_id = $1 AND artist_id = $2', [req.user.id, artistId]);
+  res.json({ following: !!existing });
+}));
+
 app.get('/api/artist/stats', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const row = await db.get('SELECT COALESCE(SUM(streams), 0)::int as total_streams FROM tracks WHERE artist_id = $1', [req.user.id]);

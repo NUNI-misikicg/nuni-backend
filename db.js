@@ -134,6 +134,22 @@ async function initSchema() {
       viewer_id INTEGER REFERENCES users(id),
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS track_likes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      track_id INTEGER NOT NULL REFERENCES tracks(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, track_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS clip_likes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      clip_id INTEGER NOT NULL REFERENCES clips(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, clip_id)
+    );
   `);
 
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
