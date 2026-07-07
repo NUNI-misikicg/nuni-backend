@@ -83,15 +83,35 @@
     <div id="subs-summary" style="margin-top:14px;"></div>
     <div id="subs-list" style="margin-top:14px;"></div>
 
-    <!-- Déconnexion manuelle d'un compte : ne supprime rien (compte, morceaux, clips conservés),
-         mais coupe son abonnement actif et invalide son code d'accès. -->
+    <!-- Suspension d'un compte : bloque TOTALEMENT la connexion (vérifié à chaque requête,
+         pas seulement à la connexion), sans supprimer le compte ni son contenu. -->
     <div class="card" style="margin-top:20px;">
-      <b style="color:#D4AF6A; font-size:13px;">🔒 Déconnecter un compte manuellement</b>
-      <div class="muted" style="margin-top:4px;">Coupe l'abonnement actif d'un compte, sans supprimer le compte ni son contenu. L'utilisateur devra repasser par un Pass pour se réactiver.</div>
-      <label>Email du compte à déconnecter</label>
+      <b style="color:#D4AF6A; font-size:13px;">🔒 Suspendre un compte</b>
+      <div class="muted" style="margin-top:4px;">Bloque totalement la connexion de ce compte (même en pleine session), sans supprimer le compte ni son contenu.</div>
+      <label>Email du compte à suspendre</label>
       <input id="deactivate-email" type="text" placeholder="email@exemple.com">
-      <button class="danger" style="margin-top:10px;" onclick="deactivateSubscription()">🔒 Déconnecter ce compte</button>
+      <button class="danger" style="margin-top:10px;" onclick="deactivateSubscription()">🔒 Suspendre ce compte</button>
       <div id="deactivate-msg"></div>
+    </div>
+
+    <!-- Réactivation : redonne l'accès à la connexion à un compte suspendu -->
+    <div class="card" style="margin-top:14px;">
+      <b style="color:#7ee6a8; font-size:13px;">🔓 Réactiver un compte suspendu</b>
+      <div class="muted" style="margin-top:4px;">Redonne le droit de se connecter. Le Pass reste à réactiver séparément si besoin.</div>
+      <label>Email du compte à réactiver</label>
+      <input id="reactivate-email" type="text" placeholder="email@exemple.com">
+      <button class="secondary" style="margin-top:10px;" onclick="reactivateAccount()">🔓 Réactiver ce compte</button>
+      <div id="reactivate-msg"></div>
+    </div>
+
+    <!-- Suppression définitive : IRRÉVERSIBLE, cascade complète -->
+    <div class="card" style="margin-top:14px; border-color:#7a2020;">
+      <b style="color:#f29a9a; font-size:13px;">🗑️ Supprimer définitivement un compte</b>
+      <div class="muted" style="margin-top:4px;">⚠️ Action irréversible. Supprime le compte et TOUT son contenu lié : morceaux, clips, abonnements, paiements, écoutes, abonnés.</div>
+      <label>Email du compte à supprimer</label>
+      <input id="delete-email" type="text" placeholder="email@exemple.com">
+      <button class="danger" style="margin-top:10px;" onclick="deleteAccountPermanently()">🗑️ Supprimer définitivement</button>
+      <div id="delete-msg"></div>
     </div>
   </div>
 
@@ -182,7 +202,7 @@
     const email = document.getElementById('deactivate-email').value.trim();
     const msg = document.getElementById('deactivate-msg');
     if(!email){ msg.innerHTML = '<div class="msg err">❌ Email obligatoire.</div>'; return; }
-    msg.innerHTML = '<div class="msg">Déconnexion en cours…</div>';
+    msg.innerHTML = '<div class="msg">Suspension en cours…</div>';
     try{
       const res = await fetch('/api/admin/subscription/deactivate', {
         method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
@@ -191,6 +211,48 @@
       const data = await res.json();
       msg.innerHTML = res.ok ? '<div class="msg ok">✅ '+data.message+'</div>' : '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>';
       if(res.ok) document.getElementById('deactivate-email').value = '';
+    }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function reactivateAccount(){
+    const email = document.getElementById('reactivate-email').value.trim();
+    const msg = document.getElementById('reactivate-msg');
+    if(!email){ msg.innerHTML = '<div class="msg err">❌ Email obligatoire.</div>'; return; }
+    msg.innerHTML = '<div class="msg">Réactivation en cours…</div>';
+    try{
+      const res = await fetch('/api/admin/users/reactivate', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      msg.innerHTML = res.ok ? '<div class="msg ok">✅ '+data.message+'</div>' : '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>';
+      if(res.ok) document.getElementById('reactivate-email').value = '';
+    }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  async function deleteAccountPermanently(){
+    const email = document.getElementById('delete-email').value.trim();
+    const msg = document.getElementById('delete-msg');
+    if(!email){ msg.innerHTML = '<div class="msg err">❌ Email obligatoire.</div>'; return; }
+
+    const firstConfirm = confirm('Cette action est IRRÉVERSIBLE.\n\nLe compte "'+email+'" et TOUT son contenu (morceaux, clips, abonnements, paiements, écoutes, abonnés) seront supprimés définitivement.\n\nContinuer ?');
+    if(!firstConfirm) return;
+
+    const typed = prompt('Pour confirmer, tapez exactement : SUPPRIMER');
+    if(typed !== 'SUPPRIMER'){
+      msg.innerHTML = '<div class="msg err">❌ Confirmation annulée ou incorrecte — rien n\'a été supprimé.</div>';
+      return;
+    }
+
+    msg.innerHTML = '<div class="msg">Suppression en cours…</div>';
+    try{
+      const res = await fetch('/api/admin/users/delete', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ email, confirm: 'SUPPRIMER' })
+      });
+      const data = await res.json();
+      msg.innerHTML = res.ok ? '<div class="msg ok">✅ '+data.message+'</div>' : '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>';
+      if(res.ok) document.getElementById('delete-email').value = '';
     }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
   }
 
@@ -262,12 +324,14 @@
       const res = await fetch('/api/admin/users', { headers:{'x-admin-key':getKey()} });
       const data = await res.json();
       if(!res.ok){ list.innerHTML = '<div class="msg err">❌ '+(data.error||'Erreur')+'</div>'; return; }
-      let html = '<table><tr><th>Nom</th><th>Email</th><th>Type</th><th>Pass</th><th>Statut</th><th>Sons</th><th>Abonnés</th><th>Inscrit le</th></tr>';
+      let html = '<table><tr><th>Nom</th><th>Email</th><th>Type</th><th>Pass</th><th>Abonnement</th><th>Compte</th><th>Sons</th><th>Abonnés</th><th>Inscrit le</th></tr>';
       data.users.forEach(u=>{
         const name = u.account_type === 'artist' ? (u.artist_name || u.first_name) : (u.first_name+' '+u.last_name);
         const typePill = u.account_type === 'artist' ? '<span class="pill artist">Artiste</span>' : '<span class="pill consumer">Consommateur</span>';
         const verified = u.is_verified ? ' <span class="pill verified">✓</span>' : '';
-        html += '<tr><td>'+name+verified+'</td><td>'+u.email+'</td><td>'+typePill+'</td><td>'+(u.plan||'—')+'</td><td>'+(u.subscription_status||'—')+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+new Date(u.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
+        const accStatus = u.account_status || 'active';
+        const accPill = accStatus === 'suspended' ? '<span class="pill expired">🔒 Suspendu</span>' : (accStatus === 'deleted' ? '<span class="pill expired">Supprimé</span>' : '<span class="pill active">Actif</span>');
+        html += '<tr><td>'+name+verified+'</td><td>'+u.email+'</td><td>'+typePill+'</td><td>'+(u.plan||'—')+'</td><td>'+(u.subscription_status||'—')+'</td><td>'+accPill+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+new Date(u.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;

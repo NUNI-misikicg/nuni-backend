@@ -3,7 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const cloudinary = require('cloudinary').v2; // lit CLOUDINARY_URL automatiquement dans l'env
+const cloudinary = require('cloudinary').v2;
 const db = require('./db');
 const {
   initAuth, hashPassword, verifyPassword, signToken, verifyToken, generateAccessCode, authMiddleware,
@@ -12,10 +12,9 @@ const { sendAccessCodeEmail } = require('./mailer');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' })); // limite augmentée pour accepter les fichiers audio/pochette encodés
-app.use(express.static(path.join(__dirname, 'public'))); // sert /admin.html
+app.use(express.json({ limit: '15mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Petit wrapper pour éviter de répéter try/catch async sur chaque route
 function h(fn) {
   return (req, res) => fn(req, res).catch((err) => {
     console.error(err);
@@ -23,24 +22,16 @@ function h(fn) {
   });
 }
 
-// ---------- Cloudinary : upload d'un data URI (base64) envoyé par le frontend ----------
-// Si CLOUDINARY_URL n'est pas configurée sur Render, cloudinary.uploader.upload() échouera
-// avec une erreur claire au moment de l'appel — pas de crash silencieux.
 async function uploadIfDataUri(value, resourceType) {
   if (!value) return null;
-  if (!String(value).startsWith('data:')) return value; // déjà une URL (ex: re-sauvegarde) -> on garde
+  if (!String(value).startsWith('data:')) return value;
   const result = await cloudinary.uploader.upload(value, {
-    resource_type: resourceType, // 'image' pour pochettes/miniatures, 'video' pour audio/clips
+    resource_type: resourceType,
     folder: 'nuni',
   });
   return result.secure_url;
 }
 
-// ---------- Upload direct navigateur → Cloudinary (fichiers volumineux : audio, vidéo) ----------
-// Le navigateur envoie le gros fichier DIRECTEMENT à Cloudinary, jamais via notre serveur ni
-// transformé en base64 — ça évite les plantages "Out of Memory" sur les fichiers audio/vidéo
-// volumineux (WAV, FLAC, clips de plusieurs dizaines de Mo). Notre serveur ne fait que fournir
-// une signature temporaire, sans jamais exposer la clé secrète Cloudinary au navigateur.
 app.get('/api/upload-signature', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const timestamp = Math.round(Date.now() / 1000);
@@ -53,7 +44,6 @@ app.get('/api/upload-signature', authMiddleware, h(async (req, res) => {
   });
 }));
 
-// Prix de référence par Pass/durée
 const PRICE_TABLE = {
   consumer: { 30: 650, 90: 650, 365: 1500 },
   artist: { 90: 5000, 365: 10000 },
@@ -66,7 +56,6 @@ function basePriceFor(plan, durationDays) {
   return Math.round((ref / refDays) * durationDays);
 }
 
-// Vérifie un code promo : existe, actif, pas expiré, pas épuisé, compatible avec le Pass choisi.
 async function resolvePromoDiscount(code, plan) {
   if (!code) return { pct: 0, valid: true, code: null };
   const promo = await db.get('SELECT * FROM promo_codes WHERE code = $1', [String(code).toUpperCase().trim()]);
@@ -78,7 +67,6 @@ async function resolvePromoDiscount(code, plan) {
   return { pct: promo.discount_pct, valid: true, code: promo.code };
 }
 
-// Verrouillage automatique des abonnements expirés
 async function enforceSubscriptionExpiry() {
   try {
     await db.run(`
@@ -90,7 +78,6 @@ async function enforceSubscriptionExpiry() {
   } catch (e) { /* ne bloque jamais une requête si ça échoue */ }
 }
 
-// ---------- Validation helpers ----------
 function isEmail(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v || ''); }
 function required(obj, fields) {
   return fields.filter((f) => !obj[f] || String(obj[f]).trim() === '');
@@ -151,13 +138,27 @@ app.post('/api/register', h(async (req, res) => {
   });
 }));
 
+// ---------- Connexion : VRAIE vérification de l'état du compte, à chaque tentative ----------
+// Ordre volontaire : on ne révèle rien sur l'existence du compte tant que le mot de passe
+// n'est pas confirmé exact. Ce n'est qu'APRÈS un mot de passe correct qu'on vérifie si le
+// compte est suspendu/supprimé — sinon on donnerait à n'importe qui un moyen de deviner
+// quels emails ont un compte suspendu, juste en essayant de se connecter avec.
 app.post('/api/login', h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const { email, password } = req.body;
   const user = await db.get('SELECT * FROM users WHERE email = $1', [email || '']);
   if (!user) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
+
   const ok = await verifyPassword(password || '', user.password_hash);
   if (!ok) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
+
+  if (user.account_status === 'deleted') {
+    return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
+  }
+  if (user.account_status === 'suspended') {
+    return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
+  }
+
   const token = signToken(user);
   res.json({ token, user: publicUser(await withArtistStats(user)) });
 }));
@@ -286,10 +287,9 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
 
-  // Upload vers Cloudinary si ce sont des data URI base64 (comportement du frontend inchangé)
   const [finalCoverUrl, finalAudioUrl] = await Promise.all([
     uploadIfDataUri(coverUrl, 'image'),
-    uploadIfDataUri(audioUrl, 'video'), // Cloudinary traite l'audio sous resource_type "video"
+    uploadIfDataUri(audioUrl, 'video'),
   ]);
 
   const inserted = await db.get(`
@@ -350,9 +350,6 @@ app.post('/api/tracks/:id/play', h(async (req, res) => {
   if (!listenerId) {
     return res.json({ counted: false, reason: 'Connectez-vous pour que votre écoute soit comptée.', streams: track.streams });
   }
-  // Seul un compte Pass Consommateur génère un vrai stream (rémunéré). Un compte Artiste qui écoute
-  // — le sien ou celui d'un autre artiste — n'est jamais compté : le fonds n'est alimenté que par les
-  // vraies écoutes des auditeurs, pas par l'activité entre artistes.
   if (payload.accountType !== 'consumer') {
     return res.json({ counted: false, reason: "Seules les écoutes via un Pass Consommateur génèrent un stream.", streams: track.streams });
   }
@@ -469,7 +466,7 @@ app.get('/api/admin/users', h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const rows = await db.query(`
     SELECT u.id, u.account_type, u.first_name, u.last_name, u.email, u.artist_name,
-           u.plan, u.subscription_status, u.is_verified, u.verification_status, u.created_at,
+           u.plan, u.subscription_status, u.account_status, u.is_verified, u.verification_status, u.created_at,
            (SELECT COUNT(*) FROM tracks t WHERE t.artist_id = u.id AND t.published = 1) as track_count,
            (SELECT COUNT(*) FROM follows f WHERE f.artist_id = u.id) as follower_count
     FROM users u
@@ -483,7 +480,7 @@ app.get('/api/admin/subscriptions', h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const rows = await db.query(`
     SELECT u.id, u.first_name, u.last_name, u.email, u.account_type, u.artist_name, u.plan,
-           u.subscription_status, u.subscription_started_at, u.subscription_expires_at,
+           u.subscription_status, u.account_status, u.subscription_started_at, u.subscription_expires_at,
            CEIL(EXTRACT(EPOCH FROM (u.subscription_expires_at - NOW())) / 86400)::int as days_remaining,
            (SELECT p.amount_fcfa FROM payments p WHERE p.user_id = u.id ORDER BY p.created_at DESC LIMIT 1) as last_amount_fcfa
     FROM users u
@@ -496,10 +493,9 @@ app.get('/api/admin/subscriptions', h(async (req, res) => {
   res.json({ subscriptions: rows, total_collected_fcfa: totalRow.total });
 }));
 
-// Désactive manuellement l'abonnement d'un utilisateur (déconnexion forcée au prochain
-// rechargement / login) — sans jamais supprimer le compte, ses morceaux, ses clips ou son
-// historique. L'ancien code d'accès est invalidé pour éviter qu'il soit réutilisé pour
-// se réactiver sans repasser par un vrai paiement/activation admin.
+// ---------- Suspension d'un compte : coupe le Pass ET bloque totalement la connexion ----------
+// Contrairement à avant, ceci fixe désormais account_status='suspended', qui est vérifié
+// à CHAQUE connexion et à CHAQUE requête authentifiée — pas seulement l'abonnement.
 app.post('/api/admin/subscription/deactivate', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const { email } = req.body;
@@ -507,10 +503,66 @@ app.post('/api/admin/subscription/deactivate', h(async (req, res) => {
   const user = await db.get('SELECT * FROM users WHERE email = $1', [email]);
   if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
   await db.run(
-    `UPDATE users SET subscription_status = 'inactive', access_code = NULL WHERE id = $1`,
+    `UPDATE users SET subscription_status = 'inactive', account_status = 'suspended', access_code = NULL WHERE id = $1`,
     [user.id],
   );
-  res.json({ message: `Abonnement désactivé pour ${user.artist_name || user.first_name} — compte et contenu conservés.` });
+  res.json({ message: `Compte suspendu pour ${user.artist_name || user.first_name} — connexion bloquée, compte et contenu conservés.` });
+}));
+
+// ---------- Réactivation d'un compte suspendu ----------
+app.post('/api/admin/users/reactivate', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email } = req.body;
+  if (!isEmail(email)) return res.status(400).json({ error: 'Email invalide.' });
+  const user = await db.get('SELECT * FROM users WHERE email = $1', [email]);
+  if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+  await db.run(`UPDATE users SET account_status = 'active' WHERE id = $1`, [user.id]);
+  res.json({ message: `Connexion réactivée pour ${user.artist_name || user.first_name} — le Pass reste à réactiver séparément si besoin.` });
+}));
+
+// ---------- Suppression DÉFINITIVE d'un compte — cascade complète, aucun résidu ----------
+app.post('/api/admin/users/delete', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { email, confirm } = req.body;
+  if (!isEmail(email)) return res.status(400).json({ error: 'Email invalide.' });
+  if (confirm !== 'SUPPRIMER') {
+    return res.status(400).json({ error: 'Confirmation manquante ou incorrecte.' });
+  }
+  const user = await db.get('SELECT * FROM users WHERE email = $1', [email]);
+  if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Vues/écoutes générées par ce compte en tant qu'auditeur
+    await client.query('DELETE FROM clip_views WHERE viewer_id = $1', [user.id]);
+    await client.query('DELETE FROM plays WHERE listener_id = $1', [user.id]);
+    // Follows dans les deux sens (abonné à d'autres artistes / suivi par d'autres)
+    await client.query('DELETE FROM follows WHERE follower_id = $1 OR artist_id = $1', [user.id]);
+    // Paiements liés
+    await client.query('DELETE FROM payments WHERE user_id = $1', [user.id]);
+    // Si c'est un artiste : vues/écoutes reçues sur son contenu, puis le contenu lui-même
+    const tracks = await client.query('SELECT id FROM tracks WHERE artist_id = $1', [user.id]);
+    for (const t of tracks.rows) {
+      await client.query('DELETE FROM plays WHERE track_id = $1', [t.id]);
+    }
+    await client.query('DELETE FROM tracks WHERE artist_id = $1', [user.id]);
+    const clips = await client.query('SELECT id FROM clips WHERE artist_id = $1', [user.id]);
+    for (const c of clips.rows) {
+      await client.query('DELETE FROM clip_views WHERE clip_id = $1', [c.id]);
+    }
+    await client.query('DELETE FROM clips WHERE artist_id = $1', [user.id]);
+    // Enfin le compte lui-même
+    await client.query('DELETE FROM users WHERE id = $1', [user.id]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  res.json({ message: `Compte ${email} supprimé définitivement — aucune donnée résiduelle (morceaux, clips, abonnements, écoutes, follows).` });
 }));
 
 app.get('/api/admin/promo-codes', h(async (req, res) => {
@@ -591,7 +643,6 @@ app.get('/admin-verify.html', (req, res) => {
   res.redirect('/admin.html');
 });
 
-// ---------- Publication planifiée : job qui "sort" les titres/clips programmés ----------
 setInterval(async () => {
   try {
     await db.run(`UPDATE tracks SET published = 1 WHERE published = 0 AND scheduled_release_at <= NOW()`);
@@ -599,7 +650,6 @@ setInterval(async () => {
   } catch (e) { console.error('Erreur job publication planifiée:', e); }
 }, 60 * 1000);
 
-// ---------- Démarrage : initialise le schéma + la clé JWT AVANT d'écouter ----------
 async function start() {
   await db.initSchema();
   await initAuth();

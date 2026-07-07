@@ -16,26 +16,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }, // requis par Neon
 });
 
-// Petit raccourci : query(text, params) -> retourne les lignes (comme .all() en SQLite)
 async function query(text, params = []) {
   const result = await pool.query(text, params);
   return result.rows;
 }
 
-// get(text, params) -> une seule ligne ou undefined (comme .get() en SQLite)
 async function get(text, params = []) {
   const rows = await query(text, params);
   return rows[0];
 }
 
-// run(text, params) -> exécute sans retour de lignes utile (comme .run() en SQLite),
-// mais si la requête contient RETURNING, renvoie aussi les lignes.
 async function run(text, params = []) {
   const result = await pool.query(text, params);
   return { rowCount: result.rowCount, rows: result.rows };
 }
 
-// ---------- Création des tables (équivalent Postgres du schéma SQLite) ----------
 async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -141,11 +136,17 @@ async function initSchema() {
     );
   `);
 
-  // Ces colonnes existaient déjà via ALTER TABLE en SQLite — ici elles sont dans le
-  // CREATE TABLE directement, mais on garde IF NOT EXISTS par sécurité si la table
-  // existait déjà sans elles (ex: relance après une création partielle).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS lyrics TEXT;`);
+
+  // ---------- État réel du compte (distinct du Pass/abonnement) ----------
+  // subscription_status = état du Pass payant (inactive/pending/active/expired).
+  // account_status = état du COMPTE lui-même, décidé par l'admin :
+  //   - 'active'    : compte normal, login autorisé (comportement selon son Pass ensuite)
+  //   - 'suspended' : login TOTALEMENT bloqué par l'admin, quel que soit le Pass
+  //   - 'deleted'   : filet de sécurité si une suppression partielle a eu lieu
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active';`);
+  await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 }
 
 module.exports = { pool, query, get, run, initSchema };

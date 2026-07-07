@@ -4,10 +4,6 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('./db');
 
-// La clé JWT doit maintenant être chargée de façon ASYNCHRONE (requête Postgres),
-// donc on ne peut plus faire `const JWT_SECRET = getOrCreateJwtSecret()` au chargement
-// du module comme avant. À la place : initAuth() est appelée UNE FOIS au démarrage du
-// serveur (dans server.js, avant app.listen), et remplit JWT_SECRET en mémoire.
 let JWT_SECRET = null;
 
 async function initAuth() {
@@ -55,9 +51,8 @@ function verifyToken(token) {
   }
 }
 
-// Génère un code d'accès à 6 caractères (lettres majuscules + chiffres), unique et lisible
 function generateAccessCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // exclut 0/O/1/I pour éviter la confusion
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 6; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
@@ -65,12 +60,36 @@ function generateAccessCode() {
   return code;
 }
 
-function authMiddleware(req, res, next) {
+// ---------- Middleware d'authentification — RE-VÉRIFIE le compte en base à CHAQUE requête ----------
+// Avant : ce middleware faisait uniquement confiance au JWT (signature valide = accès autorisé),
+// sans jamais revérifier l'état réel du compte. Un compte suspendu ou supprimé APRÈS l'émission
+// du token continuait donc de fonctionner normalement jusqu'à l'expiration du token (30 jours !).
+// Maintenant : chaque requête authentifiée fait une vraie vérification en base. Si l'admin suspend
+// ou supprime un compte, l'utilisateur perd l'accès dès sa PROCHAINE requête — pas dans 30 jours.
+async function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Authentification requise.' });
+
   const payload = verifyToken(token);
   if (!payload) return res.status(401).json({ error: 'Session invalide ou expirée.' });
+
+  try {
+    const user = await db.get('SELECT id, account_status FROM users WHERE id = $1', [payload.id]);
+    if (!user) {
+      return res.status(401).json({ error: 'Ce compte n\'existe plus.' });
+    }
+    if (user.account_status === 'suspended') {
+      return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
+    }
+    if (user.account_status === 'deleted') {
+      return res.status(401).json({ error: 'Ce compte n\'existe plus.' });
+    }
+  } catch (e) {
+    console.error('Erreur de vérification du compte dans authMiddleware:', e);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+
   req.user = payload;
   next();
 }
