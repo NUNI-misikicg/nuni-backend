@@ -296,6 +296,32 @@ app.put('/api/artist/momo', authMiddleware, h(async (req, res) => {
   res.json({ message: cleaned ? 'Numéro Mobile Money enregistré.' : 'Numéro Mobile Money retiré.', momo_number: cleaned || null });
 }));
 
+// ---------- Statistiques publiques d'un artiste (visibles par n'importe quel visiteur) ----------
+// Avant : le nombre de followers réel n'était affiché que sur SA PROPRE page (via /api/me).
+// Un consommateur qui visitait la page d'un artiste voyait toujours "—", même si le vrai
+// nombre existait déjà en base. Cette route publique corrige ça : n'importe qui peut voir
+// le vrai nombre d'abonnés d'un artiste, comme sur n'importe quel réseau social.
+// ---------- Vraie photo de profil artiste — persistée en base, visible par tout le monde ----------
+// Avant : "Changer la photo de profil" ne faisait qu'un aperçu local dans le navigateur,
+// jamais envoyé au serveur — perdu au rechargement, et jamais visible sur la vraie page
+// artiste (qui affichait toujours les initiales, sans jamais vérifier une vraie photo).
+app.put('/api/artist/avatar', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const { avatarUrl } = req.body;
+  if (!avatarUrl || !String(avatarUrl).startsWith('http')) return res.status(400).json({ error: 'URL de photo invalide.' });
+  await db.run('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, req.user.id]);
+  res.json({ message: 'Photo de profil mise à jour.', avatar_url: avatarUrl });
+}));
+
+app.get('/api/artist/:id/public-stats', h(async (req, res) => {
+  const artistId = Number(req.params.id);
+  const artist = await db.get('SELECT id, account_type, avatar_url FROM users WHERE id = $1', [artistId]);
+  if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
+  const followerCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artistId])).c;
+  const trackCount = (await db.get('SELECT COUNT(*)::int as c FROM tracks WHERE artist_id = $1 AND published = 1', [artistId])).c;
+  res.json({ follower_count: followerCount, track_count: trackCount, avatar_url: artist.avatar_url || null });
+}));
+
 app.get('/api/artist/:id/support-info', h(async (req, res) => {
   const artist = await db.get(
     'SELECT id, account_type, artist_name, first_name, momo_number FROM users WHERE id = $1',
