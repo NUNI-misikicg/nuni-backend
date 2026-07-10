@@ -397,6 +397,24 @@ app.get('/api/artist/:id/featured-tracks', h(async (req, res) => {
   res.json({ tracks: rows });
 }));
 
+// ---------- Calendrier des sorties — vraies sorties programmées par l'artiste ----------
+// Avant : "Calendrier des sorties" affichait 3 entrées codées en dur ("Nzela ya Sika",
+// "Envol (Deluxe)", "Tournée Kinshasa"), identiques pour tout le monde, jamais reliées à
+// aucune vraie programmation. Ici : les vrais morceaux/albums que CET artiste a importés
+// avec une date de sortie future (published=0, en attente du job qui les publie
+// automatiquement à l'heure dite — voir le setInterval plus bas dans ce fichier).
+app.get('/api/artist/:id/scheduled-releases', h(async (req, res) => {
+  const artistId = Number(req.params.id);
+  const rows = await db.query(`
+    SELECT title, release_type, scheduled_release_at
+    FROM tracks
+    WHERE artist_id = $1 AND published = 0 AND scheduled_release_at IS NOT NULL AND scheduled_release_at > NOW()
+    ORDER BY scheduled_release_at ASC
+    LIMIT 10
+  `, [artistId]);
+  res.json({ releases: rows });
+}));
+
 // ---------- Historique des paiements — calculé en direct depuis les vraies écoutes ----------
 // Avant : deux lignes ("Mai 2026", "Juin 2026") codées en dur, identiques pour tout le monde.
 // Maintenant : regroupement réel des écoutes (table plays) par mois, pour les morceaux de
