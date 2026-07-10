@@ -705,7 +705,8 @@ app.post('/api/follow', authMiddleware, h(async (req, res) => {
 
 app.get('/api/clips', h(async (req, res) => {
   const rows = await db.query(`
-    SELECT c.id, c.title, c.thumb_url, c.video_url, c.views, c.likes, u.artist_name
+    SELECT c.id, c.title, c.thumb_url, c.video_url, c.views, c.likes,
+           u.id as artist_id, u.artist_name, u.avatar_url as artist_avatar_url
     FROM clips c JOIN users u ON u.id = c.artist_id
     WHERE c.published = 1 AND (c.scheduled_release_at IS NULL OR c.scheduled_release_at <= NOW())
     ORDER BY RANDOM()
