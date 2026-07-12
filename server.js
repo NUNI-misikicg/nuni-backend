@@ -896,19 +896,27 @@ app.post('/api/admin/users/delete', h(async (req, res) => {
     // Vues/écoutes générées par ce compte en tant qu'auditeur
     await client.query('DELETE FROM clip_views WHERE viewer_id = $1', [user.id]);
     await client.query('DELETE FROM plays WHERE listener_id = $1', [user.id]);
+    // Likes/dislikes donnés PAR ce compte sur les morceaux/clips d'autres artistes
+    await client.query('DELETE FROM track_likes WHERE user_id = $1', [user.id]);
+    await client.query('DELETE FROM clip_likes WHERE user_id = $1', [user.id]);
+    await client.query('DELETE FROM clip_dislikes WHERE user_id = $1', [user.id]);
     // Follows dans les deux sens (abonné à d'autres artistes / suivi par d'autres)
     await client.query('DELETE FROM follows WHERE follower_id = $1 OR artist_id = $1', [user.id]);
     // Paiements liés
     await client.query('DELETE FROM payments WHERE user_id = $1', [user.id]);
-    // Si c'est un artiste : vues/écoutes reçues sur son contenu, puis le contenu lui-même
+    // Si c'est un artiste : vues/écoutes/likes/mises en avant reçues sur son contenu, puis le contenu lui-même
     const tracks = await client.query('SELECT id FROM tracks WHERE artist_id = $1', [user.id]);
     for (const t of tracks.rows) {
       await client.query('DELETE FROM plays WHERE track_id = $1', [t.id]);
+      await client.query('DELETE FROM track_likes WHERE track_id = $1', [t.id]);
+      await client.query('DELETE FROM featured_tracks WHERE track_id = $1', [t.id]);
     }
     await client.query('DELETE FROM tracks WHERE artist_id = $1', [user.id]);
     const clips = await client.query('SELECT id FROM clips WHERE artist_id = $1', [user.id]);
     for (const c of clips.rows) {
       await client.query('DELETE FROM clip_views WHERE clip_id = $1', [c.id]);
+      await client.query('DELETE FROM clip_likes WHERE clip_id = $1', [c.id]);
+      await client.query('DELETE FROM clip_dislikes WHERE clip_id = $1', [c.id]);
     }
     await client.query('DELETE FROM clips WHERE artist_id = $1', [user.id]);
     // Enfin le compte lui-même
