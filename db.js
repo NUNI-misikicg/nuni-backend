@@ -150,6 +150,14 @@ async function initSchema() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(user_id, clip_id)
     );
+
+    CREATE TABLE IF NOT EXISTS clip_dislikes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      clip_id INTEGER NOT NULL REFERENCES clips(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, clip_id)
+    );
   `);
 
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
@@ -179,6 +187,8 @@ async function initSchema() {
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS studio TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS description TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS release_date TIMESTAMPTZ;`);
+
+  await pool.query(`ALTER TABLE clips ADD COLUMN IF NOT EXISTS dislikes INTEGER DEFAULT 0;`);
 
   // ---------- Sons en vedette — sélectionnés par l'artiste pour sa biographie ----------
   // L'artiste choisit, parmi ses propres morceaux déjà publiés, jusqu'à 6 à mettre en avant

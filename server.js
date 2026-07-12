@@ -600,7 +600,7 @@ app.get('/api/me/liked-tracks', authMiddleware, h(async (req, res) => {
 // ---------- Likes réels sur les clips ----------
 app.post('/api/clips/:id/like', authMiddleware, h(async (req, res) => {
   const clipId = Number(req.params.id);
-  const clip = await db.get('SELECT id, likes FROM clips WHERE id = $1', [clipId]);
+  const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
   if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
 
   const existing = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
@@ -613,9 +613,51 @@ app.post('/api/clips/:id/like', authMiddleware, h(async (req, res) => {
     await db.run('INSERT INTO clip_likes (user_id, clip_id) VALUES ($1,$2)', [req.user.id, clipId]);
     await db.run('UPDATE clips SET likes = likes + 1 WHERE id = $1', [clipId]);
     liked = true;
+    // Exclusion mutuelle façon YouTube — un "j'aime" retire automatiquement un "je n'aime pas"
+    // déjà posé par la même personne sur ce clip.
+    const existingDislike = await db.get('SELECT id FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    if (existingDislike) {
+      await db.run('DELETE FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+      await db.run('UPDATE clips SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1', [clipId]);
+    }
   }
-  const fresh = await db.get('SELECT likes FROM clips WHERE id = $1', [clipId]);
-  res.json({ liked, likes: fresh.likes });
+  const fresh = await db.get('SELECT likes, dislikes FROM clips WHERE id = $1', [clipId]);
+  res.json({ liked, disliked: false, likes: fresh.likes, dislikes: fresh.dislikes });
+}));
+
+// ---------- "Je n'aime pas" — même principe que le like, avec exclusion mutuelle ----------
+app.post('/api/clips/:id/dislike', authMiddleware, h(async (req, res) => {
+  const clipId = Number(req.params.id);
+  const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
+  if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
+
+  const existing = await db.get('SELECT id FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  let disliked;
+  if (existing) {
+    await db.run('DELETE FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1', [clipId]);
+    disliked = false;
+  } else {
+    await db.run('INSERT INTO clip_dislikes (user_id, clip_id) VALUES ($1,$2)', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET dislikes = dislikes + 1 WHERE id = $1', [clipId]);
+    disliked = true;
+    const existingLike = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    if (existingLike) {
+      await db.run('DELETE FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+      await db.run('UPDATE clips SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [clipId]);
+    }
+  }
+  const fresh = await db.get('SELECT likes, dislikes FROM clips WHERE id = $1', [clipId]);
+  res.json({ disliked, liked: false, likes: fresh.likes, dislikes: fresh.dislikes });
+}));
+
+// ---------- Statut like/dislike de la personne connectée sur un clip précis ----------
+// Utile à l'ouverture du lecteur de clip, pour afficher les bons boutons déjà actifs.
+app.get('/api/clips/:id/my-reaction', authMiddleware, h(async (req, res) => {
+  const clipId = Number(req.params.id);
+  const liked = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  const disliked = await db.get('SELECT id FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  res.json({ liked: !!liked, disliked: !!disliked });
 }));
 
 // ---------- Statut de suivi réel — pour afficher "Suivre" / "Suivi ✓" au bon état à l'ouverture ----------
@@ -705,7 +747,7 @@ app.post('/api/follow', authMiddleware, h(async (req, res) => {
 
 app.get('/api/clips', h(async (req, res) => {
   const rows = await db.query(`
-    SELECT c.id, c.title, c.thumb_url, c.video_url, c.views, c.likes,
+    SELECT c.id, c.title, c.thumb_url, c.video_url, c.views, c.likes, c.dislikes,
            u.id as artist_id, u.artist_name, u.avatar_url as artist_avatar_url
     FROM clips c JOIN users u ON u.id = c.artist_id
     WHERE c.published = 1 AND (c.scheduled_release_at IS NULL OR c.scheduled_release_at <= NOW())
