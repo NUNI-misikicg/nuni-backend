@@ -241,6 +241,20 @@ async function initSchema() {
       UNIQUE(user_id, item_key)
     );
   `);
+
+  // ---------- NUNI Talent — vrais votes hebdomadaires ----------
+  // Avant : classement 100% inventé (noms fictifs, streams aléatoires, votes jamais
+  // enregistrés nulle part). Un seul vote par personne et par semaine, pour un vrai artiste.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS talent_votes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      week_key TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, week_key)
+    );
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };

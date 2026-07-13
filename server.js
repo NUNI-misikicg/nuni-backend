@@ -1123,6 +1123,58 @@ app.get('/api/artists/top100', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
+// ---------- NUNI Talent — vrai classement (écoutes réelles + votes de la semaine) ----------
+// Avant : noms fictifs, streams aléatoires générés côté client, votes jamais enregistrés.
+// Score = vraies écoutes cumulées de l'artiste + un vrai poids par vote reçu cette semaine —
+// un artiste avec peu de streams peut donc vraiment grimper grâce aux votes, sans que ça
+// écrase complètement le poids des vraies écoutes.
+const TALENT_VOTE_WEIGHT = 2000;
+app.get('/api/talent/top100', h(async (req, res) => {
+  const weekKey = weeklyPeriodKey();
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
+      (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as genre,
+      COALESCE((SELECT SUM(streams) FROM tracks WHERE artist_id = u.id), 0)::int as total_streams,
+      (SELECT COUNT(*)::int FROM talent_votes tv WHERE tv.artist_id = u.id AND tv.week_key = $1) as votes_this_week
+    FROM users u
+    WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+  `, [weekKey]);
+
+  const withScore = rows.map((r) => ({ ...r, score: r.total_streams + r.votes_this_week * TALENT_VOTE_WEIGHT }));
+  withScore.sort((a, b) => b.score - a.score);
+  withScore.forEach((r, i) => { r.rank = i + 1; });
+
+  const weeklyWinner = [...withScore].sort((a, b) => b.votes_this_week - a.votes_this_week || b.score - a.score)[0] || null;
+
+  let myVote = null;
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const payload = token ? verifyToken(token) : null;
+  if (payload) {
+    const existing = await db.get('SELECT artist_id FROM talent_votes WHERE user_id = $1 AND week_key = $2', [payload.id, weekKey]);
+    myVote = existing ? existing.artist_id : null;
+  }
+
+  res.json({ artists: withScore.slice(0, 100), weekly_winner: weeklyWinner, my_vote_artist_id: myVote });
+}));
+
+app.post('/api/talent/vote', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
+  const { artistId } = req.body;
+  const artist = await db.get(
+    `SELECT id FROM users WHERE id = $1 AND account_type = 'artist' AND subscription_status = 'active' AND plan = 'artist'`,
+    [artistId],
+  );
+  if (!artist) return res.status(404).json({ error: "Artiste introuvable ou sans Pass Artiste actif." });
+
+  const weekKey = weeklyPeriodKey();
+  const existing = await db.get('SELECT id FROM talent_votes WHERE user_id = $1 AND week_key = $2', [req.user.id, weekKey]);
+  if (existing) return res.status(400).json({ error: 'Vous avez déjà voté cette semaine — revenez la semaine prochaine.' });
+
+  await db.run('INSERT INTO talent_votes (user_id, artist_id, week_key) VALUES ($1,$2,$3)', [req.user.id, artistId, weekKey]);
+  await addXp(req.user.id, 10);
+  res.json({ message: 'Vote enregistré — merci de soutenir la scène congolaise 🕊️' });
+}));
+
 app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const { artistId } = req.body;
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
