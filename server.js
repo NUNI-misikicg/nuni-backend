@@ -21,6 +21,7 @@ const app = express();
 // serveur-à-serveur) restent autorisées — un navigateur ne les émet jamais sans origine.
 const ALLOWED_ORIGINS = [
   'https://nuni-misikicg.github.io',
+  'https://nuni-backend.onrender.com', // héberge admin.html directement (public/admin.html)
 ];
 app.use(cors({
   origin(origin, callback) {
