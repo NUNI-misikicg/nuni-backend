@@ -330,7 +330,10 @@
         const typePill = u.account_type === 'artist' ? '<span class="pill artist">Artiste</span>' : '<span class="pill consumer">Consommateur</span>';
         const verified = u.is_verified ? ' <span class="pill verified">✓</span>' : '';
         const accStatus = u.account_status || 'active';
-        const accPill = accStatus === 'suspended' ? '<span class="pill expired">🔒 Suspendu</span>' : (accStatus === 'deleted' ? '<span class="pill expired">Supprimé</span>' : '<span class="pill active">Actif</span>');
+        const accPill = accStatus === 'suspended' ? '<span class="pill expired">🔒 Suspendu</span>'
+          : accStatus === 'deleted' ? '<span class="pill expired">Supprimé</span>'
+          : u.subscription_status === 'pending' ? '<span class="pill pending">En cours d\'activation</span>'
+          : '<span class="pill active">Actif</span>';
         html += '<tr><td>'+name+verified+'</td><td>'+u.email+'</td><td>'+typePill+'</td><td>'+(u.plan||'—')+'</td><td>'+(u.subscription_status||'—')+'</td><td>'+accPill+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+new Date(u.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
       });
       html += '</table>';
