@@ -1265,6 +1265,11 @@ app.post('/api/admin/users/delete', h(async (req, res) => {
     await client.query('DELETE FROM follows WHERE follower_id = $1 OR artist_id = $1', [user.id]);
     // Paiements liés
     await client.query('DELETE FROM payments WHERE user_id = $1', [user.id]);
+    // Progression de gamification liée (défis + achats boutique) — ajoutée après la première
+    // version de cette cascade, oubliée ici jusqu'à présent : provoquait une violation de
+    // clé étrangère (donc un crash 500) dès qu'un compte ayant progressé était supprimé.
+    await client.query('DELETE FROM challenge_progress WHERE user_id = $1', [user.id]);
+    await client.query('DELETE FROM shop_purchases WHERE user_id = $1', [user.id]);
     // Si c'est un artiste : vues/écoutes/likes/mises en avant reçues sur son contenu, puis le contenu lui-même
     const tracks = await client.query('SELECT id FROM tracks WHERE artist_id = $1', [user.id]);
     for (const t of tracks.rows) {
