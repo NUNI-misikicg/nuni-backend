@@ -93,6 +93,50 @@ async function withArtistStats(u) {
   return { ...u, track_count: trackCount, follower_count: followerCount };
 }
 
+// ================= PROGRESSION (XP, niveaux, série d'écoute) =================
+// Fondation du système de gamification : 10 niveaux, seuils d'XP croissants.
+const NUNI_LEVELS = [
+  { level: 1, name: 'Rookie', minXp: 0 },
+  { level: 2, name: 'Explorer', minXp: 100 },
+  { level: 3, name: 'Supporter', minXp: 300 },
+  { level: 4, name: 'Auditeur Premium', minXp: 700 },
+  { level: 5, name: 'Légende', minXp: 1500 },
+  { level: 6, name: 'Elite', minXp: 3000 },
+  { level: 7, name: 'Diamant', minXp: 6000 },
+  { level: 8, name: 'Icône', minXp: 12000 },
+  { level: 9, name: 'Ambassadeur', minXp: 25000 },
+  { level: 10, name: 'NUNI GOD', minXp: 50000 },
+];
+function levelInfoForXp(xp) {
+  let current = NUNI_LEVELS[0];
+  for (const l of NUNI_LEVELS) { if (xp >= l.minXp) current = l; }
+  const next = NUNI_LEVELS.find((l) => l.minXp > xp) || null;
+  const progressPct = next ? Math.round(((xp - current.minXp) / (next.minXp - current.minXp)) * 100) : 100;
+  return {
+    level: current.level, name: current.name, xp,
+    next_level_name: next ? next.name : null,
+    xp_for_next: next ? next.minXp : null,
+    progress_pct: progressPct,
+  };
+}
+async function addXp(userId, amount) {
+  try { await db.run('UPDATE users SET xp = COALESCE(xp,0) + $1 WHERE id = $2', [amount, userId]); } catch (e) { /* jamais bloquant */ }
+}
+// Connexion quotidienne : +15 XP la première fois du jour, et incrémente la vraie série
+// (streak_days) si la dernière activité était bien hier — remise à zéro sinon.
+async function touchDailyLogin(userId) {
+  try {
+    const user = await db.get('SELECT last_active_date, streak_days FROM users WHERE id = $1', [userId]);
+    if (!user) return;
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.last_active_date && new Date(user.last_active_date).toISOString().slice(0, 10) === today) return; // déjà compté aujourd'hui
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const wasYesterday = user.last_active_date && new Date(user.last_active_date).toISOString().slice(0, 10) === yesterday;
+    const newStreak = wasYesterday ? (user.streak_days || 0) + 1 : 1;
+    await db.run('UPDATE users SET last_active_date = $1, streak_days = $2, xp = COALESCE(xp,0) + 15 WHERE id = $3', [today, newStreak, userId]);
+  } catch (e) { /* jamais bloquant */ }
+}
+
 // ================= AUTH =================
 
 app.post('/api/register', h(async (req, res) => {
@@ -160,7 +204,9 @@ app.post('/api/login', h(async (req, res) => {
   }
 
   const token = signToken(user);
-  res.json({ token, user: publicUser(await withArtistStats(user)) });
+  await touchDailyLogin(user.id);
+  const fresh = await db.get('SELECT * FROM users WHERE id = $1', [user.id]);
+  res.json({ token, user: publicUser(await withArtistStats(fresh)) });
 }));
 
 app.get('/api/me', authMiddleware, h(async (req, res) => {
@@ -168,6 +214,47 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
   const user = await db.get('SELECT * FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
   res.json({ user: publicUser(await withArtistStats(user)) });
+}));
+
+// ---------- Progression réelle : niveau, XP, et les 6 badges calculés à partir de vraies actions ----------
+// Avant : "Vos badges d'auditeur" était un tableau entièrement codé en dur (même le "62/100"
+// était du texte fixe). Ici, chaque badge est calculé en direct depuis les vraies données
+// (écoutes, genres, artistes suivis, classement mensuel réel).
+app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
+  const user = await db.get('SELECT id, xp, streak_days, created_at FROM users WHERE id = $1', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+
+  const distinctTracks = (await db.get(
+    'SELECT COUNT(DISTINCT track_id)::int as c FROM plays WHERE listener_id = $1', [user.id],
+  )).c;
+  const distinctGenres = (await db.get(`
+    SELECT COUNT(DISTINCT t.genre)::int as c FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    WHERE p.listener_id = $1 AND t.genre IS NOT NULL
+  `, [user.id])).c;
+  const followedArtists = (await db.get(
+    'SELECT COUNT(*)::int as c FROM follows WHERE follower_id = $1', [user.id],
+  )).c;
+  const monthlyRank = await db.get(`
+    WITH monthly AS (
+      SELECT listener_id, COUNT(*) as c FROM plays
+      WHERE created_at >= date_trunc('month', NOW()) AND listener_id IS NOT NULL
+      GROUP BY listener_id
+    )
+    SELECT c, RANK() OVER (ORDER BY c DESC) as rnk FROM monthly WHERE listener_id = $1
+  `, [user.id]);
+  const isTopListener = !!(monthlyRank && Number(monthlyRank.rnk) <= 10);
+
+  const badges = [
+    { ic: '🕊️', n: 'Fan de la première heure', locked: false, d: 'Compte créé' },
+    { ic: '🎧', n: '100 titres découverts', locked: distinctTracks < 100, d: `${distinctTracks}/100` },
+    { ic: '🔥', n: `${user.streak_days || 0} jour(s) d'écoute d'affilée`, locked: (user.streak_days || 0) < 7, d: (user.streak_days || 0) >= 7 ? 'Débloqué' : 'Série en cours' },
+    { ic: '🌍', n: '5 genres explorés', locked: distinctGenres < 5, d: `${distinctGenres}/5` },
+    { ic: '💛', n: '10 artistes soutenus', locked: followedArtists < 10, d: `${followedArtists}/10` },
+    { ic: '🏆', n: 'Top auditeur du mois', locked: !isTopListener, d: isTopListener ? `Rang #${monthlyRank.rnk}` : 'Verrouillé' },
+  ];
+
+  res.json({ ...levelInfoForXp(user.xp || 0), streak_days: user.streak_days || 0, badges });
 }));
 
 // ================= ABONNEMENT =================
@@ -208,6 +295,7 @@ async function activateAndNotify(user, plan, durationDays, promoCode) {
   if (promoResult.valid && promoResult.code) {
     await db.run('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [promoResult.code]);
   }
+  await addXp(user.id, 300);
 
   const mailResult = await sendAccessCodeEmail({ user, plan, accessCode: access_code, durationDays });
   return {
@@ -566,6 +654,7 @@ app.post('/api/tracks/:id/play', h(async (req, res) => {
 
   await db.run('INSERT INTO plays (track_id, listener_id) VALUES ($1,$2)', [trackId, listenerId]);
   await db.run('UPDATE tracks SET streams = streams + 1 WHERE id = $1', [trackId]);
+  await addXp(listenerId, 5);
   res.json({ counted: true, streams: track.streams + 1 });
 }));
 
@@ -759,6 +848,7 @@ app.post('/api/follow', authMiddleware, h(async (req, res) => {
   } else {
     await db.run('INSERT INTO follows (follower_id, artist_id) VALUES ($1,$2)', [req.user.id, artist.id]);
     following = true;
+    await addXp(req.user.id, 20);
   }
   const followersCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artist.id])).c;
   res.json({ following, followersCount });

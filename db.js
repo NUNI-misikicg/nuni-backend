@@ -175,6 +175,13 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 
+  // ---------- Progression réelle (XP, niveaux, série d'écoute) ----------
+  // Fondation du système de gamification demandé : plus de badges/niveaux inventés,
+  // tout est calculé à partir de vraies actions (écoutes, connexions, suivis, achats de Pass).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_days INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_date DATE;`);
+
   // ---------- Crédits réels du morceau ----------
   // Avant : le formulaire de publication affichait des champs "Description", "Date de
   // sortie", "Compositeur / Auteur", "Featuring", "Studio d'enregistrement" — mais rien
