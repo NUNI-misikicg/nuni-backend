@@ -165,7 +165,7 @@ app.get('/api/shop/items', authMiddleware, h(async (req, res) => {
   });
 }));
 
-app.post('/api/shop/items/:key/buy', authMiddleware, h(async (req, res) => {
+app.post('/api/shop/items/:key/buy', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
   const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
   if (!item) return res.status(404).json({ error: 'Article introuvable.' });
   if (await db.get('SELECT id FROM shop_purchases WHERE user_id = $1 AND item_key = $2', [req.user.id, item.key])) {
@@ -266,7 +266,7 @@ app.get('/api/me/challenges', authMiddleware, h(async (req, res) => {
 }));
 
 // Récupère l'XP d'un défi complété — une seule fois par période, vérifié côté serveur.
-app.post('/api/me/challenges/:key/claim', authMiddleware, h(async (req, res) => {
+app.post('/api/me/challenges/:key/claim', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
   const def = CHALLENGES.find((c) => c.key === req.params.key);
   if (!def) return res.status(404).json({ error: 'Défi introuvable.' });
   const periodKey = periodKeyFor(def.period);
@@ -509,6 +509,42 @@ function checkAdminKey(req, res) {
   }
   return true;
 }
+
+// ================= SÉCURITÉ ANTI-TRICHE (étape 6 gamification) =================
+// Limiteur de débit léger en mémoire (sans dépendance externe) — identifie la personne par
+// son compte si connectée (même via un token décodé manuellement sur les routes publiques),
+// sinon par IP. Protège les routes qui rapportent de l'XP/des NUNI Points/des interactions
+// contre un script qui les appellerait en boucle.
+const rateLimitBuckets = new Map();
+function rateLimitKeyFor(req) {
+  if (req.user && req.user.id) return 'u' + req.user.id;
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const payload = token ? verifyToken(token) : null;
+  if (payload) return 'u' + payload.id;
+  return 'ip' + req.ip;
+}
+function rateLimit(maxRequests, windowMs) {
+  return (req, res, next) => {
+    const key = rateLimitKeyFor(req);
+    const now = Date.now();
+    let bucket = rateLimitBuckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      rateLimitBuckets.set(key, bucket);
+    }
+    bucket.count++;
+    if (bucket.count > maxRequests) {
+      return res.status(429).json({ error: 'Trop de requêtes en peu de temps — merci de ralentir un instant.' });
+    }
+    next();
+  };
+}
+// Purge périodique pour ne pas laisser grossir la Map indéfiniment sur un serveur qui tourne longtemps.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets) { if (now > bucket.resetAt) rateLimitBuckets.delete(key); }
+}, 5 * 60 * 1000);
 
 app.post('/api/admin/activate', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
@@ -827,7 +863,7 @@ const NUNI_PRICE_PER_STREAM_FCFA = 2;
 const NUNI_ARTIST_SHARE_PCT = 75;
 const MONTH_LABELS_FR = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Juin', 'Juil', 'Août', 'Sep', 'Oct', 'Nov', 'Déc'];
 
-app.post('/api/tracks/:id/play', h(async (req, res) => {
+app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   const trackId = Number(req.params.id);
   const track = await db.get('SELECT id, artist_id, streams FROM tracks WHERE id = $1', [trackId]);
   if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
@@ -849,15 +885,24 @@ app.post('/api/tracks/:id/play', h(async (req, res) => {
 
   await db.run('INSERT INTO plays (track_id, listener_id) VALUES ($1,$2)', [trackId, listenerId]);
   await db.run('UPDATE tracks SET streams = streams + 1 WHERE id = $1', [trackId]);
-  await addXp(listenerId, 5);
-  await addPoints(listenerId, 1);
-  await bumpChallenge(listenerId, 'daily_listen_3', 1);
-  await bumpChallenge(listenerId, 'weekly_listen_15', 1);
+  // Le vrai stream ci-dessus compte toujours pour la rémunération de l'artiste, sans plafond —
+  // seule la RÉCOMPENSE de gamification (XP/points/défis) est limitée à 40 écoutes par jour,
+  // pour empêcher un script d'enchaîner des écoutes en boucle uniquement pour farmer de l'XP.
+  const DAILY_PLAY_REWARD_CAP = 40;
+  const todayPlaysCount = (await db.get(
+    "SELECT COUNT(*)::int as c FROM plays WHERE listener_id = $1 AND created_at >= CURRENT_DATE", [listenerId],
+  )).c;
+  if (todayPlaysCount <= DAILY_PLAY_REWARD_CAP) {
+    await addXp(listenerId, 5);
+    await addPoints(listenerId, 1);
+    await bumpChallenge(listenerId, 'daily_listen_3', 1);
+    await bumpChallenge(listenerId, 'weekly_listen_15', 1);
+  }
   res.json({ counted: true, streams: track.streams + 1 });
 }));
 
 // ---------- Likes réels sur les morceaux (persistés, un seul like par personne) ----------
-app.post('/api/tracks/:id/like', authMiddleware, h(async (req, res) => {
+app.post('/api/tracks/:id/like', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const trackId = Number(req.params.id);
   const track = await db.get('SELECT id, likes FROM tracks WHERE id = $1', [trackId]);
   if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
@@ -886,7 +931,7 @@ app.get('/api/me/liked-tracks', authMiddleware, h(async (req, res) => {
 }));
 
 // ---------- Likes réels sur les clips ----------
-app.post('/api/clips/:id/like', authMiddleware, h(async (req, res) => {
+app.post('/api/clips/:id/like', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
   if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
@@ -915,7 +960,7 @@ app.post('/api/clips/:id/like', authMiddleware, h(async (req, res) => {
 }));
 
 // ---------- "Je n'aime pas" — même principe que le like, avec exclusion mutuelle ----------
-app.post('/api/clips/:id/dislike', authMiddleware, h(async (req, res) => {
+app.post('/api/clips/:id/dislike', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
   if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
@@ -1035,7 +1080,7 @@ app.get('/api/artists/featured', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
-app.post('/api/follow', authMiddleware, h(async (req, res) => {
+app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const { artistId } = req.body;
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
   if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
