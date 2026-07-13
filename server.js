@@ -1106,6 +1106,23 @@ app.get('/api/artists/featured', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
+// ---------- Top 100 artistes — vrai classement par abonnés ----------
+// Réservé aux comptes ayant réellement un Pass Artiste actif (même filtre que /featured),
+// classés par leur vrai nombre d'abonnés (table follows), pas par XP ni popularité inventée.
+app.get('/api/artists/top100', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
+      (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre,
+      (SELECT COUNT(*)::int FROM follows f WHERE f.artist_id = u.id) as follower_count,
+      RANK() OVER (ORDER BY (SELECT COUNT(*)::int FROM follows f WHERE f.artist_id = u.id) DESC) as rnk
+    FROM users u
+    WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+    ORDER BY follower_count DESC
+    LIMIT 100
+  `);
+  res.json({ artists: rows });
+}));
+
 app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const { artistId } = req.body;
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
