@@ -1131,7 +1131,114 @@ app.get('/api/artist/stats/monthly', authMiddleware, h(async (req, res) => {
   res.json({ monthly });
 }));
 
-// ---------- Artistes à suivre — vrais artistes avec un Pass Artiste actif ----------
+// ---------- Badges & progression réels — pour le panneau "Ton évolution" / "Badges exclusifs" ----------
+// Avant : rang, barre de progression et badges tous codés en dur, identiques pour tout le monde.
+// Ici : tout dérive de la table `plays` (un vrai stream = une ligne horodatée), sans nouvelle
+// table. Pas de prédiction inventée ("X% de chances") : uniquement des faits mesurés.
+// - roi_congo / rank : vrai classement par streams cumulés (tous artistes Pass actif)
+// - tendance : top 3 plus forte progression sur les 7 derniers jours (vraies écoutes datées)
+// - artiste_du_mois : #1 en streams depuis le 1er du mois calendaire en cours
+// - revelation : compte créé il y a ≤60 jours ET déjà dans le top 50
+// - legende : seuil de streams cumulés (1M, ajustable)
+// - choix_public : même gagnant que le vote hebdomadaire NUNI Talent
+app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const artistId = req.user.id;
+
+  const allArtists = await db.query(`
+    SELECT u.id, u.created_at,
+      COALESCE((SELECT SUM(streams) FROM tracks WHERE artist_id = u.id), 0)::int as total_streams
+    FROM users u
+    WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+  `);
+  const me = allArtists.find((a) => a.id === artistId);
+  if (!me) return res.status(404).json({ error: 'Profil artiste introuvable ou Pass inactif.' });
+
+  const sortedNow = [...allArtists].sort((a, b) => b.total_streams - a.total_streams);
+  const rank = sortedNow.findIndex((a) => a.id === artistId) + 1;
+
+  // Vraie progression sur 7 jours (table plays, horodatée) — pour "Tendance" et le delta de rang
+  const growthRows = await db.query(`
+    SELECT t.artist_id, COUNT(*)::int as streams_7d
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE p.created_at >= NOW() - INTERVAL '7 days'
+    GROUP BY t.artist_id
+  `);
+  const growthMap = {};
+  growthRows.forEach((r) => { growthMap[r.artist_id] = r.streams_7d; });
+  const myWeeklyGrowth = growthMap[artistId] || 0;
+
+  const tendanceTop3 = Object.entries(growthMap).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([id]) => Number(id));
+
+  // Rang tel qu'il était il y a 7 jours (déduit : total actuel moins ce qui a été gagné depuis)
+  const sorted7dAgo = [...allArtists]
+    .map((a) => ({ id: a.id, total_7d_ago: a.total_streams - (growthMap[a.id] || 0) }))
+    .sort((a, b) => b.total_7d_ago - a.total_7d_ago);
+  const rank7dAgo = sorted7dAgo.findIndex((a) => a.id === artistId) + 1;
+  const rankChange = rank7dAgo - rank; // positif = a gagné des places
+
+  // Auditeurs distincts réels sur 7 jours (pas de fausse "croissance d'audience")
+  const listenersRow = await db.get(`
+    SELECT COUNT(DISTINCT p.listener_id)::int as n
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = $1 AND p.created_at >= NOW() - INTERVAL '7 days'
+  `, [artistId]);
+
+  // Streams du mois calendaire en cours, tous artistes — pour "Artiste du mois"
+  const monthlyRows = await db.query(`
+    SELECT t.artist_id, COUNT(*)::int as streams_month
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE p.created_at >= date_trunc('month', NOW())
+    GROUP BY t.artist_id ORDER BY streams_month DESC LIMIT 1
+  `);
+  const artisteDuMoisId = monthlyRows[0] ? monthlyRows[0].artist_id : null;
+
+  // Gagnant du vote NUNI Talent cette semaine (même règle que /api/talent/top100)
+  const weekKey = weeklyPeriodKey();
+  const voteWinner = await db.get(`
+    SELECT artist_id FROM talent_votes WHERE week_key = $1
+    GROUP BY artist_id ORDER BY COUNT(*) DESC LIMIT 1
+  `, [weekKey]);
+
+  const LEGENDE_THRESHOLD = 1000000;
+  const daysSinceCreated = Math.floor((Date.now() - new Date(me.created_at).getTime()) / 86400000);
+
+  const badges = {
+    roi_congo: rank === 1,
+    tendance: myWeeklyGrowth > 0 && tendanceTop3.includes(artistId),
+    revelation: daysSinceCreated <= 60 && rank <= 50,
+    legende: me.total_streams >= LEGENDE_THRESHOLD,
+    choix_public: !!voteWinner && voteWinner.artist_id === artistId,
+    artiste_du_mois: artisteDuMoisId === artistId,
+  };
+
+  // Palier suivant pour la barre de progression (prochain seuil rond au-dessus du total actuel)
+  const milestones = [50000, 100000, 250000, 500000, 1000000, 2500000, 5000000, 10000000, 25000000];
+  const nextMilestone = milestones.find((m) => m > me.total_streams) || me.total_streams * 2;
+  const milestoneProgressPct = Math.min(100, Math.round((me.total_streams / nextMilestone) * 100));
+
+  // Vraie courbe des 14 derniers jours (une ligne par jour, table plays)
+  const dailySeries = await db.query(`
+    SELECT to_char(d.day, 'YYYY-MM-DD') as day,
+      COALESCE((SELECT COUNT(*)::int FROM plays p JOIN tracks t ON t.id = p.track_id
+        WHERE t.artist_id = $1 AND p.created_at::date = d.day), 0) as streams
+    FROM generate_series(CURRENT_DATE - INTERVAL '13 days', CURRENT_DATE, INTERVAL '1 day') as d(day)
+  `, [artistId]);
+
+  res.json({
+    rank,
+    rankChange,
+    total_streams: me.total_streams,
+    weekly_growth_streams: myWeeklyGrowth,
+    weekly_new_listeners: listenersRow.n,
+    nextMilestone,
+    milestoneProgressPct,
+    badges,
+    daily_streams: dailySeries,
+  });
+}));
+
+
 // Avant : 6 noms codés en dur ("Bibi Mwana", "Ndombe Junior"...), identiques pour tout le
 // monde, indéfiniment. Ici : une vraie sélection aléatoire parmi les artistes ayant
 // réellement payé leur Pass Artiste (donc de vrais comptes actifs à soutenir), qui change
@@ -1164,6 +1271,34 @@ app.get('/api/artists/top100', h(async (req, res) => {
     ORDER BY follower_count DESC
     LIMIT 100
   `);
+  res.json({ artists: rows });
+}));
+
+// ---------- Top artistes par streams — pour la pyramide Top Congo ----------
+// Vrais streams cumulés (SUM sur tracks.streams), même filtre Pass Artiste actif
+// que /top100 et /talent/top100. Pas de votes ici : uniquement l'écoute réelle.
+app.get('/api/artists/top-streams', h(async (req, res) => {
+  const genre = (req.query.genre || '').trim();
+  const rows = genre
+    ? await db.query(`
+        SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
+          $1::text as genre,
+          COALESCE((SELECT SUM(streams) FROM tracks WHERE artist_id = u.id AND genre = $1), 0)::int as total_streams
+        FROM users u
+        WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+          AND EXISTS (SELECT 1 FROM tracks WHERE artist_id = u.id AND genre = $1)
+        ORDER BY total_streams DESC
+        LIMIT 11
+      `, [genre])
+    : await db.query(`
+        SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
+          (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as genre,
+          COALESCE((SELECT SUM(streams) FROM tracks WHERE artist_id = u.id), 0)::int as total_streams
+        FROM users u
+        WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+        ORDER BY total_streams DESC
+        LIMIT 11
+      `);
   res.json({ artists: rows });
 }));
 
