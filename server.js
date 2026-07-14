@@ -432,6 +432,13 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const user = await db.get('SELECT * FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+  // Avant : seul /api/login vérifiait la suspension. Un compte déjà connecté (token valide)
+  // au moment où l'admin le suspend continuait d'accéder normalement à l'application — la
+  // vérification périodique côté client, qui interroge justement cet endpoint pour détecter
+  // une suspension pendant une session déjà ouverte, ne pouvait donc jamais rien détecter.
+  if (user.account_status === 'suspended') {
+    return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
+  }
   res.json({ user: publicUser(await withArtistStats(user)) });
 }));
 
