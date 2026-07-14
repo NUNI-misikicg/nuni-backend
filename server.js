@@ -1209,6 +1209,23 @@ app.post('/api/tracks/:id/like', authMiddleware, rateLimit(30, 60000), h(async (
   res.json({ liked, likes: fresh.likes });
 }));
 
+// Signalement réel — avant, le bouton ne faisait qu'afficher un message, rien n'était
+// jamais enregistré. Utilisable par un compte connecté OU un visiteur (reporter_id nullable),
+// pour ne jamais bloquer un vrai signalement légitime derrière une exigence de connexion.
+app.post('/api/tracks/:id/report', rateLimit(10, 60000), h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const track = await db.get('SELECT id FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  const authHeader = req.headers.authorization;
+  let reporterId = null;
+  if (authHeader) {
+    try { reporterId = verifyToken(authHeader.replace('Bearer ', '')).id; } catch (e) { /* visiteur non connecté : reporterId reste null */ }
+  }
+  const reason = (req.body && req.body.reason ? String(req.body.reason) : '').slice(0, 500) || null;
+  await db.run('INSERT INTO track_reports (track_id, reporter_id, reason) VALUES ($1,$2,$3)', [trackId, reporterId, reason]);
+  res.json({ message: 'Signalement enregistré — merci de votre vigilance, notre équipe va l\'examiner.' });
+}));
+
 // Liste des morceaux likés par l'utilisateur connecté — sert à resynchroniser les cœurs
 // (Favoris) après une reconnexion ou sur un autre appareil, au lieu de repartir de zéro.
 app.get('/api/me/liked-tracks', authMiddleware, h(async (req, res) => {
@@ -1835,6 +1852,21 @@ app.get('/api/promo/:code/status', h(async (req, res) => {
   );
   if (!row) return res.status(404).json({ error: 'Code introuvable.' });
   res.json(row);
+}));
+
+app.get('/api/admin/track-reports', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(`
+    SELECT tr.id, tr.reason, tr.created_at, t.title, t.id as track_id,
+      u.artist_name, u.first_name as artist_first_name,
+      rep.first_name as reporter_first_name, rep.email as reporter_email
+    FROM track_reports tr
+    JOIN tracks t ON t.id = tr.track_id
+    JOIN users u ON u.id = t.artist_id
+    LEFT JOIN users rep ON rep.id = tr.reporter_id
+    ORDER BY tr.created_at DESC LIMIT 100
+  `);
+  res.json({ reports: rows });
 }));
 
 app.get('/api/admin/promo-codes', h(async (req, res) => {
