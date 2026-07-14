@@ -792,6 +792,23 @@ app.get('/api/artist/:id/featured-tracks', h(async (req, res) => {
 // aucune vraie programmation. Ici : les vrais morceaux/albums que CET artiste a importés
 // avec une date de sortie future (published=0, en attente du job qui les publie
 // automatiquement à l'heure dite — voir le setInterval plus bas dans ce fichier).
+// ---------- Calendrier des sorties — page d'accueil, toute la plateforme ----------
+// Avant : 4 sorties codées en dur ("Nzela ya Sika"...), identiques pour tout le monde,
+// dates figées pour toujours. Ici : vraies sorties programmées de tous les artistes
+// (Pass Artiste actif), triées par date réelle la plus proche.
+app.get('/api/releases/upcoming', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT t.title, t.release_type, t.scheduled_release_at, u.artist_name, u.first_name
+    FROM tracks t
+    JOIN users u ON u.id = t.artist_id
+    WHERE t.published = 0 AND t.scheduled_release_at IS NOT NULL AND t.scheduled_release_at > NOW()
+      AND u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+    ORDER BY t.scheduled_release_at ASC
+    LIMIT 8
+  `);
+  res.json({ releases: rows });
+}));
+
 app.get('/api/artist/:id/scheduled-releases', h(async (req, res) => {
   const artistId = Number(req.params.id);
   const rows = await db.query(`
@@ -1386,6 +1403,11 @@ app.post('/api/notifications/mark-read', authMiddleware, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// Paliers de followers qui déclenchent une notification de félicitations — seuils réels,
+// vérifiés à chaque nouveau follower (le compteur avance de 1 en 1, donc chaque seuil est
+// forcément atteint exactement une fois, pas de risque de le "sauter").
+const FOLLOWER_MILESTONES = [100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000];
+
 app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const { artistId } = req.body;
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
@@ -1406,6 +1428,13 @@ app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res)
     await createNotification(artist.id, 'follower', 'Nouveau follower', `${followerName} vous suit désormais.`, null);
   }
   const followersCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artist.id])).c;
+  if (following && FOLLOWER_MILESTONES.includes(followersCount)) {
+    await createNotification(
+      artist.id, 'follower_milestone', '🎉 Nouveau palier atteint',
+      `Vous venez d'atteindre ${followersCount.toLocaleString('fr-FR')} followers. Votre musique touche de plus en plus de monde.`,
+      null,
+    );
+  }
   res.json({ following, followersCount });
 }));
 
@@ -1683,6 +1712,38 @@ setInterval(async () => {
     }
   } catch (e) { console.error('Erreur job publication planifiée:', e); }
 }, 60 * 1000);
+
+// ---------- Rappels d'absence (3j / 7j) — vrai `last_active_date`, déjà mis à jour à
+// chaque connexion (touchDailyLogin). Un seul envoi par seuil : on compare la date exacte,
+// donc ça ne se déclenche qu'une fois pile à 3 jours et une fois pile à 7 jours d'absence,
+// pas tous les jours en boucle. Passe une fois par jour, pas besoin de tourner plus souvent.
+async function sendAbsenceReminders() {
+  try {
+    const staleAt = (days) => new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    const threeDayUsers = await db.query(
+      "SELECT id FROM users WHERE last_active_date IS NOT NULL AND last_active_date::date = $1::date AND account_type = 'consumer'",
+      [staleAt(3)],
+    );
+    for (const u of threeDayUsers) {
+      await createNotification(
+        u.id, 'absence_reminder', '👋 On a remarqué votre absence',
+        'De nouveaux morceaux vous attendent. Revenez découvrir ce qui fait vibrer le Congo.', null,
+      );
+    }
+    const sevenDayUsers = await db.query(
+      "SELECT id FROM users WHERE last_active_date IS NOT NULL AND last_active_date::date = $1::date AND account_type = 'consumer'",
+      [staleAt(7)],
+    );
+    for (const u of sevenDayUsers) {
+      await createNotification(
+        u.id, 'absence_reminder', '✨ Votre bibliothèque a changé',
+        'Plusieurs artistes que vous suivez ont publié de nouveaux titres depuis votre dernière visite.', null,
+      );
+    }
+  } catch (e) { console.error('Erreur job rappels d\'absence:', e); }
+}
+setInterval(sendAbsenceReminders, 24 * 60 * 60 * 1000);
+sendAbsenceReminders(); // premier passage au démarrage, pas besoin d'attendre 24h
 
 async function start() {
   await db.initSchema();
