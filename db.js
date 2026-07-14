@@ -134,7 +134,6 @@ async function initSchema() {
       viewer_id INTEGER REFERENCES users(id),
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-
     CREATE TABLE IF NOT EXISTS track_likes (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -196,6 +195,27 @@ async function initSchema() {
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS release_date TIMESTAMPTZ;`);
 
   await pool.query(`ALTER TABLE clips ADD COLUMN IF NOT EXISTS dislikes INTEGER DEFAULT 0;`);
+
+  // ---------- Contrainte d'unicité manquante sur plays/clip_views ----------
+  // Avant : "déjà écouté/vu ?" était vérifié en code (SELECT puis INSERT), pas garanti par
+  // la base — deux requêtes simultanées (double-clic, connexion lente qui retente) pouvaient
+  // compter le même stream/vue deux fois, gonflant à tort les revenus réels de l'artiste.
+  // Nettoie d'abord les doublons déjà présents (sinon la contrainte échouerait à la création),
+  // recalcule honnêtement les compteurs à partir des vraies lignes dédupliquées, puis verrouille
+  // au niveau base pour qu'un doublon devienne structurellement impossible désormais.
+  await pool.query(`
+    DELETE FROM plays a USING plays b
+    WHERE a.id > b.id AND a.track_id = b.track_id AND a.listener_id = b.listener_id AND a.listener_id IS NOT NULL;
+  `);
+  await pool.query(`UPDATE tracks SET streams = (SELECT COUNT(*)::int FROM plays WHERE plays.track_id = tracks.id);`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plays_unique_listener ON plays(track_id, listener_id) WHERE listener_id IS NOT NULL;`);
+
+  await pool.query(`
+    DELETE FROM clip_views a USING clip_views b
+    WHERE a.id > b.id AND a.clip_id = b.clip_id AND a.viewer_id = b.viewer_id AND a.viewer_id IS NOT NULL;
+  `);
+  await pool.query(`UPDATE clips SET views = (SELECT COUNT(*)::int FROM clip_views WHERE clip_views.clip_id = clips.id);`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_clip_views_unique_viewer ON clip_views(clip_id, viewer_id) WHERE viewer_id IS NOT NULL;`);
 
   // ---------- Sons en vedette — sélectionnés par l'artiste pour sa biographie ----------
   // L'artiste choisit, parmi ses propres morceaux déjà publiés, jusqu'à 6 à mettre en avant
@@ -267,6 +287,44 @@ async function initSchema() {
       image_url TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+  `);
+
+  // ---------- Notifications réelles ----------
+  // Nouveau follower, nouvelle sortie d'un artiste suivi, palier de followers, rappel
+  // d'absence — jamais de contenu inventé, uniquement de vrais événements déclenchés côté
+  // serveur (voir createNotification dans server.js).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      link TEXT,
+      is_read INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+  `);
+
+  // ---------- Playlists NUNI — curées par l'équipe depuis admin.html ----------
+  // Jamais de playlist générée automatiquement sans validation humaine (voir l'onglet
+  // Playlists de admin.html, avec tirage aléatoire proposé comme point de départ seulement).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS playlists (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      cover_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS playlist_tracks (
+      id SERIAL PRIMARY KEY,
+      playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id, position);
   `);
 }
 

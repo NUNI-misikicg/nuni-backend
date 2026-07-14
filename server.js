@@ -1157,11 +1157,16 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   if (listener.plan === 'discovery') {
     return res.json({ counted: false, reason: "Écoute en Pass Découverte — ne compte pas comme un vrai stream tant qu'aucun Pass payant n'est validé.", streams: track.streams });
   }
-  if (await db.get('SELECT id FROM plays WHERE track_id = $1 AND listener_id = $2', [trackId, listenerId])) {
+  // Insertion atomique (la base garantit maintenant l'unicité track_id+listener_id) — plus de
+  // vérification séparée avant l'insertion, qui laissait une petite fenêtre pour compter deux
+  // fois la même écoute en cas de requêtes simultanées.
+  const inserted = await db.run(
+    'INSERT INTO plays (track_id, listener_id) VALUES ($1,$2) ON CONFLICT (track_id, listener_id) WHERE listener_id IS NOT NULL DO NOTHING',
+    [trackId, listenerId],
+  );
+  if (!inserted.rowCount) {
     return res.json({ counted: false, reason: 'Déjà compté lors de votre première écoute de ce morceau.', streams: track.streams });
   }
-
-  await db.run('INSERT INTO plays (track_id, listener_id) VALUES ($1,$2)', [trackId, listenerId]);
   await db.run('UPDATE tracks SET streams = streams + 1 WHERE id = $1', [trackId]);
   // Le vrai stream ci-dessus compte toujours pour la rémunération de l'artiste, sans plafond —
   // seule la RÉCOMPENSE de gamification (XP/points/défis) est limitée à 40 écoutes par jour,
@@ -1662,11 +1667,15 @@ app.post('/api/clips/:id/view', h(async (req, res) => {
   if (viewer && viewer.plan === 'discovery') {
     return res.json({ counted: false, reason: "Vue en Pass Découverte — ne compte pas comme une vraie vue tant qu'aucun Pass payant n'est validé.", views: clip.views });
   }
-  if (await db.get('SELECT id FROM clip_views WHERE clip_id = $1 AND viewer_id = $2', [clipId, viewerId])) {
+  // Insertion atomique (la base garantit maintenant l'unicité clip_id+viewer_id) — même
+  // correction que pour les streams, plus de fenêtre de course possible.
+  const inserted = await db.run(
+    'INSERT INTO clip_views (clip_id, viewer_id) VALUES ($1,$2) ON CONFLICT (clip_id, viewer_id) WHERE viewer_id IS NOT NULL DO NOTHING',
+    [clipId, viewerId],
+  );
+  if (!inserted.rowCount) {
     return res.json({ counted: false, reason: 'Déjà compté lors de votre première vue de ce clip.', views: clip.views });
   }
-
-  await db.run('INSERT INTO clip_views (clip_id, viewer_id) VALUES ($1,$2)', [clipId, viewerId]);
   await db.run('UPDATE clips SET views = views + 1 WHERE id = $1', [clipId]);
   res.json({ counted: true, views: clip.views + 1 });
 }));
