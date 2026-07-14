@@ -1125,8 +1125,16 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   if (!listenerId) {
     return res.json({ counted: false, reason: 'Connectez-vous pour que votre écoute soit comptée.', streams: track.streams });
   }
-  if (payload.accountType !== 'consumer') {
+  // Vérifié en base en direct (pas seulement dans le token, qui peut dater d'avant un
+  // changement de Pass) — un compte Pass Découverte n'a payé pour rien : ses écoutes ne
+  // doivent générer ni vrai stream ni rémunération pour l'artiste. Elles compteront
+  // normalement dès que la personne valide un vrai Pass Consommateur payant.
+  const listener = await db.get('SELECT account_type, plan FROM users WHERE id = $1', [listenerId]);
+  if (!listener || listener.account_type !== 'consumer') {
     return res.json({ counted: false, reason: "Seules les écoutes via un Pass Consommateur génèrent un stream.", streams: track.streams });
+  }
+  if (listener.plan === 'discovery') {
+    return res.json({ counted: false, reason: "Écoute en Pass Découverte — ne compte pas comme un vrai stream tant qu'aucun Pass payant n'est validé.", streams: track.streams });
   }
   if (await db.get('SELECT id FROM plays WHERE track_id = $1 AND listener_id = $2', [trackId, listenerId])) {
     return res.json({ counted: false, reason: 'Déjà compté lors de votre première écoute de ce morceau.', streams: track.streams });
@@ -1626,6 +1634,12 @@ app.post('/api/clips/:id/view', h(async (req, res) => {
   }
   if (viewerId === clip.artist_id) {
     return res.json({ counted: false, reason: "Une vue de son propre clip n'est pas comptée.", views: clip.views });
+  }
+  // Même règle que pour les streams : un compte Pass Découverte n'a rien payé, ses vues ne
+  // comptent pas tant qu'aucun vrai Pass n'est validé.
+  const viewer = await db.get('SELECT plan FROM users WHERE id = $1', [viewerId]);
+  if (viewer && viewer.plan === 'discovery') {
+    return res.json({ counted: false, reason: "Vue en Pass Découverte — ne compte pas comme une vraie vue tant qu'aucun Pass payant n'est validé.", views: clip.views });
   }
   if (await db.get('SELECT id FROM clip_views WHERE clip_id = $1 AND viewer_id = $2', [clipId, viewerId])) {
     return res.json({ counted: false, reason: 'Déjà compté lors de votre première vue de ce clip.', views: clip.views });
