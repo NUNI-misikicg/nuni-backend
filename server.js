@@ -1354,6 +1354,38 @@ app.post('/api/talent/vote', authMiddleware, rateLimit(15, 60000), h(async (req,
   res.json({ message: 'Vote enregistré — merci de soutenir la scène congolaise 🕊️' });
 }));
 
+// ---------- Notifications réelles ----------
+// Avant : 3 notifications codées en dur dans le HTML, identiques pour tout le monde,
+// badge toujours à "3". Ici : une vraie table, remplie uniquement à de vrais événements
+// (nouveau follower, nouvelle sortie d'un artiste suivi) — pas de paiement fictif tant
+// qu'il n'existe pas de vrai flux de versement aux artistes dans le backend.
+async function createNotification(userId, type, title, body, link) {
+  try {
+    await db.run(
+      'INSERT INTO notifications (user_id, type, title, body, link) VALUES ($1,$2,$3,$4,$5)',
+      [userId, type, title, body, link || null],
+    );
+  } catch (e) { console.error('Erreur création notification:', e); }
+}
+
+app.get('/api/notifications', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(
+    'SELECT id, type, title, body, link, is_read, created_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30',
+    [req.user.id],
+  );
+  res.json({ notifications: rows });
+}));
+
+app.get('/api/notifications/unread-count', authMiddleware, h(async (req, res) => {
+  const row = await db.get('SELECT COUNT(*)::int as c FROM notifications WHERE user_id = $1 AND is_read = 0', [req.user.id]);
+  res.json({ count: row.c });
+}));
+
+app.post('/api/notifications/mark-read', authMiddleware, h(async (req, res) => {
+  await db.run('UPDATE notifications SET is_read = 1 WHERE user_id = $1 AND is_read = 0', [req.user.id]);
+  res.json({ ok: true });
+}));
+
 app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const { artistId } = req.body;
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
@@ -1369,6 +1401,9 @@ app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res)
     following = true;
     await addXp(req.user.id, 20);
     await bumpChallenge(req.user.id, 'weekly_follow_2', 1);
+    const follower = await db.get('SELECT first_name FROM users WHERE id = $1', [req.user.id]);
+    const followerName = (follower && follower.first_name) || 'Un auditeur';
+    await createNotification(artist.id, 'follower', 'Nouveau follower', `${followerName} vous suit désormais.`, null);
   }
   const followersCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artist.id])).c;
   res.json({ following, followersCount });
@@ -1627,8 +1662,25 @@ app.get('/admin-verify.html', (req, res) => {
 
 setInterval(async () => {
   try {
+    // Repérer AVANT publication ce qui va sortir, pour notifier les vrais abonnés
+    // (l'UPDATE seul ne permettrait pas de savoir quels morceaux viennent de changer).
+    const newlyPublished = await db.query(`
+      SELECT id, artist_id, title FROM tracks WHERE published = 0 AND scheduled_release_at <= NOW()
+    `);
     await db.run(`UPDATE tracks SET published = 1 WHERE published = 0 AND scheduled_release_at <= NOW()`);
     await db.run(`UPDATE clips SET published = 1 WHERE published = 0 AND scheduled_release_at <= NOW()`);
+
+    for (const track of newlyPublished) {
+      const artist = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [track.artist_id]);
+      const artistName = (artist && (artist.artist_name || artist.first_name)) || 'Un artiste que vous suivez';
+      const followers = await db.query('SELECT follower_id FROM follows WHERE artist_id = $1', [track.artist_id]);
+      for (const f of followers) {
+        await createNotification(
+          f.follower_id, 'new_release', 'Nouvelle sortie suivie',
+          `${artistName} vient de publier "${track.title}".`, null,
+        );
+      }
+    }
   } catch (e) { console.error('Erreur job publication planifiée:', e); }
 }, 60 * 1000);
 
