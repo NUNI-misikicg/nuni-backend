@@ -517,6 +517,16 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
 // Avant : "Vos badges d'auditeur" était un tableau entièrement codé en dur (même le "62/100"
 // était du texte fixe). Ici, chaque badge est calculé en direct depuis les vraies données
 // (écoutes, genres, artistes suivis, classement mensuel réel).
+app.get('/api/me/following', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.is_verified
+    FROM follows f JOIN users u ON u.id = f.artist_id
+    WHERE f.follower_id = $1
+    ORDER BY f.id DESC
+  `, [req.user.id]);
+  res.json({ following: rows });
+}));
+
 app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   const user = await db.get('SELECT id, xp, streak_days, created_at FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
@@ -1194,17 +1204,21 @@ app.post('/api/tracks/:id/like', authMiddleware, rateLimit(30, 60000), h(async (
   const track = await db.get('SELECT id, likes FROM tracks WHERE id = $1', [trackId]);
   if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
 
-  const existing = await db.get('SELECT id FROM track_likes WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
+  // Même faille de course que suivi/vote, corrigée pareillement : insertion atomique d'abord,
+  // et si elle échoue (déjà liké), on bascule vers la suppression sans jamais planter.
+  const inserted = await db.run(
+    'INSERT INTO track_likes (user_id, track_id) VALUES ($1,$2) ON CONFLICT (user_id, track_id) DO NOTHING',
+    [req.user.id, trackId],
+  );
   let liked;
-  if (existing) {
-    await db.run('DELETE FROM track_likes WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
-    await db.run('UPDATE tracks SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [trackId]);
-    liked = false;
-  } else {
-    await db.run('INSERT INTO track_likes (user_id, track_id) VALUES ($1,$2)', [req.user.id, trackId]);
+  if (inserted.rowCount > 0) {
     await db.run('UPDATE tracks SET likes = likes + 1 WHERE id = $1', [trackId]);
     liked = true;
     await bumpChallenge(req.user.id, 'daily_like_1', 1);
+  } else {
+    await db.run('DELETE FROM track_likes WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
+    await db.run('UPDATE tracks SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [trackId]);
+    liked = false;
   }
   const fresh = await db.get('SELECT likes FROM tracks WHERE id = $1', [trackId]);
   res.json({ liked, likes: fresh.likes });
@@ -1240,14 +1254,13 @@ app.post('/api/clips/:id/like', authMiddleware, rateLimit(30, 60000), h(async (r
   const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
   if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
 
-  const existing = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  // Même correction qu'ailleurs : insertion atomique d'abord.
+  const inserted = await db.run(
+    'INSERT INTO clip_likes (user_id, clip_id) VALUES ($1,$2) ON CONFLICT (user_id, clip_id) DO NOTHING',
+    [req.user.id, clipId],
+  );
   let liked;
-  if (existing) {
-    await db.run('DELETE FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
-    await db.run('UPDATE clips SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [clipId]);
-    liked = false;
-  } else {
-    await db.run('INSERT INTO clip_likes (user_id, clip_id) VALUES ($1,$2)', [req.user.id, clipId]);
+  if (inserted.rowCount > 0) {
     await db.run('UPDATE clips SET likes = likes + 1 WHERE id = $1', [clipId]);
     liked = true;
     await bumpChallenge(req.user.id, 'daily_like_1', 1);
@@ -1258,6 +1271,10 @@ app.post('/api/clips/:id/like', authMiddleware, rateLimit(30, 60000), h(async (r
       await db.run('DELETE FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
       await db.run('UPDATE clips SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1', [clipId]);
     }
+  } else {
+    await db.run('DELETE FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [clipId]);
+    liked = false;
   }
   const fresh = await db.get('SELECT likes, dislikes FROM clips WHERE id = $1', [clipId]);
   res.json({ liked, disliked: false, likes: fresh.likes, dislikes: fresh.dislikes });
@@ -1269,14 +1286,12 @@ app.post('/api/clips/:id/dislike', authMiddleware, rateLimit(30, 60000), h(async
   const clip = await db.get('SELECT id, likes, dislikes FROM clips WHERE id = $1', [clipId]);
   if (!clip) return res.status(404).json({ error: 'Clip introuvable.' });
 
-  const existing = await db.get('SELECT id FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+  const insertedDislike = await db.run(
+    'INSERT INTO clip_dislikes (user_id, clip_id) VALUES ($1,$2) ON CONFLICT (user_id, clip_id) DO NOTHING',
+    [req.user.id, clipId],
+  );
   let disliked;
-  if (existing) {
-    await db.run('DELETE FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
-    await db.run('UPDATE clips SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1', [clipId]);
-    disliked = false;
-  } else {
-    await db.run('INSERT INTO clip_dislikes (user_id, clip_id) VALUES ($1,$2)', [req.user.id, clipId]);
+  if (insertedDislike.rowCount > 0) {
     await db.run('UPDATE clips SET dislikes = dislikes + 1 WHERE id = $1', [clipId]);
     disliked = true;
     const existingLike = await db.get('SELECT id FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
@@ -1284,6 +1299,10 @@ app.post('/api/clips/:id/dislike', authMiddleware, rateLimit(30, 60000), h(async
       await db.run('DELETE FROM clip_likes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
       await db.run('UPDATE clips SET likes = GREATEST(likes - 1, 0) WHERE id = $1', [clipId]);
     }
+  } else {
+    await db.run('DELETE FROM clip_dislikes WHERE user_id = $1 AND clip_id = $2', [req.user.id, clipId]);
+    await db.run('UPDATE clips SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1', [clipId]);
+    disliked = false;
   }
   const fresh = await db.get('SELECT likes, dislikes FROM clips WHERE id = $1', [clipId]);
   res.json({ disliked, liked: false, likes: fresh.likes, dislikes: fresh.dislikes });
@@ -1580,10 +1599,15 @@ app.post('/api/talent/vote', authMiddleware, rateLimit(15, 60000), h(async (req,
   if (!artist) return res.status(404).json({ error: "Artiste introuvable ou sans Pass Artiste actif." });
 
   const weekKey = weeklyPeriodKey();
-  const existing = await db.get('SELECT id FROM talent_votes WHERE user_id = $1 AND week_key = $2', [req.user.id, weekKey]);
-  if (existing) return res.status(400).json({ error: 'Vous avez déjà voté cette semaine — revenez la semaine prochaine.' });
-
-  await db.run('INSERT INTO talent_votes (user_id, artist_id, week_key) VALUES ($1,$2,$3)', [req.user.id, artistId, weekKey]);
+  // Avant : même faille de course que pour le suivi d'artiste — "déjà voté ?" vérifié puis
+  // inséré en deux temps, plantait au lieu de refuser proprement en cas de double-clic rapide.
+  const inserted = await db.run(
+    'INSERT INTO talent_votes (user_id, artist_id, week_key) VALUES ($1,$2,$3) ON CONFLICT (user_id, week_key) DO NOTHING',
+    [req.user.id, artistId, weekKey],
+  );
+  if (!inserted.rowCount) {
+    return res.status(400).json({ error: 'Vous avez déjà voté cette semaine — revenez la semaine prochaine.' });
+  }
   await addXp(req.user.id, 10);
   res.json({ message: 'Vote enregistré — merci de soutenir la scène congolaise 🕊️' });
 }));
@@ -1684,19 +1708,28 @@ app.post('/api/follow', authMiddleware, rateLimit(30, 60000), h(async (req, res)
   const artist = await db.get('SELECT * FROM users WHERE id = $1', [artistId]);
   if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
   if (artist.id === req.user.id) return res.status(400).json({ error: 'Vous ne pouvez pas vous suivre vous-même.' });
-  const existing = await db.get('SELECT * FROM follows WHERE follower_id = $1 AND artist_id = $2', [req.user.id, artist.id]);
+
+  // Avant : vérifier "déjà suivi ?" puis insérer/supprimer dans deux requêtes séparées
+  // laissait une fenêtre de course — un double-clic rapide (ou deux onglets) pouvait faire
+  // planter la requête (violation de la contrainte d'unicité déjà en place sur follows,
+  // jamais gérée gracieusement) au lieu de basculer proprement. Insertion atomique
+  // (ON CONFLICT DO NOTHING) : si elle échoue vraiment à cause d'un doublon, c'est qu'on
+  // suit déjà — on bascule alors proprement vers la suppression, sans jamais planter.
+  const inserted = await db.run(
+    'INSERT INTO follows (follower_id, artist_id) VALUES ($1,$2) ON CONFLICT (follower_id, artist_id) DO NOTHING',
+    [req.user.id, artist.id],
+  );
   let following;
-  if (existing) {
-    await db.run('DELETE FROM follows WHERE follower_id = $1 AND artist_id = $2', [req.user.id, artist.id]);
-    following = false;
-  } else {
-    await db.run('INSERT INTO follows (follower_id, artist_id) VALUES ($1,$2)', [req.user.id, artist.id]);
+  if (inserted.rowCount > 0) {
     following = true;
     await addXp(req.user.id, 20);
     await bumpChallenge(req.user.id, 'weekly_follow_2', 1);
     const follower = await db.get('SELECT first_name FROM users WHERE id = $1', [req.user.id]);
     const followerName = (follower && follower.first_name) || 'Un auditeur';
     await createNotification(artist.id, 'follower', 'Nouveau follower', `${followerName} vous suit désormais.`, null);
+  } else {
+    await db.run('DELETE FROM follows WHERE follower_id = $1 AND artist_id = $2', [req.user.id, artist.id]);
+    following = false;
   }
   const followersCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artist.id])).c;
   if (following && FOLLOWER_MILESTONES.includes(followersCount)) {
