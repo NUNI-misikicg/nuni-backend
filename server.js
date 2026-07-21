@@ -1577,8 +1577,8 @@ app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
 // Avant : 6 noms codés en dur ("Bibi Mwana", "Ndombe Junior"...), identiques pour tout le
 // monde, indéfiniment. Ici : une vraie sélection aléatoire parmi les artistes ayant
 // réellement payé leur Pass Artiste (donc de vrais comptes actifs à soutenir), qui change
-// automatiquement toutes les 30 minutes — via un hash basé sur l'heure, pas de tâche
-// planifiée nécessaire : la même fenêtre de 30 min donne le même ordre pour tout le monde,
+// automatiquement chaque semaine — via un hash basé sur la semaine calendaire, pas de
+// tâche planifiée nécessaire : la même semaine donne le même ordre pour tout le monde,
 // et l'ordre change tout seul dès qu'on passe à la fenêtre suivante.
 app.get('/api/artists/featured', h(async (req, res) => {
   const rows = await db.query(`
@@ -1586,7 +1586,7 @@ app.get('/api/artists/featured', h(async (req, res) => {
       (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre
     FROM users u
     WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
-    ORDER BY md5(u.id::text || floor(extract(epoch from now())/1800)::text)
+    ORDER BY md5(u.id::text || floor(extract(epoch from now())/604800)::text)
     LIMIT 6
   `);
   res.json({ artists: rows });
