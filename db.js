@@ -305,6 +305,21 @@ async function initSchema() {
     );
   `);
 
+  // ---------- Cosmétiques équipés — personnalisation du profil (barre du haut) ----------
+  // Un seul objet équipé par catégorie (couronne, casque, micro, cadre, badge, effet) —
+  // garanti par la contrainte UNIQUE(user_id, category) + UPSERT atomique dans la route
+  // d'équipement (même pattern que le reste : pas de check-then-write).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_equipped_cosmetics (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      category TEXT NOT NULL,
+      item_key TEXT NOT NULL,
+      equipped_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, category)
+    );
+  `);
+
   // ---------- NUNI Talent — vrais votes hebdomadaires ----------
   // Avant : classement 100% inventé (noms fictifs, streams aléatoires, votes jamais
   // enregistrés nulle part). Un seul vote par personne et par semaine, pour un vrai artiste.

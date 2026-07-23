@@ -214,23 +214,102 @@ async function touchDailyLogin(userId) {
 }
 
 // ================= BOUTIQUE NUNI POINTS =================
-// Étape 4 de la gamification. Articles purement cosmétiques : des badges collectionnables
-// supplémentaires, achetés une seule fois, qui viennent s'ajouter à "Vos badges d'auditeur".
+// Étape 4 de la gamification, enrichie ensuite en véritable système de personnalisation :
+// chaque objet appartient à une catégorie (une seule pièce équipée par catégorie à la fois,
+// voir user_equipped_cosmetics). `unlockType` prépare les futurs déblocages par XP/streams/
+// événements (uniquement 'points' est activé pour l'instant — le reste attend la mécanique
+// de progression correspondante, pour ne pas promettre un déblocage qui n'existe pas encore).
+const COSMETIC_CATEGORIES = ['crown', 'headphones', 'mic', 'frame', 'badge', 'effect'];
 const SHOP_ITEMS = [
-  { key: 'badge_gold_disc', name: '🥇 Disque d\'Or', description: 'Badge collector', cost: 100 },
-  { key: 'badge_early_bird', name: '🌅 Lève-tôt NUNI', description: 'Badge collector', cost: 150 },
-  { key: 'badge_flame_king', name: '👑 Roi du Streak', description: 'Badge collector', cost: 250 },
-  { key: 'badge_legend', name: '⚡ Collectionneur', description: 'Badge collector', cost: 400 },
+  // ---- Badges (historiques, inchangés — ne pas casser les achats déjà faits) ----
+  { key: 'badge_gold_disc', name: '🥇 Disque d\'Or', description: 'Badge collector', cost: 100, category: 'badge', unlockType: 'points' },
+  { key: 'badge_early_bird', name: '🌅 Lève-tôt NUNI', description: 'Badge collector', cost: 150, category: 'badge', unlockType: 'points' },
+  { key: 'badge_flame_king', name: '👑 Roi du Streak', description: 'Badge collector', cost: 250, category: 'badge', unlockType: 'points' },
+  { key: 'badge_legend', name: '⚡ Collectionneur', description: 'Badge collector', cost: 400, category: 'badge', unlockType: 'points' },
+  // ---- Nouveaux badges ----
+  { key: 'badge_top_fan', name: '🏆 Top Fan', description: 'Montrez votre fidélité à vos artistes préférés.', cost: 200, category: 'badge', unlockType: 'points' },
+  { key: 'badge_explorer', name: '🏆 Explorateur Musical', description: 'Pour celles et ceux qui écoutent tous les genres.', cost: 200, category: 'badge', unlockType: 'points' },
+  { key: 'badge_ambassador', name: '🏆 Ambassadeur NUNI', description: 'Le badge des plus fidèles à la plateforme.', cost: 500, category: 'badge', unlockType: 'points' },
+  // ---- Couronnes ----
+  { key: 'crown_king_stream', name: '👑 Couronne Roi du Stream', description: 'Montrez que vous dominez les classements.', cost: 250, category: 'crown', unlockType: 'points' },
+  { key: 'crown_platinum', name: '👑 Couronne Platine', description: 'Une couronne qui brille discrètement.', cost: 300, category: 'crown', unlockType: 'points' },
+  { key: 'crown_diamond', name: '👑 Couronne Diamant', description: 'La rareté à son maximum.', cost: 450, category: 'crown', unlockType: 'points' },
+  { key: 'crown_top_congo', name: '👑 Couronne Top Congo', description: 'L\'élégance congolaise sur votre profil.', cost: 350, category: 'crown', unlockType: 'points' },
+  // ---- Casques ----
+  { key: 'headphones_studio', name: '🎧 Casque Studio Premium', description: 'Le style des vrais professionnels du son.', cost: 220, category: 'headphones', unlockType: 'points' },
+  { key: 'headphones_afrobeats', name: '🎧 Casque Afro Beats', description: 'Aux couleurs de la musique africaine.', cost: 220, category: 'headphones', unlockType: 'points' },
+  // ---- Micros ----
+  { key: 'mic_star', name: '🎤 Micro Star', description: 'Pour celles et ceux qui rêvent de scène.', cost: 220, category: 'mic', unlockType: 'points' },
+  { key: 'mic_legend', name: '🎤 Micro Légende', description: 'Réservé aux légendes de NUNI.', cost: 350, category: 'mic', unlockType: 'points' },
+  // ---- Cadres d'avatar ----
+  { key: 'frame_halo_gold', name: '✨ Halo Doré', description: 'Un halo chaud et lumineux autour de votre avatar.', cost: 180, category: 'frame', unlockType: 'points' },
+  { key: 'frame_halo_neon', name: '✨ Halo Néon', description: 'Pour un profil qui sort du lot.', cost: 200, category: 'frame', unlockType: 'points' },
+  { key: 'frame_halo_copper', name: '✨ Halo Cuivre', description: 'Une teinte chaleureuse, discrète et élégante.', cost: 180, category: 'frame', unlockType: 'points' },
+  { key: 'frame_circle_premium', name: '✨ Cercle Lumineux Premium', description: 'Le cadre le plus prestigieux de NUNI.', cost: 400, category: 'frame', unlockType: 'points' },
+  // ---- Effets visuels ----
+  { key: 'effect_lightning', name: '⚡ Éclairs musicaux', description: 'Un effet énergique autour de votre profil.', cost: 260, category: 'effect', unlockType: 'points' },
+  { key: 'effect_golden_particles', name: '✨ Particules dorées', description: 'De fines particules qui scintillent doucement.', cost: 280, category: 'effect', unlockType: 'points' },
+  { key: 'effect_animated_notes', name: '🎶 Notes musicales animées', description: 'Des notes qui flottent autour de votre avatar.', cost: 240, category: 'effect', unlockType: 'points' },
+  { key: 'effect_luminous_aura', name: '🌟 Aura lumineuse', description: 'Une aura douce et premium.', cost: 300, category: 'effect', unlockType: 'points' },
+  { key: 'effect_floating_note', name: '🎼 Note Musicale Flottante', description: 'Une note unique qui flotte au-dessus de l\'avatar.', cost: 150, category: 'effect', unlockType: 'points' },
+  { key: 'effect_sound_waves', name: '🎵 Vagues Sonores', description: 'Des ondes sonores animées autour du profil.', cost: 200, category: 'effect', unlockType: 'points' },
 ];
 
 app.get('/api/shop/items', authMiddleware, h(async (req, res) => {
   const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [req.user.id]);
   const ownedSet = new Set(owned.map((o) => o.item_key));
+  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [req.user.id]);
+  const equipped = {};
+  COSMETIC_CATEGORIES.forEach((c) => { equipped[c] = null; });
+  equippedRows.forEach((r) => { equipped[r.category] = r.item_key; });
   const user = await db.get('SELECT nuni_points FROM users WHERE id = $1', [req.user.id]);
   res.json({
     points: user.nuni_points || 0,
-    items: SHOP_ITEMS.map((it) => ({ ...it, owned: ownedSet.has(it.key) })),
+    items: SHOP_ITEMS.map((it) => ({ ...it, owned: ownedSet.has(it.key), equipped: equipped[it.category] === it.key })),
+    equipped,
   });
+}));
+
+// ---------- Inventaire — "Mes objets" (uniquement les objets possédés + état équipé) ----------
+app.get('/api/me/cosmetics', authMiddleware, h(async (req, res) => {
+  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [req.user.id]);
+  const ownedSet = new Set(owned.map((o) => o.item_key));
+  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [req.user.id]);
+  const equipped = {};
+  COSMETIC_CATEGORIES.forEach((c) => { equipped[c] = null; });
+  equippedRows.forEach((r) => { equipped[r.category] = r.item_key; });
+  const inventory = SHOP_ITEMS
+    .filter((it) => ownedSet.has(it.key))
+    .map((it) => ({ ...it, equipped: equipped[it.category] === it.key }));
+  res.json({ inventory, equipped });
+}));
+
+// ---------- Équiper un objet possédé ----------
+// UPSERT atomique sur UNIQUE(user_id, category) : équiper une nouvelle couronne retire
+// automatiquement l'ancienne, sans jamais lire-puis-écrire (même principe que tout le reste
+// de l'app — voir les notes sur les races conditions ailleurs dans ce fichier).
+app.post('/api/me/cosmetics/:key/equip', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
+  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
+  if (!item) return res.status(404).json({ error: 'Objet introuvable.' });
+  const owns = await db.get('SELECT id FROM shop_purchases WHERE user_id = $1 AND item_key = $2', [req.user.id, item.key]);
+  if (!owns) return res.status(403).json({ error: 'Vous ne possédez pas cet objet.' });
+  await db.run(
+    `INSERT INTO user_equipped_cosmetics (user_id, category, item_key) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, category) DO UPDATE SET item_key = EXCLUDED.item_key, equipped_at = NOW()`,
+    [req.user.id, item.category, item.key],
+  );
+  res.json({ message: `${item.name} équipé.`, category: item.category });
+}));
+
+// ---------- Retirer l'objet équipé d'une catégorie ----------
+app.post('/api/me/cosmetics/:key/unequip', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
+  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
+  if (!item) return res.status(404).json({ error: 'Objet introuvable.' });
+  await db.run(
+    'DELETE FROM user_equipped_cosmetics WHERE user_id = $1 AND category = $2 AND item_key = $3',
+    [req.user.id, item.category, item.key],
+  );
+  res.json({ message: `${item.name} retiré.`, category: item.category });
 }));
 
 app.post('/api/shop/items/:key/buy', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
@@ -581,7 +660,11 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
   if (user.account_status === 'suspended') {
     return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
   }
-  res.json({ user: publicUser(await withArtistStats(user)) });
+  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [user.id]);
+  const equippedCosmetics = {};
+  COSMETIC_CATEGORIES.forEach((c) => { equippedCosmetics[c] = null; });
+  equippedRows.forEach((r) => { equippedCosmetics[r.category] = r.item_key; });
+  res.json({ user: publicUser(await withArtistStats(user)), equippedCosmetics });
 }));
 
 app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
@@ -652,7 +735,7 @@ app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   // Badges cosmétiques achetés dans la boutique NUNI Points — toujours débloqués une fois payés.
   const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [user.id]);
   const ownedSet = new Set(owned.map((o) => o.item_key));
-  SHOP_ITEMS.forEach((it) => {
+  SHOP_ITEMS.filter((it) => it.category === 'badge').forEach((it) => {
     if (ownedSet.has(it.key)) {
       badges.push({ ic: it.name.split(' ')[0], n: it.name.replace(/^\S+\s/, ''), locked: false, d: 'Boutique' });
     }
@@ -844,46 +927,13 @@ app.get('/api/playlists/:id', h(async (req, res) => {
 }));
 
 function checkAdminKey(req, res) {
-  const adminKey = (req.headers['x-admin-key'] || '').trim();
-  const expectedKey = (process.env.ADMIN_KEY || '').trim();
-  if (!expectedKey || adminKey !== expectedKey) {
+  const adminKey = req.headers['x-admin-key'];
+  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
     res.status(403).json({ error: 'Clé admin invalide.' });
     return false;
   }
   return true;
 }
-
-// ---------- Route de debug temporaire — clé admin ----------
-// Ne révèle JAMAIS la valeur de la clé, seulement sa longueur et le code du dernier
-// caractère (utile pour détecter un espace ou un retour à la ligne collé par erreur
-// dans la variable d'environnement Render). À SUPPRIMER une fois le diagnostic terminé.
-app.get('/api/admin/debug-key-length', (req, res) => {
-  const raw = process.env.ADMIN_KEY || '';
-  res.json({
-    exists: !!process.env.ADMIN_KEY,
-    lengthRaw: raw.length,
-    lengthTrimmed: raw.trim().length,
-    lastCharCode: raw.length ? raw.charCodeAt(raw.length - 1) : null,
-    firstCharCode: raw.length ? raw.charCodeAt(0) : null,
-  });
-});
-
-// Compare la clé réellement envoyée par admin.html avec celle attendue par le serveur —
-// ne révèle jamais les valeurs en clair, seulement un résultat de comparaison et les
-// longueurs. À SUPPRIMER une fois le diagnostic terminé.
-app.get('/api/admin/debug-key-check', (req, res) => {
-  const provided = (req.headers['x-admin-key'] || '').trim();
-  const expected = (process.env.ADMIN_KEY || '').trim();
-  res.json({
-    match: provided === expected,
-    providedLength: provided.length,
-    expectedLength: expected.length,
-    providedFirstChar: provided.length ? provided[0] : null,
-    providedLastChar: provided.length ? provided[provided.length - 1] : null,
-    expectedFirstChar: expected.length ? expected[0] : null,
-    expectedLastChar: expected.length ? expected[expected.length - 1] : null,
-  });
-});
 
 // ================= SÉCURITÉ ANTI-TRICHE (étape 6 gamification) =================
 // Limiteur de débit léger en mémoire (sans dépendance externe) — identifie la personne par
