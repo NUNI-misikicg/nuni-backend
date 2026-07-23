@@ -57,6 +57,7 @@
     <button class="tab-btn" data-tab="users">👥 Utilisateurs</button>
     <button class="tab-btn" data-tab="hero">🖼️ Bannières</button>
     <button class="tab-btn" data-tab="playlists">🎧 Playlists</button>
+    <button class="tab-btn" data-tab="payouts">💸 Reversements artistes</button>
   </div>
 
   <!-- ONGLET 1 : ACTIVER UN PASS -->
@@ -205,6 +206,21 @@
     </div>
     <button class="secondary" onclick="loadPlaylists()" style="margin-top:14px;">Charger les playlists existantes</button>
     <div id="playlists-list" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- ONGLET : REVERSEMENTS ARTISTES -->
+  <div class="pane" id="pane-payouts">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">💸 Combien reverser à chaque artiste</b>
+      <div class="muted" style="margin-top:4px;">
+        Vrais streams cumulés depuis le début, montant calculé au même taux que le Dashboard de chaque artiste
+        (jamais un chiffre inventé). Aucun suivi de "déjà payé" pour l'instant — ce sont les totaux cumulés,
+        à comparer vous-même avec ce qui a déjà été viré.
+      </div>
+      <button class="primary" style="margin-top:12px;" onclick="loadArtistPayouts()">Charger les reversements</button>
+    </div>
+    <div id="payouts-summary" style="margin-top:14px;"></div>
+    <div id="payouts-list" style="margin-top:14px;"></div>
   </div>
 
 <script>
@@ -699,6 +715,30 @@
     }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
   renderPlTrackList();
+
+  async function loadArtistPayouts(){
+    const summary = document.getElementById('payouts-summary');
+    const wrap = document.getElementById('payouts-list');
+    wrap.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/artist-payouts', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ wrap.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; summary.innerHTML=''; return; }
+      const payouts = data.payouts || [];
+      summary.innerHTML = `<div class="card row">
+        <div><b style="color:#7ee6a8; font-size:18px;">${(data.total_due_fcfa||0).toLocaleString('fr-FR')} FCFA</b><div class="muted">Total dû à l'ensemble des artistes</div></div>
+        <div class="muted">${data.price_per_stream_fcfa} FCFA/stream · ${data.artist_share_pct}% reversé à l'artiste</div>
+      </div>`;
+      if(!payouts.length){ wrap.innerHTML = '<p class="muted">Aucun artiste avec des streams pour le moment.</p>'; return; }
+      let html = '<table><tr><th>Pseudo</th><th>Email</th><th>Streams</th><th>Montant à reverser</th></tr>';
+      payouts.forEach(p=>{
+        html += `<tr><td><b>${p.pseudo}</b></td><td class="muted">${p.email}</td><td>${p.total_streams.toLocaleString('fr-FR')}</td>
+          <td><b style="color:#D4AF6A;">${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA</b></td></tr>`;
+      });
+      html += '</table>';
+      wrap.innerHTML = html;
+    }catch(e){ wrap.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
 
   window.addEventListener('load', ()=>{ const k = localStorage.getItem('nuniAdminKey'); if(k) document.getElementById('key').value = k; });
 </script>
