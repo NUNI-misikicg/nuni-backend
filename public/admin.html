@@ -782,11 +782,14 @@
   }
 
   async function payArtist(artistId, pseudo, amount){
-    if(!confirm(`Confirmer le versement de ${amount.toLocaleString('fr-FR')} FCFA à ${pseudo} ?\n\nCeci enregistre le paiement et recalculera automatiquement le prochain montant dû à partir de zéro streams pour cet artiste — les streams publics ne sont jamais touchés.`)) return;
+    const method = prompt(`Verser ${amount.toLocaleString('fr-FR')} FCFA à ${pseudo}.\n\nComment ce paiement a-t-il été fait ? Tapez :\n1 = Agence (remis en personne)\n2 = Mobile Money`, '1');
+    if(method === null) return; // annulé
+    const methodLabel = method.trim() === '2' ? 'Mobile Money' : 'Agence (en personne)';
+    if(!confirm(`Confirmer le versement de ${amount.toLocaleString('fr-FR')} FCFA à ${pseudo} via ${methodLabel} ?\n\nCeci enregistre le paiement et recalculera automatiquement le prochain montant dû à partir de zéro streams pour cet artiste — les streams publics ne sont jamais touchés.`)) return;
     try{
       const res = await fetch('/api/admin/artist-payouts/' + artistId + '/pay', {
         method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
-        body: JSON.stringify({ method:'Manuel' })
+        body: JSON.stringify({ method: methodLabel })
       });
       const data = await res.json();
       if(!res.ok){ alert('❌ ' + (data.error||'Erreur.')); return; }
