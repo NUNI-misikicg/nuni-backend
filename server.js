@@ -10,7 +10,7 @@ const {
   initAuth, hashPassword, verifyPassword, needsRehash, signToken, verifyToken, generateAccessCode,
   generateResetCode, hashResetCode, authMiddleware,
 } = require('./auth');
-const { sendAccessCodeEmail, sendPasswordResetEmail } = require('./mailer');
+const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail } = require('./mailer');
 
 const app = express();
 // ---------- CORS restreint (durcissement sécurité) ----------
@@ -577,6 +577,23 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
     return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
   }
   res.json({ user: publicUser(await withArtistStats(user)) });
+}));
+
+app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
+  await db.run('UPDATE users SET has_seen_artist_contract = 1 WHERE id = $1', [req.user.id]);
+  res.json({ ok: true });
+}));
+
+app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
+  const { name, desc, link, contact, duration } = req.body;
+  if (!name || !link || !contact) {
+    return res.status(400).json({ error: 'Merci de renseigner au minimum le nom du produit, un lien et un contact.' });
+  }
+  const result = await sendAdRequestEmail({ name, desc, link, contact, duration });
+  if (!result.sent) {
+    return res.status(502).json({ error: "La demande n'a pas pu être envoyée pour l'instant — réessayez plus tard." });
+  }
+  res.json({ message: 'Votre demande a bien été envoyée — NUNI vous recontactera bientôt.' });
 }));
 
 // ---------- Progression réelle : niveau, XP, et les 6 badges calculés à partir de vraies actions ----------

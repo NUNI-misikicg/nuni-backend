@@ -190,6 +190,7 @@ async function initSchema() {
   // champ texte, rempli par l'artiste lui-même depuis son tableau de bord (voir
   // PUT /api/artist/bio dans server.js).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS has_seen_artist_contract INTEGER DEFAULT 0;`);
 
   // ---------- Progression réelle (XP, niveaux, série d'écoute) ----------
   // Fondation du système de gamification demandé : plus de badges/niveaux inventés,
