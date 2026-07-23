@@ -844,13 +844,29 @@ app.get('/api/playlists/:id', h(async (req, res) => {
 }));
 
 function checkAdminKey(req, res) {
-  const adminKey = req.headers['x-admin-key'];
-  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+  const adminKey = (req.headers['x-admin-key'] || '').trim();
+  const expectedKey = (process.env.ADMIN_KEY || '').trim();
+  if (!expectedKey || adminKey !== expectedKey) {
     res.status(403).json({ error: 'Clé admin invalide.' });
     return false;
   }
   return true;
 }
+
+// ---------- Route de debug temporaire — clé admin ----------
+// Ne révèle JAMAIS la valeur de la clé, seulement sa longueur et le code du dernier
+// caractère (utile pour détecter un espace ou un retour à la ligne collé par erreur
+// dans la variable d'environnement Render). À SUPPRIMER une fois le diagnostic terminé.
+app.get('/api/admin/debug-key-length', (req, res) => {
+  const raw = process.env.ADMIN_KEY || '';
+  res.json({
+    exists: !!process.env.ADMIN_KEY,
+    lengthRaw: raw.length,
+    lengthTrimmed: raw.trim().length,
+    lastCharCode: raw.length ? raw.charCodeAt(raw.length - 1) : null,
+    firstCharCode: raw.length ? raw.charCodeAt(0) : null,
+  });
+});
 
 // ================= SÉCURITÉ ANTI-TRICHE (étape 6 gamification) =================
 // Limiteur de débit léger en mémoire (sans dépendance externe) — identifie la personne par
