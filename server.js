@@ -190,13 +190,8 @@ function levelInfoForXp(xp) {
 async function addXp(userId, amount) {
   try { await db.run('UPDATE users SET xp = COALESCE(xp,0) + $1 WHERE id = $2', [amount, userId]); } catch (e) { /* jamais bloquant */ }
 }
-// NUNI Points — monnaie virtuelle dépensée dans la boutique (badges cosmétiques uniquement,
-// aucune conversion en FCFA, aucun lien avec la rémunération réelle des artistes).
-async function addPoints(userId, amount) {
-  try { await db.run('UPDATE users SET nuni_points = COALESCE(nuni_points,0) + $1 WHERE id = $2', [amount, userId]); } catch (e) { /* jamais bloquant */ }
-}
-// Connexion quotidienne : +15 XP et +5 NUNI Points la première fois du jour, et incrémente
-// la vraie série (streak_days) si la dernière activité était bien hier — remise à zéro sinon.
+// Connexion quotidienne : +15 XP la première fois du jour, et incrémente la vraie série
+// (streak_days) si la dernière activité était bien hier — remise à zéro sinon.
 async function touchDailyLogin(userId) {
   try {
     const user = await db.get('SELECT last_active_date, streak_days FROM users WHERE id = $1', [userId]);
@@ -207,150 +202,11 @@ async function touchDailyLogin(userId) {
     const wasYesterday = user.last_active_date && new Date(user.last_active_date).toISOString().slice(0, 10) === yesterday;
     const newStreak = wasYesterday ? (user.streak_days || 0) + 1 : 1;
     await db.run(
-      'UPDATE users SET last_active_date = $1, streak_days = $2, xp = COALESCE(xp,0) + 15, nuni_points = COALESCE(nuni_points,0) + 5 WHERE id = $3',
+      'UPDATE users SET last_active_date = $1, streak_days = $2, xp = COALESCE(xp,0) + 15 WHERE id = $3',
       [today, newStreak, userId],
     );
   } catch (e) { /* jamais bloquant */ }
 }
-
-// ================= BOUTIQUE NUNI POINTS =================
-// Étape 4 de la gamification, enrichie ensuite en véritable système de personnalisation :
-// chaque objet appartient à une catégorie (une seule pièce équipée par catégorie à la fois,
-// voir user_equipped_cosmetics). `unlockType` prépare les futurs déblocages par XP/streams/
-// événements (uniquement 'points' est activé pour l'instant — le reste attend la mécanique
-// de progression correspondante, pour ne pas promettre un déblocage qui n'existe pas encore).
-const COSMETIC_CATEGORIES = ['crown', 'headphones', 'mic', 'frame', 'badge', 'effect'];
-const SHOP_ITEMS = [
-  // ---- Badges (historiques, inchangés — ne pas casser les achats déjà faits) ----
-  { key: 'badge_gold_disc', name: '🥇 Disque d\'Or', description: 'Badge collector', cost: 100, category: 'badge', unlockType: 'points' },
-  { key: 'badge_early_bird', name: '🌅 Lève-tôt NUNI', description: 'Badge collector', cost: 150, category: 'badge', unlockType: 'points' },
-  { key: 'badge_flame_king', name: '👑 Roi du Streak', description: 'Badge collector', cost: 250, category: 'badge', unlockType: 'points' },
-  { key: 'badge_legend', name: '⚡ Collectionneur', description: 'Badge collector', cost: 400, category: 'badge', unlockType: 'points' },
-  // ---- Nouveaux badges ----
-  { key: 'badge_top_fan', name: '🏆 Top Fan', description: 'Montrez votre fidélité à vos artistes préférés.', cost: 200, category: 'badge', unlockType: 'points' },
-  { key: 'badge_explorer', name: '🏆 Explorateur Musical', description: 'Pour celles et ceux qui écoutent tous les genres.', cost: 200, category: 'badge', unlockType: 'points' },
-  { key: 'badge_ambassador', name: '🏆 Ambassadeur NUNI', description: 'Le badge des plus fidèles à la plateforme.', cost: 500, category: 'badge', unlockType: 'points' },
-  // ---- Couronnes ----
-  { key: 'crown_king_stream', name: '👑 Couronne Roi du Stream', description: 'Montrez que vous dominez les classements.', cost: 250, category: 'crown', unlockType: 'points' },
-  { key: 'crown_platinum', name: '👑 Couronne Platine', description: 'Une couronne qui brille discrètement.', cost: 300, category: 'crown', unlockType: 'points' },
-  { key: 'crown_diamond', name: '👑 Couronne Diamant', description: 'La rareté à son maximum.', cost: 450, category: 'crown', unlockType: 'points' },
-  { key: 'crown_top_congo', name: '👑 Couronne Top Congo', description: 'L\'élégance congolaise sur votre profil.', cost: 350, category: 'crown', unlockType: 'points' },
-  // ---- Casques ----
-  { key: 'headphones_studio', name: '🎧 Casque Studio Premium', description: 'Le style des vrais professionnels du son.', cost: 220, category: 'headphones', unlockType: 'points' },
-  { key: 'headphones_afrobeats', name: '🎧 Casque Afro Beats', description: 'Aux couleurs de la musique africaine.', cost: 220, category: 'headphones', unlockType: 'points' },
-  // ---- Micros ----
-  { key: 'mic_star', name: '🎤 Micro Star', description: 'Pour celles et ceux qui rêvent de scène.', cost: 220, category: 'mic', unlockType: 'points' },
-  { key: 'mic_legend', name: '🎤 Micro Légende', description: 'Réservé aux légendes de NUNI.', cost: 350, category: 'mic', unlockType: 'points' },
-  // ---- Cadres d'avatar ----
-  { key: 'frame_halo_gold', name: '✨ Halo Doré', description: 'Un halo chaud et lumineux autour de votre avatar.', cost: 180, category: 'frame', unlockType: 'points' },
-  { key: 'frame_halo_neon', name: '✨ Halo Néon', description: 'Pour un profil qui sort du lot.', cost: 200, category: 'frame', unlockType: 'points' },
-  { key: 'frame_halo_copper', name: '✨ Halo Cuivre', description: 'Une teinte chaleureuse, discrète et élégante.', cost: 180, category: 'frame', unlockType: 'points' },
-  { key: 'frame_circle_premium', name: '✨ Cercle Lumineux Premium', description: 'Le cadre le plus prestigieux de NUNI.', cost: 400, category: 'frame', unlockType: 'points' },
-  // ---- Effets visuels ----
-  { key: 'effect_lightning', name: '⚡ Éclairs musicaux', description: 'Un effet énergique autour de votre profil.', cost: 260, category: 'effect', unlockType: 'points' },
-  { key: 'effect_golden_particles', name: '✨ Particules dorées', description: 'De fines particules qui scintillent doucement.', cost: 280, category: 'effect', unlockType: 'points' },
-  { key: 'effect_animated_notes', name: '🎶 Notes musicales animées', description: 'Des notes qui flottent autour de votre avatar.', cost: 240, category: 'effect', unlockType: 'points' },
-  { key: 'effect_luminous_aura', name: '🌟 Aura lumineuse', description: 'Une aura douce et premium.', cost: 300, category: 'effect', unlockType: 'points' },
-  { key: 'effect_floating_note', name: '🎼 Note Musicale Flottante', description: 'Une note unique qui flotte au-dessus de l\'avatar.', cost: 150, category: 'effect', unlockType: 'points' },
-  { key: 'effect_sound_waves', name: '🎵 Vagues Sonores', description: 'Des ondes sonores animées autour du profil.', cost: 200, category: 'effect', unlockType: 'points' },
-];
-
-app.get('/api/shop/items', authMiddleware, h(async (req, res) => {
-  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [req.user.id]);
-  const ownedSet = new Set(owned.map((o) => o.item_key));
-  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [req.user.id]);
-  const equipped = {};
-  COSMETIC_CATEGORIES.forEach((c) => { equipped[c] = null; });
-  equippedRows.forEach((r) => { equipped[r.category] = r.item_key; });
-  const user = await db.get('SELECT nuni_points FROM users WHERE id = $1', [req.user.id]);
-  res.json({
-    points: user.nuni_points || 0,
-    items: SHOP_ITEMS.map((it) => ({ ...it, owned: ownedSet.has(it.key), equipped: equipped[it.category] === it.key })),
-    equipped,
-  });
-}));
-
-// ---------- Inventaire — "Mes objets" (uniquement les objets possédés + état équipé) ----------
-app.get('/api/me/cosmetics', authMiddleware, h(async (req, res) => {
-  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [req.user.id]);
-  const ownedSet = new Set(owned.map((o) => o.item_key));
-  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [req.user.id]);
-  const equipped = {};
-  COSMETIC_CATEGORIES.forEach((c) => { equipped[c] = null; });
-  equippedRows.forEach((r) => { equipped[r.category] = r.item_key; });
-  const inventory = SHOP_ITEMS
-    .filter((it) => ownedSet.has(it.key))
-    .map((it) => ({ ...it, equipped: equipped[it.category] === it.key }));
-  res.json({ inventory, equipped });
-}));
-
-// ---------- Équiper un objet possédé ----------
-// UPSERT atomique sur UNIQUE(user_id, category) : équiper une nouvelle couronne retire
-// automatiquement l'ancienne, sans jamais lire-puis-écrire (même principe que tout le reste
-// de l'app — voir les notes sur les races conditions ailleurs dans ce fichier).
-app.post('/api/me/cosmetics/:key/equip', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
-  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
-  if (!item) return res.status(404).json({ error: 'Objet introuvable.' });
-  const owns = await db.get('SELECT id FROM shop_purchases WHERE user_id = $1 AND item_key = $2', [req.user.id, item.key]);
-  if (!owns) return res.status(403).json({ error: 'Vous ne possédez pas cet objet.' });
-  await db.run(
-    `INSERT INTO user_equipped_cosmetics (user_id, category, item_key) VALUES ($1, $2, $3)
-     ON CONFLICT (user_id, category) DO UPDATE SET item_key = EXCLUDED.item_key, equipped_at = NOW()`,
-    [req.user.id, item.category, item.key],
-  );
-  res.json({ message: `${item.name} équipé.`, category: item.category });
-}));
-
-// ---------- Retirer l'objet équipé d'une catégorie ----------
-app.post('/api/me/cosmetics/:key/unequip', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
-  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
-  if (!item) return res.status(404).json({ error: 'Objet introuvable.' });
-  await db.run(
-    'DELETE FROM user_equipped_cosmetics WHERE user_id = $1 AND category = $2 AND item_key = $3',
-    [req.user.id, item.category, item.key],
-  );
-  res.json({ message: `${item.name} retiré.`, category: item.category });
-}));
-
-app.post('/api/shop/items/:key/buy', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
-  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
-  if (!item) return res.status(404).json({ error: 'Article introuvable.' });
-  if (await db.get('SELECT id FROM shop_purchases WHERE user_id = $1 AND item_key = $2', [req.user.id, item.key])) {
-    return res.status(400).json({ error: 'Déjà acheté.' });
-  }
-  const client = await db.pool.connect();
-  try {
-    await client.query('BEGIN');
-    // Avant : le solde était vérifié AVANT la transaction, puis débité dedans — un
-    // double-clic rapide ou deux onglets pouvaient passer la vérification en même temps
-    // (tous deux liraient le même solde encore suffisant) et faire passer le solde en
-    // négatif. Maintenant : la condition de solde suffisant fait partie de l'UPDATE
-    // lui-même (atomique), donc une seule des deux requêtes concurrentes peut réussir.
-    const updated = await client.query(
-      'UPDATE users SET nuni_points = nuni_points - $1 WHERE id = $2 AND nuni_points >= $1 RETURNING nuni_points',
-      [item.cost, req.user.id],
-    );
-    if (updated.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Pas assez de NUNI Points.' });
-    }
-    await client.query('INSERT INTO shop_purchases (user_id, item_key) VALUES ($1,$2)', [req.user.id, item.key]);
-    await client.query('COMMIT');
-    res.json({ message: `${item.name} débloqué !`, points: updated.rows[0].nuni_points });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    // Cas très rare (deux achats simultanés du même article) : la contrainte d'unicité sur
-    // shop_purchases refuse le doublon — la transaction entière est annulée automatiquement,
-    // donc les points ne sont jamais perdus. On répond proprement plutôt qu'avec une erreur
-    // générique 500, comme avant.
-    if (e.code === '23505') {
-      return res.status(400).json({ error: 'Déjà acheté.' });
-    }
-    throw e;
-  } finally {
-    client.release();
-  }
-}));
 
 // ================= DÉFIS QUOTIDIENS / HEBDOMADAIRES =================
 // Étape 3 de la gamification. Récompense en XP direct (la monnaie NUNI Points arrive à
@@ -455,9 +311,7 @@ app.post('/api/me/challenges/:key/claim', authMiddleware, rateLimit(15, 60000), 
     return res.status(400).json({ error: 'Récompense déjà récupérée.' });
   }
   await addXp(req.user.id, def.xp);
-  const pointsAwarded = Math.round(def.xp / 2);
-  await addPoints(req.user.id, pointsAwarded);
-  res.json({ message: `+${def.xp} XP · +${pointsAwarded} NUNI Points !`, xp_awarded: def.xp, points_awarded: pointsAwarded });
+  res.json({ message: `+${def.xp} XP !`, xp_awarded: def.xp });
 }));
 
 // ================= AUTH =================
@@ -660,11 +514,7 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
   if (user.account_status === 'suspended') {
     return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
   }
-  const equippedRows = await db.query('SELECT category, item_key FROM user_equipped_cosmetics WHERE user_id = $1', [user.id]);
-  const equippedCosmetics = {};
-  COSMETIC_CATEGORIES.forEach((c) => { equippedCosmetics[c] = null; });
-  equippedRows.forEach((r) => { equippedCosmetics[r.category] = r.item_key; });
-  res.json({ user: publicUser(await withArtistStats(user)), equippedCosmetics });
+  res.json({ user: publicUser(await withArtistStats(user)) });
 }));
 
 app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
@@ -724,24 +574,15 @@ app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   const isTopListener = !!(monthlyRank && Number(monthlyRank.rnk) <= 10);
 
   const badges = [
-    { ic: '🕊️', n: 'Fan de la première heure', locked: false, d: 'Compte créé' },
-    { ic: '🎧', n: '100 titres découverts', locked: distinctTracks < 100, d: `${distinctTracks}/100` },
-    { ic: '🔥', n: `${user.streak_days || 0} jour(s) d'écoute d'affilée`, locked: (user.streak_days || 0) < 7, d: (user.streak_days || 0) >= 7 ? 'Débloqué' : 'Série en cours' },
-    { ic: '🌍', n: '5 genres explorés', locked: distinctGenres < 5, d: `${distinctGenres}/5` },
-    { ic: '💛', n: '10 artistes soutenus', locked: followedArtists < 10, d: `${followedArtists}/10` },
-    { ic: '🏆', n: 'Top auditeur du mois', locked: !isTopListener, d: isTopListener ? `Rang #${monthlyRank.rnk}` : 'Verrouillé' },
+    { icon: 'star', n: 'Fan de la première heure', locked: false, d: 'Compte créé' },
+    { icon: 'headphones', n: '100 titres découverts', locked: distinctTracks < 100, d: `${distinctTracks}/100` },
+    { icon: 'flame', n: `${user.streak_days || 0} jour(s) d'écoute d'affilée`, locked: (user.streak_days || 0) < 7, d: (user.streak_days || 0) >= 7 ? 'Débloqué' : 'Série en cours' },
+    { icon: 'globe', n: '5 genres explorés', locked: distinctGenres < 5, d: `${distinctGenres}/5` },
+    { icon: 'heart', n: '10 artistes soutenus', locked: followedArtists < 10, d: `${followedArtists}/10` },
+    { icon: 'trophy', n: 'Top auditeur du mois', locked: !isTopListener, d: isTopListener ? `Rang #${monthlyRank.rnk}` : 'Verrouillé' },
   ];
 
-  // Badges cosmétiques achetés dans la boutique NUNI Points — toujours débloqués une fois payés.
-  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [user.id]);
-  const ownedSet = new Set(owned.map((o) => o.item_key));
-  SHOP_ITEMS.filter((it) => it.category === 'badge').forEach((it) => {
-    if (ownedSet.has(it.key)) {
-      badges.push({ ic: it.name.split(' ')[0], n: it.name.replace(/^\S+\s/, ''), locked: false, d: 'Boutique' });
-    }
-  });
-
-  res.json({ ...levelInfoForXp(user.xp || 0), streak_days: user.streak_days || 0, nuni_points: (await db.get('SELECT nuni_points FROM users WHERE id = $1', [user.id])).nuni_points || 0, badges });
+  res.json({ ...levelInfoForXp(user.xp || 0), streak_days: user.streak_days || 0, badges });
 }));
 
 // ---------- Classement public (XP) — étape 5 gamification ----------
@@ -1406,7 +1247,6 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   )).c;
   if (todayPlaysCount <= DAILY_PLAY_REWARD_CAP) {
     await addXp(listenerId, 5);
-    await addPoints(listenerId, 1);
     await bumpChallenge(listenerId, 'daily_listen_3', 1);
     await bumpChallenge(listenerId, 'weekly_listen_15', 1);
   }
