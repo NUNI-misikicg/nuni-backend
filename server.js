@@ -645,21 +645,59 @@ app.post('/api/admin/labels/:id/mark-verification', h(async (req, res) => {
 // ou "retirer" un artiste n'affecte QUE l'affiliation (label_artists) — jamais le compte
 // artiste lui-même (account_status), qui reste sous le contrôle exclusif de l'artiste.
 // Un Label ne peut jamais bloquer l'accès NUNI d'un artiste indépendant.
-async function requireValidatedLabel(req, res) {
-  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
-  if (!user || user.account_type !== 'label') { res.status(403).json({ error: 'Réservé aux comptes Label.' }); return null; }
-  const label = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
+//
+// ---------- Système de rôles (Phase 4) ----------
+// Le compte de connexion du Label (labels.user_id) est toujours 'owner', rang le plus élevé.
+// Les membres d'équipe (label_team_members) ont chacun un rôle propre, avec des permissions
+// croissantes : assistant < manager < admin < owner. minRole fixe le rang minimum requis
+// pour l'action demandée — par défaut 'assistant' (accès en lecture pour toute l'équipe).
+const LABEL_ROLE_RANK = { assistant: 1, manager: 2, admin: 3, owner: 4 };
+// Notifie le propriétaire du Label quand un artiste rejoint (création ou invitation
+// acceptée), et signale en plus si le palier de son plan vient d'être atteint.
+async function notifyLabelArtistAdded(label, artistName, newCount) {
+  await createNotification(
+    label.user_id, 'label_artist_added', 'Nouvel artiste',
+    `${artistName} fait maintenant partie de ${label.label_name}.`, null,
+  ).catch(() => {});
+  const max = LABEL_PLAN_MAX_ARTISTS[label.plan];
+  if (max !== null && newCount >= max) {
+    await createNotification(
+      label.user_id, 'label_plan_limit', 'Palier atteint',
+      `${label.label_name} a atteint la limite de ${max} artiste(s) de son palier actuel. Passez à un palier supérieur pour continuer à ajouter des artistes.`, null,
+    ).catch(() => {});
+  }
+}
+
+async function requireValidatedLabel(req, res, minRole = 'assistant') {
+  // Le compte est-il le compte de connexion du Label lui-même (toujours owner) ?
+  const ownLabel = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
+  let label = ownLabel;
+  let myRole = 'owner';
+  if (!label) {
+    // Sinon, est-ce un membre d'équipe actif d'un Label ?
+    const membership = await db.get(
+      "SELECT lt.role, lt.label_id FROM label_team_members lt WHERE lt.user_id = $1 AND lt.status = 'active' LIMIT 1",
+      [req.user.id],
+    );
+    if (!membership) { res.status(403).json({ error: 'Réservé aux comptes Label.' }); return null; }
+    label = await db.get('SELECT * FROM labels WHERE id = $1', [membership.label_id]);
+    myRole = membership.role;
+  }
   if (!label) { res.status(404).json({ error: 'Profil Label introuvable.' }); return null; }
   if (label.verification_status !== 'validated') {
-    res.status(403).json({ error: 'Votre compte Label doit être validé par NUNI avant de gérer des artistes.' });
+    res.status(403).json({ error: 'Ce compte Label doit être validé par NUNI avant de gérer des artistes.' });
     return null;
   }
-  return label;
+  if (LABEL_ROLE_RANK[myRole] < LABEL_ROLE_RANK[minRole]) {
+    res.status(403).json({ error: `Action réservée aux rôles ${minRole} et supérieurs.` });
+    return null;
+  }
+  return { ...label, myRole };
 }
 
 // ---------- Liste des artistes gérés par le Label, avec leurs vraies stats ----------
 app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'assistant');
   if (!label) return;
   const rows = await db.query(`
     SELECT la.id as affiliation_id, la.status as affiliation_status, la.created_at as joined_at,
@@ -675,7 +713,7 @@ app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
 
 // ---------- Créer un nouvel artiste directement sous le Label ----------
 app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'manager');
   if (!label) return;
   const currentCount = (await db.get(
     "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
@@ -708,12 +746,13 @@ app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000),
     "INSERT INTO label_artists (label_id, artist_id, status) VALUES ($1,$2,'active')",
     [label.id, insertedArtist.id],
   );
+  await notifyLabelArtistAdded(label, artistName, currentCount + 1);
   res.status(201).json({ message: `${artistName} a été créé et rattaché à ${label.label_name}.`, artistId: insertedArtist.id });
 }));
 
 // ---------- Inviter un artiste EXISTANT (déjà inscrit sur NUNI) par email ----------
 app.post('/api/label/artists/invite', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'manager');
   if (!label) return;
   const currentCount = (await db.get(
     "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
@@ -736,7 +775,7 @@ app.post('/api/label/artists/invite', authMiddleware, rateLimit(10, 60 * 60000),
 
 // ---------- Retirer un artiste du Label (n'affecte jamais le compte artiste lui-même) ----------
 app.delete('/api/label/artists/:id', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'admin');
   if (!label) return;
   const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
   if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
@@ -746,7 +785,7 @@ app.delete('/api/label/artists/:id', authMiddleware, h(async (req, res) => {
 
 // ---------- Suspendre / réactiver l'affiliation (jamais le compte artiste lui-même) ----------
 app.post('/api/label/artists/:id/suspend', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'manager');
   if (!label) return;
   const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
   if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
@@ -754,7 +793,7 @@ app.post('/api/label/artists/:id/suspend', authMiddleware, h(async (req, res) =>
   res.json({ message: 'Affiliation suspendue — le compte artiste reste actif et indépendant sur NUNI.' });
 }));
 app.post('/api/label/artists/:id/reactivate', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'manager');
   if (!label) return;
   const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
   if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
@@ -764,7 +803,7 @@ app.post('/api/label/artists/:id/reactivate', authMiddleware, h(async (req, res)
 
 // ---------- Vue d'ensemble (accueil du Dashboard Label) ----------
 app.get('/api/label/overview', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'assistant');
   if (!label) return;
   const artistIds = (await db.query(
     "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
@@ -810,7 +849,7 @@ app.get('/api/label/overview', authMiddleware, h(async (req, res) => {
 // d'argent lui-même via NUNI, il consulte simplement l'historique réel de ses artistes,
 // consolidé. Rien n'est inventé ou simulé ici.
 app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res);
+  const label = await requireValidatedLabel(req, res, 'admin');
   if (!label) return;
   const artistIds = (await db.query(
     "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status != 'removed'", [label.id],
@@ -835,6 +874,94 @@ app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
   res.json({ totalPaidFcfa, byArtist, history });
 }));
 
+// ---------- Équipe & rôles (Phase 4) ----------
+// PROPRIÉTAIRE (le compte de connexion du Label lui-même) > ADMIN > MANAGER > ASSISTANT.
+app.get('/api/label/team', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT lt.id, lt.role, lt.status, lt.email, lt.created_at, u.first_name, u.last_name
+    FROM label_team_members lt LEFT JOIN users u ON u.id = lt.user_id
+    WHERE lt.label_id = $1 ORDER BY lt.created_at ASC
+  `, [label.id]);
+  const owner = await db.get('SELECT first_name, last_name, email FROM users WHERE id = $1', [label.user_id]);
+  res.json({ members: rows, owner, myRole: label.myRole });
+}));
+
+app.post('/api/label/team/invite', authMiddleware, rateLimit(15, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const { email, role } = req.body;
+  if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  if (!['admin', 'manager', 'assistant'].includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide (admin, manager ou assistant).' });
+  }
+  const invitedUser = await db.get('SELECT id FROM users WHERE email = $1', [email]);
+  if (!invitedUser) return res.status(404).json({ error: 'Aucun compte NUNI ne correspond à cet email — la personne doit d\'abord créer un compte NUNI.' });
+  if (invitedUser.id === label.user_id) return res.status(400).json({ error: 'Cette personne est déjà propriétaire du Label.' });
+  if (await db.get('SELECT id FROM label_team_members WHERE label_id = $1 AND user_id = $2', [label.id, invitedUser.id])) {
+    return res.status(400).json({ error: 'Cette personne fait déjà partie de votre équipe (ou en a déjà fait partie).' });
+  }
+  await db.run(
+    "INSERT INTO label_team_members (label_id, user_id, email, role, status) VALUES ($1,$2,$3,$4,'invited')",
+    [label.id, invitedUser.id, email, role],
+  );
+  await createNotification(invitedUser.id, 'label_team_invite', 'Invitation à rejoindre un Label', `${label.label_name} vous invite à rejoindre son équipe NUNI en tant que ${role}.`, null).catch(() => {});
+  res.status(201).json({ message: 'Invitation envoyée.' });
+}));
+
+app.delete('/api/label/team/:id', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const member = await db.get('SELECT id FROM label_team_members WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!member) return res.status(404).json({ error: 'Membre introuvable.' });
+  await db.run('DELETE FROM label_team_members WHERE id = $1', [member.id]);
+  res.json({ message: 'Membre retiré de l\'équipe.' });
+}));
+
+app.put('/api/label/team/:id/role', authMiddleware, h(async (req, res) => {
+  // Changer le rôle d'un membre est réservé au propriétaire — évite qu'un admin ne se
+  // promeuve lui-même ou ne rétrograde un autre admin par rivalité interne.
+  const label = await requireValidatedLabel(req, res, 'owner');
+  if (!label) return;
+  const { role } = req.body;
+  if (!['admin', 'manager', 'assistant'].includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide (admin, manager ou assistant).' });
+  }
+  const member = await db.get('SELECT id FROM label_team_members WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!member) return res.status(404).json({ error: 'Membre introuvable.' });
+  await db.run('UPDATE label_team_members SET role = $1 WHERE id = $2', [role, member.id]);
+  res.json({ message: 'Rôle mis à jour.' });
+}));
+
+// ---------- Côté UTILISATEUR : invitations d'équipe reçues ----------
+app.get('/api/me/label-team-invites', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT lt.id, lt.role, l.label_name, l.logo_url
+    FROM label_team_members lt JOIN labels l ON l.id = lt.label_id
+    WHERE lt.user_id = $1 AND lt.status = 'invited'
+  `, [req.user.id]);
+  res.json({ invites: rows });
+}));
+app.post('/api/me/label-team-invites/:id/accept', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id FROM label_team_members WHERE id = $1 AND user_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run("UPDATE label_team_members SET status = 'active' WHERE id = $1", [invite.id]);
+  res.json({ message: 'Invitation acceptée.' });
+}));
+app.post('/api/me/label-team-invites/:id/decline', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id FROM label_team_members WHERE id = $1 AND user_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run('DELETE FROM label_team_members WHERE id = $1', [invite.id]);
+  res.json({ message: 'Invitation refusée.' });
+}));
+
 // ---------- Côté ARTISTE : voir/accepter/refuser une invitation reçue d'un Label ----------
 app.get('/api/me/label-invites', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`
@@ -846,11 +973,19 @@ app.get('/api/me/label-invites', authMiddleware, h(async (req, res) => {
 }));
 app.post('/api/me/label-invites/:id/accept', authMiddleware, h(async (req, res) => {
   const invite = await db.get(
-    "SELECT id FROM label_artists WHERE id = $1 AND artist_id = $2 AND status = 'invited'",
+    "SELECT id, label_id FROM label_artists WHERE id = $1 AND artist_id = $2 AND status = 'invited'",
     [Number(req.params.id), req.user.id],
   );
   if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
   await db.run("UPDATE label_artists SET status = 'active' WHERE id = $1", [invite.id]);
+  const label = await db.get('SELECT * FROM labels WHERE id = $1', [invite.label_id]);
+  const artist = await db.get('SELECT artist_name FROM users WHERE id = $1', [req.user.id]);
+  if (label && artist) {
+    const newCount = (await db.get(
+      "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+    )).c;
+    await notifyLabelArtistAdded(label, artist.artist_name, newCount);
+  }
   res.json({ message: 'Invitation acceptée.' });
 }));
 app.post('/api/me/label-invites/:id/decline', authMiddleware, h(async (req, res) => {
@@ -1478,6 +1613,15 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
     composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
   ]);
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
+  if (!isFuture) {
+    // Notification "nouvelle sortie" pour le Label — jamais bloquante pour la réponse déjà envoyée.
+    db.get(
+      "SELECT l.user_id, l.label_name, u.artist_name FROM label_artists la JOIN labels l ON l.id = la.label_id JOIN users u ON u.id = la.artist_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
+      [req.user.id],
+    ).then((row) => {
+      if (row) createNotification(row.user_id, 'label_new_release', 'Nouvelle sortie', `${row.artist_name} vient de publier « ${title} » sur NUNI.`, null).catch(() => {});
+    }).catch(() => {});
+  }
 }));
 
 app.post('/api/clips', authMiddleware, h(async (req, res) => {
@@ -2551,6 +2695,14 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
     user: artist, amountFcfa: p.amount_due_fcfa, streamsCovered: p.current_period_streams,
     periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
   }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
+
+  // Notification "paiement reçu" pour le Label, si cet artiste lui est affilié.
+  db.get(
+    "SELECT l.user_id, l.label_name FROM label_artists la JOIN labels l ON l.id = la.label_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
+    [artistId],
+  ).then((row) => {
+    if (row) createNotification(row.user_id, 'label_payment_received', 'Paiement reçu', `${artist.artist_name || artist.first_name} a reçu un versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA.`, null).catch(() => {});
+  }).catch(() => {});
 
   res.json({ message: `Versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA enregistré pour ${artist.artist_name || artist.first_name}.`, payment_id: inserted.id });
 }));
