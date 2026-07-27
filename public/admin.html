@@ -58,6 +58,7 @@
     <button class="tab-btn" data-tab="hero">🖼️ Bannières</button>
     <button class="tab-btn" data-tab="playlists">🎧 Playlists</button>
     <button class="tab-btn" data-tab="payouts">💸 Reversements artistes</button>
+    <button class="tab-btn" data-tab="events">🎉 NUNI Événements</button>
   </div>
 
   <!-- ONGLET 1 : ACTIVER UN PASS -->
@@ -237,6 +238,74 @@
     <div id="payouts-history-wrap" style="margin-top:14px;"></div>
   </div>
 
+  <div class="pane" id="pane-events">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🎉 Créer un événement NUNI</b>
+      <div class="muted" style="margin-top:4px;">Réservé à l'équipe NUNI — aucun artiste ne peut publier ici. Visible immédiatement dans Recherche → NUNI Événements dès la publication.</div>
+
+      <label>Catégorie *</label>
+      <select id="ev-category">
+        <option value="Showcase">Showcase</option>
+        <option value="Festival">Festival</option>
+        <option value="Casting">Casting</option>
+        <option value="Conférence">Conférence</option>
+        <option value="Masterclass">Masterclass</option>
+        <option value="Soirée privée">Soirée privée</option>
+        <option value="Cérémonie">Cérémonie</option>
+        <option value="Remise de prix">Remise de prix</option>
+        <option value="Lancement d'album">Lancement d'album</option>
+        <option value="Événement sponsorisé">Événement sponsorisé</option>
+      </select>
+
+      <label>Nom de l'événement *</label>
+      <input id="ev-title" type="text" placeholder="Ex : Festival NUNI Kinshasa 2026">
+
+      <label>Description</label>
+      <textarea id="ev-description" rows="3" placeholder="Ce que le public doit savoir..."></textarea>
+
+      <label>Date *</label>
+      <input id="ev-date" type="date">
+      <label>Heure</label>
+      <input id="ev-time" type="time">
+
+      <label>Lieu</label>
+      <input id="ev-venue" type="text" placeholder="Palais du Peuple">
+      <label>Adresse</label>
+      <input id="ev-address" type="text" placeholder="Adresse précise">
+      <label>Latitude GPS (optionnel)</label>
+      <input id="ev-gps-lat" type="text" placeholder="-4.325">
+      <label>Longitude GPS (optionnel)</label>
+      <input id="ev-gps-lng" type="text" placeholder="15.322">
+
+      <label>Prix</label>
+      <input id="ev-price" type="text" placeholder="5 000 FCFA, ou Gratuit">
+      <label>Bouton Acheter — lien</label>
+      <input id="ev-purchase-link" type="text" placeholder="https://wa.me/...">
+      <label>Nombre de places</label>
+      <input id="ev-capacity" type="number" min="0" placeholder="1000">
+
+      <label>Flyer</label>
+      <div id="ev-flyer-preview" style="width:140px; height:180px; border-radius:8px; background:#1a1410; border:1px dashed #4a3a28; background-size:cover; background-position:center; display:flex; align-items:center; justify-content:center; color:#8a7a68; font-size:11px; cursor:pointer;" onclick="document.getElementById('ev-flyer-input').click()">Choisir une image</div>
+      <input type="file" id="ev-flyer-input" accept="image/*" style="display:none;" onchange="previewEventFlyer(event)">
+
+      <label style="margin-top:10px;">Galerie photos (plusieurs images possibles)</label>
+      <input type="file" id="ev-gallery-input" accept="image/*" multiple onchange="handleEventGalleryFiles(event)">
+      <div id="ev-gallery-status" class="muted" style="margin-top:4px;"></div>
+
+      <label>Vidéo promotionnelle (optionnel)</label>
+      <input type="file" id="ev-video-input" accept="video/*" onchange="handleEventVideoFile(event)">
+      <div id="ev-video-status" class="muted" style="margin-top:4px;"></div>
+
+      <button class="primary" style="margin-top:14px;" onclick="publishNuniEvent()">Publier l'événement</button>
+      <div id="ev-publish-msg" style="margin-top:8px;"></div>
+    </div>
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">Événements publiés</b>
+      <button class="secondary" style="margin-top:10px;" onclick="loadAdminNuniEvents()">Charger les événements</button>
+      <div id="admin-events-list" style="margin-top:14px;"></div>
+    </div>
+  </div>
+
 <script>
   function getKey(){ const k = document.getElementById('key').value.trim(); localStorage.setItem('nuniAdminKey', k); return k; }
 
@@ -260,6 +329,145 @@
       box.innerHTML = '🔍 Diagnostic impossible à charger (route debug-key-check absente ou serveur inaccessible).';
       container.appendChild(box);
     }
+  }
+
+  // ============ NUNI ÉVÉNEMENTS (Phase 3) ============
+  // Helper d'upload réutilisable, même pattern que les bannières hero plus haut (upload
+  // direct navigateur → Cloudinary, signé par la clé admin, jamais de secret exposé).
+  async function adminUploadToCloudinary(file, resourceType){
+    const sigRes = await fetch('/api/admin/upload-signature', { headers:{'x-admin-key':getKey()} });
+    const sig = await sigRes.json();
+    if(!sigRes.ok) throw new Error(sig.error || 'Clé admin invalide.');
+    const form = new FormData();
+    form.append('file', file);
+    form.append('api_key', sig.apiKey);
+    form.append('timestamp', sig.timestamp);
+    form.append('signature', sig.signature);
+    form.append('folder', sig.folder);
+    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${sig.cloudName}/${resourceType}/upload`, { method:'POST', body: form });
+    const cloudData = await cloudRes.json();
+    if(!cloudRes.ok) throw new Error('Envoi Cloudinary refusé.');
+    return cloudData.secure_url;
+  }
+
+  let pendingEventFlyerFile = null;
+  let pendingEventGalleryFiles = [];
+  let pendingEventVideoFile = null;
+
+  function previewEventFlyer(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    pendingEventFlyerFile = file;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      const preview = document.getElementById('ev-flyer-preview');
+      preview.style.backgroundImage = `url(${reader.result})`;
+      preview.textContent = '';
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  }
+  function handleEventGalleryFiles(e){
+    pendingEventGalleryFiles = Array.from(e.target.files || []);
+    document.getElementById('ev-gallery-status').textContent = pendingEventGalleryFiles.length
+      ? pendingEventGalleryFiles.length + ' photo(s) sélectionnée(s)' : '';
+  }
+  function handleEventVideoFile(e){
+    pendingEventVideoFile = e.target.files[0] || null;
+    document.getElementById('ev-video-status').textContent = pendingEventVideoFile
+      ? pendingEventVideoFile.name + ' — prête à publier' : '';
+  }
+
+  async function publishNuniEvent(){
+    const msg = document.getElementById('ev-publish-msg');
+    const category = document.getElementById('ev-category').value;
+    const title = document.getElementById('ev-title').value.trim();
+    const eventDate = document.getElementById('ev-date').value;
+    if(!title || !eventDate){ msg.innerHTML = '<span class="urgent">Nom et date sont obligatoires.</span>'; return; }
+    msg.textContent = 'Publication en cours…';
+    try{
+      let flyerUrl = null;
+      if(pendingEventFlyerFile) flyerUrl = await adminUploadToCloudinary(pendingEventFlyerFile, 'image');
+
+      let galleryUrls = null;
+      if(pendingEventGalleryFiles.length){
+        const urls = await Promise.all(pendingEventGalleryFiles.map(f=> adminUploadToCloudinary(f, 'image')));
+        galleryUrls = urls.join(',');
+      }
+
+      let promoVideoUrl = null;
+      if(pendingEventVideoFile) promoVideoUrl = await adminUploadToCloudinary(pendingEventVideoFile, 'video');
+
+      const latVal = document.getElementById('ev-gps-lat').value;
+      const lngVal = document.getElementById('ev-gps-lng').value;
+      const capacityVal = document.getElementById('ev-capacity').value;
+
+      const res = await fetch('/api/admin/nuni-events', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({
+          category, title, eventDate, flyerUrl, galleryUrls, promoVideoUrl,
+          description: document.getElementById('ev-description').value.trim() || null,
+          startTime: document.getElementById('ev-time').value || null,
+          venue: document.getElementById('ev-venue').value.trim() || null,
+          address: document.getElementById('ev-address').value.trim() || null,
+          gpsLat: latVal ? Number(latVal) : null,
+          gpsLng: lngVal ? Number(lngVal) : null,
+          price: document.getElementById('ev-price').value.trim() || null,
+          purchaseLink: document.getElementById('ev-purchase-link').value.trim() || null,
+          capacity: capacityVal ? Number(capacityVal) : null,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Événement publié.</span>';
+      ['ev-title','ev-description','ev-date','ev-time','ev-venue','ev-address','ev-gps-lat','ev-gps-lng',
+       'ev-price','ev-purchase-link','ev-capacity'].forEach(id=>{ document.getElementById(id).value = ''; });
+      pendingEventFlyerFile = null; pendingEventGalleryFiles = []; pendingEventVideoFile = null;
+      document.getElementById('ev-flyer-preview').style.backgroundImage = '';
+      document.getElementById('ev-flyer-preview').textContent = 'Choisir une image';
+      document.getElementById('ev-gallery-status').textContent = '';
+      document.getElementById('ev-video-status').textContent = '';
+      loadAdminNuniEvents();
+    }catch(e){
+      msg.innerHTML = '<span class="urgent">❌ ' + (e.message || 'Erreur inconnue.') + '</span>';
+    }
+  }
+
+  async function loadAdminNuniEvents(){
+    const list = document.getElementById('admin-events-list');
+    list.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/nuni-events', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ list.innerHTML = '<div class="msg err">❌ ' + (data.error||'Erreur') + '</div>'; return; }
+      if(!data.events || !data.events.length){ list.innerHTML = '<div class="muted">Aucun événement publié.</div>'; return; }
+      list.innerHTML = '';
+      data.events.forEach(ev=>{
+        const row = document.createElement('div');
+        row.className = 'card';
+        row.style.cssText = 'display:flex; align-items:center; gap:12px; padding:10px;';
+        const dateLabel = new Date(ev.event_date).toLocaleDateString('fr-FR', {day:'2-digit', month:'short', year:'numeric'});
+        row.innerHTML = `
+          <div style="width:44px; height:56px; border-radius:6px; background:${ev.flyer_url ? `url(${ev.flyer_url})` : '#1a1410'}; background-size:cover; background-position:center; flex-shrink:0;"></div>
+          <div style="flex:1; min-width:0;">
+            <div style="font-weight:700; font-size:13px;">${ev.title}</div>
+            <div class="muted">${ev.category} · ${dateLabel}${ev.venue ? ' · ' + ev.venue : ''}</div>
+          </div>
+          <button class="secondary" onclick="deleteNuniEvent(${ev.id})">Supprimer</button>`;
+        list.appendChild(row);
+      });
+    }catch(e){
+      list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
+    }
+  }
+  async function deleteNuniEvent(id){
+    if(!confirm('Supprimer définitivement cet événement ?')) return;
+    try{
+      const res = await fetch('/api/admin/nuni-events/' + id, { method:'DELETE', headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error || 'Erreur.'); return; }
+      loadAdminNuniEvents();
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
 
   document.querySelectorAll('.tab-btn').forEach(btn=>{

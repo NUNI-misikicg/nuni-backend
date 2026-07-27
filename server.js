@@ -768,8 +768,9 @@ app.get('/api/playlists/:id', h(async (req, res) => {
 }));
 
 function checkAdminKey(req, res) {
-  const adminKey = req.headers['x-admin-key'];
-  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+  const adminKey = (req.headers['x-admin-key'] || '').trim();
+  const expectedKey = (process.env.ADMIN_KEY || '').trim();
+  if (!expectedKey || adminKey !== expectedKey) {
     res.status(403).json({ error: 'Clé admin invalide.' });
     return false;
   }
@@ -1903,6 +1904,58 @@ app.delete('/api/dashboard/concerts/:id', authMiddleware, h(async (req, res) => 
   if (!concert) return res.status(404).json({ error: 'Concert introuvable.' });
   await db.run('DELETE FROM concerts WHERE id = $1', [concert.id]);
   res.json({ message: 'Concert supprimé.' });
+}));
+
+// ================= NUNI ÉVÉNEMENTS (Phase 3) =================
+// Entièrement administrés par NUNI — aucun artiste ne peut y publier, uniquement l'équipe
+// admin via admin.html (protégé par x-admin-key, même mécanisme que le reste de l'admin).
+
+// ---------- Publique — pour la page NUNI Événements de la recherche ----------
+app.get('/api/nuni-events', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT * FROM nuni_events WHERE event_date >= CURRENT_DATE ORDER BY event_date ASC
+  `);
+  res.json({ events: rows });
+}));
+
+// ---------- Admin — liste complète (passés compris, pour la gestion) ----------
+app.get('/api/admin/nuni-events', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query('SELECT * FROM nuni_events ORDER BY event_date DESC');
+  res.json({ events: rows });
+}));
+
+// ---------- Admin — créer ----------
+app.post('/api/admin/nuni-events', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const {
+    category, title, description, flyerUrl, eventDate, startTime, venue, address,
+    gpsLat, gpsLng, price, purchaseLink, capacity, placesRestantes, galleryUrls, promoVideoUrl,
+  } = req.body;
+  if (!category || !title || !eventDate) {
+    return res.status(400).json({ error: 'Catégorie, titre et date sont obligatoires.' });
+  }
+  const row = await db.get(
+    `INSERT INTO nuni_events (
+      category, title, description, flyer_url, event_date, start_time, venue, address,
+      gps_lat, gps_lng, price, purchase_link, capacity, places_restantes, gallery_urls, promo_video_url
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+    [
+      category, title, description || null, flyerUrl || null, eventDate, startTime || null, venue || null, address || null,
+      gpsLat || null, gpsLng || null, price || null, purchaseLink || null, capacity || null,
+      placesRestantes || capacity || null, galleryUrls || null, promoVideoUrl || null,
+    ],
+  );
+  res.json({ event: row, message: 'Événement publié — visible immédiatement dans la recherche.' });
+}));
+
+// ---------- Admin — supprimer ----------
+app.delete('/api/admin/nuni-events/:id', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const event = await db.get('SELECT id FROM nuni_events WHERE id = $1', [Number(req.params.id)]);
+  if (!event) return res.status(404).json({ error: 'Événement introuvable.' });
+  await db.run('DELETE FROM nuni_events WHERE id = $1', [event.id]);
+  res.json({ message: 'Événement supprimé.' });
 }));
 
 app.post('/api/clips/:id/view', h(async (req, res) => {
