@@ -304,6 +304,19 @@
       <button class="secondary" style="margin-top:10px;" onclick="loadAdminNuniEvents()">Charger les événements</button>
       <div id="admin-events-list" style="margin-top:14px;"></div>
     </div>
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">📍 Informations officielles NUNI</b>
+      <div class="muted" style="margin-top:4px;">Affichées à la place d'un lien d'achat pour tout événement NUNI Événements sans lien renseigné — locaux, service client.</div>
+      <label>Emplacements (un par ligne — ex : Maison principale, avenue de la Paix, Kinshasa)</label>
+      <textarea id="nuni-info-locations" rows="4" placeholder="Maison principale — ...&#10;Antenne Pointe-Noire — ..."></textarea>
+      <label>Téléphone service client</label>
+      <input id="nuni-info-phone" type="text" placeholder="+242 06 895 16 00">
+      <label>Email</label>
+      <input id="nuni-info-email" type="text" placeholder="nunimisiki@gmail.com">
+      <button class="secondary" style="margin-top:10px;" onclick="loadNuniInfoForm()">Charger les infos actuelles</button>
+      <button class="primary" style="margin-top:10px;" onclick="saveNuniInfo()">Enregistrer</button>
+      <div id="nuni-info-msg" style="margin-top:8px;"></div>
+    </div>
   </div>
 
 <script>
@@ -469,6 +482,34 @@
       loadAdminNuniEvents();
     }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
+
+  async function loadNuniInfoForm(){
+    try{
+      const res = await fetch('/api/nuni-info');
+      const data = await res.json();
+      document.getElementById('nuni-info-locations').value = data.locations || '';
+      document.getElementById('nuni-info-phone').value = data.phone || '';
+      document.getElementById('nuni-info-email').value = data.email || '';
+    }catch(e){ /* pas grave */ }
+  }
+  async function saveNuniInfo(){
+    const msg = document.getElementById('nuni-info-msg');
+    msg.textContent = 'Enregistrement…';
+    try{
+      const res = await fetch('/api/admin/nuni-info', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({
+          locations: document.getElementById('nuni-info-locations').value.trim(),
+          phone: document.getElementById('nuni-info-phone').value.trim(),
+          email: document.getElementById('nuni-info-email').value.trim(),
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Enregistré.</span>';
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+  loadNuniInfoForm();
 
   document.querySelectorAll('.tab-btn').forEach(btn=>{
     btn.onclick = ()=>{

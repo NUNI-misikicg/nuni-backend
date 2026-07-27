@@ -1958,6 +1958,40 @@ app.delete('/api/admin/nuni-events/:id', h(async (req, res) => {
   res.json({ message: 'Événement supprimé.' });
 }));
 
+// ---------- Informations officielles NUNI (locaux, service client) ----------
+// Affichées à la place d'un lien d'achat pour les événements NUNI Événements qui n'en ont
+// pas — contrairement aux concerts d'artistes, un événement NUNI appartient à la plateforme
+// elle-même, donc ce sont les vraies coordonnées NUNI qui ont du sens ici, pas "bientôt
+// disponible". Stocké dans app_settings, même mécanisme que les taux de reversement.
+const NUNI_INFO_KEYS = ['nuni_info_locations', 'nuni_info_phone', 'nuni_info_email'];
+app.get('/api/nuni-info', h(async (req, res) => {
+  const rows = await db.query('SELECT key, value FROM app_settings WHERE key = ANY($1)', [NUNI_INFO_KEYS]);
+  const map = {};
+  rows.forEach((r) => { map[r.key] = r.value; });
+  res.json({
+    locations: map.nuni_info_locations || null,
+    phone: map.nuni_info_phone || null,
+    email: map.nuni_info_email || null,
+  });
+}));
+app.post('/api/admin/nuni-info', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { locations, phone, email } = req.body;
+  const pairs = [
+    ['nuni_info_locations', locations || ''],
+    ['nuni_info_phone', phone || ''],
+    ['nuni_info_email', email || ''],
+  ];
+  for (const [key, value] of pairs) {
+    await db.run(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value],
+    );
+  }
+  res.json({ message: 'Informations NUNI enregistrées.' });
+}));
+
 app.post('/api/clips/:id/view', h(async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = await db.get('SELECT id, artist_id, views FROM clips WHERE id = $1', [clipId]);
