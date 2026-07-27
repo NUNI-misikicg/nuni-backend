@@ -874,6 +874,106 @@ app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
   res.json({ totalPaidFcfa, byArtist, history });
 }));
 
+// ================= ANALYTICS + CATALOGUE (Phase 5) =================
+// Important, par honnêteté : NUNI ne suit pas encore la plateforme de lecture (mobile/web/
+// desktop) ni un vrai système de "brouillon" distinct d'une simple publication — ces deux
+// éléments demandés dans le cahier des charges ne sont donc pas inclus ici plutôt que
+// d'afficher des chiffres inventés. Tout le reste (streams, auditeurs, pays, villes,
+// croissance, rétention) vient de vraies données déjà en base (table plays).
+app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ streamsByMonth: [], topCountries: [], topCities: [], growthPct: null, retentionPct: null });
+  }
+
+  const streamsByMonth = await db.query(`
+    SELECT to_char(date_trunc('month', p.created_at), 'Mon YYYY') as month,
+           COUNT(*)::int as streams, COUNT(DISTINCT p.listener_id)::int as listeners
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = ANY($1) AND p.created_at >= NOW() - INTERVAL '6 months'
+    GROUP BY date_trunc('month', p.created_at)
+    ORDER BY date_trunc('month', p.created_at) ASC
+  `, [artistIds]);
+
+  const topCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = p.listener_id
+    WHERE t.artist_id = ANY($1) AND u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country ORDER BY plays DESC LIMIT 6
+  `, [artistIds]);
+
+  const topCities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = p.listener_id
+    WHERE t.artist_id = ANY($1) AND u.city IS NOT NULL AND u.city != ''
+    GROUP BY u.city ORDER BY plays DESC LIMIT 6
+  `, [artistIds]);
+
+  // Croissance : variation des streams entre les deux derniers mois complets.
+  let growthPct = null;
+  if (streamsByMonth.length >= 2) {
+    const prev = streamsByMonth[streamsByMonth.length - 2].streams;
+    const curr = streamsByMonth[streamsByMonth.length - 1].streams;
+    growthPct = prev > 0 ? Math.round(((curr - prev) / prev) * 1000) / 10 : null;
+  }
+
+  // Rétention : parmi les auditeurs distincts du mois précédent, quelle proportion a
+  // réécouté au moins une fois ce mois-ci.
+  const prevListeners = await db.query(`
+    SELECT DISTINCT p.listener_id FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = ANY($1)
+      AND p.created_at >= date_trunc('month', NOW() - INTERVAL '1 month')
+      AND p.created_at < date_trunc('month', NOW())
+  `, [artistIds]);
+  let retentionPct = null;
+  if (prevListeners.length) {
+    const prevIds = prevListeners.map((r) => r.listener_id);
+    const retained = await db.get(`
+      SELECT COUNT(DISTINCT p.listener_id)::int as c FROM plays p JOIN tracks t ON t.id = p.track_id
+      WHERE t.artist_id = ANY($1) AND p.listener_id = ANY($2) AND p.created_at >= date_trunc('month', NOW())
+    `, [artistIds, prevIds]);
+    retentionPct = Math.round((retained.c / prevIds.length) * 1000) / 10;
+  }
+
+  res.json({ streamsByMonth, topCountries, topCities, growthPct, retentionPct });
+}));
+
+// ---------- Catalogue consolidé (tous les artistes du Label) ----------
+app.get('/api/label/catalog', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ tracks: [], clips: [], scheduled: [] });
+  }
+  const tracks = await db.query(`
+    SELECT t.id, t.title, t.album, t.release_type, t.cover_url, t.streams, t.created_at,
+           u.artist_name
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.artist_id = ANY($1) AND t.published = 1
+    ORDER BY t.created_at DESC
+  `, [artistIds]);
+  const clips = await db.query(`
+    SELECT c.id, c.title, c.thumb_url, c.views, c.created_at, u.artist_name
+    FROM clips c JOIN users u ON u.id = c.artist_id
+    WHERE c.artist_id = ANY($1) AND c.published = 1
+    ORDER BY c.created_at DESC
+  `, [artistIds]);
+  const scheduled = await db.query(`
+    SELECT t.id, t.title, t.album, t.release_type, t.cover_url, t.scheduled_release_at, u.artist_name
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.artist_id = ANY($1) AND t.published = 0 AND t.scheduled_release_at IS NOT NULL
+    ORDER BY t.scheduled_release_at ASC
+  `, [artistIds]);
+  res.json({ tracks, clips, scheduled });
+}));
+
 // ---------- Équipe & rôles (Phase 4) ----------
 // PROPRIÉTAIRE (le compte de connexion du Label lui-même) > ADMIN > MANAGER > ASSISTANT.
 app.get('/api/label/team', authMiddleware, h(async (req, res) => {
