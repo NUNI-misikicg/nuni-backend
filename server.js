@@ -804,6 +804,37 @@ app.get('/api/label/overview', authMiddleware, h(async (req, res) => {
   });
 }));
 
+// ---------- Revenus & versements consolidés (Phase 3) ----------
+// Vue de RAPPORT sur les vrais versements déjà enregistrés (table payment_history, celle que
+// l'admin alimente depuis "Reversements artistes") — le Label ne reçoit ni ne redistribue
+// d'argent lui-même via NUNI, il consulte simplement l'historique réel de ses artistes,
+// consolidé. Rien n'est inventé ou simulé ici.
+app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res);
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status != 'removed'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ totalPaidFcfa: 0, byArtist: [], history: [] });
+  }
+  const history = await db.query(`
+    SELECT ph.id, ph.amount_fcfa, ph.streams_covered, ph.period_start, ph.period_end, ph.method, ph.created_at,
+           u.artist_name
+    FROM payment_history ph JOIN users u ON u.id = ph.artist_id
+    WHERE ph.artist_id = ANY($1)
+    ORDER BY ph.created_at DESC
+  `, [artistIds]);
+  const byArtist = await db.query(`
+    SELECT u.id as artist_id, u.artist_name, COALESCE(SUM(ph.amount_fcfa),0)::bigint as total_paid_fcfa,
+           COUNT(ph.id)::int as payment_count
+    FROM users u LEFT JOIN payment_history ph ON ph.artist_id = u.id
+    WHERE u.id = ANY($1) GROUP BY u.id, u.artist_name ORDER BY total_paid_fcfa DESC
+  `, [artistIds]);
+  const totalPaidFcfa = byArtist.reduce((sum, a) => sum + Number(a.total_paid_fcfa), 0);
+  res.json({ totalPaidFcfa, byArtist, history });
+}));
+
 // ---------- Côté ARTISTE : voir/accepter/refuser une invitation reçue d'un Label ----------
 app.get('/api/me/label-invites', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`
