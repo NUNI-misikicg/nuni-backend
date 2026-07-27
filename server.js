@@ -1171,6 +1171,7 @@ app.get('/api/tracks', h(async (req, res) => {
   const rows = await db.query(`
     SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url, t.lyrics,
            t.streams, t.likes, t.created_at, u.id as artist_id, u.artist_name, u.is_verified,
+           u.avatar_url as artist_avatar_url,
            t.composer, t.featuring, t.studio, t.description, t.release_date
     FROM tracks t JOIN users u ON u.id = t.artist_id
     WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= NOW())
