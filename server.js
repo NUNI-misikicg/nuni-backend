@@ -1825,6 +1825,83 @@ app.get('/api/clips', h(async (req, res) => {
   res.json({ clips: rows });
 }));
 
+// ================= CONCERTS (Phase 2) =================
+// Publication directe par l'artiste, aucune validation admin nécessaire — dès qu'il publie,
+// le concert apparaît dans l'onglet Concerts de la recherche (voir GET /api/concerts).
+
+// ---------- Publique — tous les concerts à venir, pour la page Concerts de la recherche ----------
+app.get('/api/concerts', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT co.*, u.artist_name, u.avatar_url as artist_avatar_url, u.is_verified
+    FROM concerts co JOIN users u ON u.id = co.artist_id
+    WHERE co.event_date >= CURRENT_DATE
+    ORDER BY co.event_date ASC
+  `);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Publique — concerts à venir d'un artiste précis (page profil artiste) ----------
+app.get('/api/artists/:id/concerts', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT * FROM concerts WHERE artist_id = $1 AND event_date >= CURRENT_DATE ORDER BY event_date ASC
+  `, [Number(req.params.id)]);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Gestion — les concerts de l'artiste connecté (Dashboard), passés et à venir ----------
+app.get('/api/dashboard/concerts', authMiddleware, h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes artiste.' });
+  const rows = await db.query('SELECT * FROM concerts WHERE artist_id = $1 ORDER BY event_date DESC', [req.user.id]);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Créer un concert ----------
+app.post('/api/dashboard/concerts', authMiddleware, rateLimit(10, 60000), h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes artiste.' });
+  const {
+    title, description, flyerUrl, eventDate, startTime, endTime, city, country, venue, address,
+    gpsLat, gpsLng, ticketPrice, ticketType, capacity, placesRestantes, purchaseLink, tourName,
+  } = req.body;
+  if (!title || !eventDate || !city || !country) {
+    return res.status(400).json({ error: 'Titre, date, ville et pays sont obligatoires.' });
+  }
+  const row = await db.get(
+    `INSERT INTO concerts (
+      artist_id, title, description, flyer_url, event_date, start_time, end_time, city, country,
+      venue, address, gps_lat, gps_lng, ticket_price, ticket_type, capacity, places_restantes,
+      purchase_link, tour_name
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+    [
+      req.user.id, title, description || null, flyerUrl || null, eventDate, startTime || null, endTime || null,
+      city, country, venue || null, address || null, gpsLat || null, gpsLng || null,
+      ticketPrice || null, ticketType || null, capacity || null, placesRestantes || capacity || null,
+      purchaseLink || null, tourName || null,
+    ],
+  );
+  res.json({ concert: row, message: 'Concert publié — visible immédiatement dans la recherche.' });
+}));
+
+// ---------- Modifier (ex: mettre à jour les places restantes) ----------
+app.put('/api/dashboard/concerts/:id', authMiddleware, h(async (req, res) => {
+  const concert = await db.get('SELECT id FROM concerts WHERE id = $1 AND artist_id = $2', [Number(req.params.id), req.user.id]);
+  if (!concert) return res.status(404).json({ error: 'Concert introuvable.' });
+  const { placesRestantes } = req.body;
+  if (typeof placesRestantes === 'number') {
+    await db.run('UPDATE concerts SET places_restantes = $1 WHERE id = $2', [placesRestantes, concert.id]);
+  }
+  res.json({ message: 'Concert mis à jour.' });
+}));
+
+// ---------- Supprimer ----------
+app.delete('/api/dashboard/concerts/:id', authMiddleware, h(async (req, res) => {
+  const concert = await db.get('SELECT id FROM concerts WHERE id = $1 AND artist_id = $2', [Number(req.params.id), req.user.id]);
+  if (!concert) return res.status(404).json({ error: 'Concert introuvable.' });
+  await db.run('DELETE FROM concerts WHERE id = $1', [concert.id]);
+  res.json({ message: 'Concert supprimé.' });
+}));
+
 app.post('/api/clips/:id/view', h(async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = await db.get('SELECT id, artist_id, views FROM clips WHERE id = $1', [clipId]);

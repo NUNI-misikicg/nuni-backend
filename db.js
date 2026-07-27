@@ -87,6 +87,60 @@ async function initSchema() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- ---------- Concerts (Phase 2) — publiés directement par l'artiste, aucune validation
+    -- admin nécessaire. tour_name regroupe plusieurs dates d'une même tournée pour l'affichage
+    -- en timeline côté recherche. places_restantes est saisi/mis à jour manuellement par
+    -- l'artiste (pas de vraie billetterie intégrée à NUNI pour l'instant — honnête plutôt que
+    -- de prétendre suivre les ventes en temps réel). purchase_link pointe vers le canal réel
+    -- de vente (WhatsApp, plateforme de billetterie externe...).
+    CREATE TABLE IF NOT EXISTS concerts (
+      id SERIAL PRIMARY KEY,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      description TEXT,
+      flyer_url TEXT,
+      event_date DATE NOT NULL,
+      start_time TEXT,
+      end_time TEXT,
+      city TEXT NOT NULL,
+      country TEXT NOT NULL,
+      venue TEXT,
+      address TEXT,
+      gps_lat DOUBLE PRECISION,
+      gps_lng DOUBLE PRECISION,
+      ticket_price TEXT,
+      ticket_type TEXT,
+      capacity INTEGER,
+      places_restantes INTEGER,
+      purchase_link TEXT,
+      tour_name TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ---------- NUNI Événements (préparée pour la Phase 3) — gérés uniquement depuis
+    -- l'admin, jamais par un artiste. Table créée dès maintenant pour éviter une migration
+    -- séparée plus tard ; aucune route ne l'utilise encore.
+    CREATE TABLE IF NOT EXISTS nuni_events (
+      id SERIAL PRIMARY KEY,
+      category TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      flyer_url TEXT,
+      event_date DATE NOT NULL,
+      start_time TEXT,
+      venue TEXT,
+      address TEXT,
+      gps_lat DOUBLE PRECISION,
+      gps_lng DOUBLE PRECISION,
+      price TEXT,
+      purchase_link TEXT,
+      capacity INTEGER,
+      places_restantes INTEGER,
+      gallery_urls TEXT,
+      promo_video_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS promo_codes (
       id SERIAL PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
