@@ -226,6 +226,10 @@ async function initSchema() {
   await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`); // numéros séparés par une virgule
   await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`);
   await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`);
+  // Artistes participants — noms séparés par une virgule (pas d'ID rigide, cohérent avec le
+  // reste de l'app où les correspondances se font par nom, ex. le genre musical par artiste).
+  // Sert à afficher "Événements auxquels il participe" sur la page profil de chaque artiste.
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS featured_artist_names TEXT;`);
 
   // ---------- État réel du compte (distinct du Pass/abonnement) ----------
   // subscription_status = état du Pass payant (inactive/pending/active/expired).

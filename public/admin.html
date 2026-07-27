@@ -272,6 +272,9 @@
       <input id="ev-venue" type="text" placeholder="Palais du Peuple">
       <label>Adresse</label>
       <input id="ev-address" type="text" placeholder="Adresse précise">
+      <label>Artistes qui participent (noms séparés par une virgule, optionnel)</label>
+      <input id="ev-featured-artists" type="text" placeholder="Ex : Bibi Mwana, MODOUROU">
+      <div class="muted" style="margin-top:2px;">Apparaîtra dans "Événements auxquels il participe" sur leur page profil — les noms doivent correspondre exactement à ceux inscrits sur NUNI.</div>
       <label>Latitude GPS (optionnel)</label>
       <input id="ev-gps-lat" type="text" placeholder="-4.325">
       <label>Longitude GPS (optionnel)</label>
@@ -432,6 +435,7 @@
           price: document.getElementById('ev-price').value.trim() || null,
           purchaseLocations: document.getElementById('ev-purchase-locations').value.trim() || null,
           purchasePhoneNumbers: document.getElementById('ev-purchase-phones').value.trim() || null,
+          featuredArtistNames: document.getElementById('ev-featured-artists').value.trim() || null,
           purchaseLink: document.getElementById('ev-purchase-link').value.trim() || null,
           capacity: capacityVal ? Number(capacityVal) : null,
         }),
@@ -440,7 +444,7 @@
       if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
       msg.innerHTML = '<span style="color:#7ee6a8;">✅ Événement publié.</span>';
       ['ev-title','ev-description','ev-date','ev-time','ev-venue','ev-address','ev-gps-lat','ev-gps-lng',
-       'ev-price','ev-purchase-locations','ev-purchase-phones','ev-purchase-link','ev-capacity'].forEach(id=>{ document.getElementById(id).value = ''; });
+       'ev-price','ev-purchase-locations','ev-purchase-phones','ev-featured-artists','ev-purchase-link','ev-capacity'].forEach(id=>{ document.getElementById(id).value = ''; });
       pendingEventFlyerFile = null; pendingEventGalleryFiles = []; pendingEventVideoFile = null;
       document.getElementById('ev-flyer-preview').style.backgroundImage = '';
       document.getElementById('ev-flyer-preview').textContent = 'Choisir une image';
