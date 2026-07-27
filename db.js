@@ -48,7 +48,7 @@ async function initSchema() {
       artist_name TEXT,
       label_or_manager TEXT,
       is_verified INTEGER DEFAULT 0,
-      plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist')),
+      plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist','label')),
       subscription_status TEXT DEFAULT 'inactive' CHECK(subscription_status IN ('inactive','pending','active','expired')),
       subscription_started_at TIMESTAMPTZ,
       subscription_expires_at TIMESTAMPTZ,
@@ -324,6 +324,12 @@ async function initSchema() {
   // inline sur une colonne), contrairement à un ADD seul qui échouerait au 2e redémarrage.
   await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_type_check;`);
   await pool.query(`ALTER TABLE users ADD CONSTRAINT users_account_type_check CHECK (account_type IN ('consumer','artist','label'));`);
+  await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_plan_check;`);
+  await pool.query(`ALTER TABLE users ADD CONSTRAINT users_plan_check CHECK (plan IN ('discovery','consumer','artist','label'));`);
+  // Répare les comptes Label déjà créés avant ce correctif : leur colonne "plan" n'était
+  // jamais renseignée à l'inscription, retombée sur 'discovery' par défaut — c'est ce qui
+  // les faisait atterrir sur la page des tarifs après connexion au lieu de leur Dashboard.
+  await pool.query(`UPDATE users SET plan = 'label' WHERE account_type = 'label' AND plan = 'discovery';`);
   await pool.query(`ALTER TABLE labels DROP CONSTRAINT IF EXISTS labels_verification_status_check;`);
   await pool.query(`ALTER TABLE labels ADD CONSTRAINT labels_verification_status_check CHECK (verification_status IN ('pending','verification','validated','refused','suspended'));`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);

@@ -342,9 +342,13 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
       return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
     }
     const password_hash = await hashPassword(password);
+    // plan='label' explicite — sans ça, la colonne retombe sur 'discovery' par défaut et
+    // casse le routage post-connexion (voir /api/login côté client : il redirige vers la
+    // page des tarifs pour tout compte dont subscription_status n'est pas 'active' ET dont
+    // plan est 'discovery', ce qui décrivait alors n'importe quel compte Label par erreur).
     const insertedUser = await db.get(`
-      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country, plan)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'label')
       RETURNING id
     `, [accountType, firstName, lastName, email, phone || null, password_hash, address, city, country]);
     const validPlan = ['start', 'pro', 'premium', 'elite'].includes(labelPlan) ? labelPlan : 'start';
