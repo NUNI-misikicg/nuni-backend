@@ -169,6 +169,12 @@ async function initSchema() {
       -- d'examen par l'équipe. 'validated' = actif. 'refused' = refusé (avec raison).
       verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending','verification','validated','refused','suspended')),
       refusal_reason TEXT,
+      -- Le Pass Label expire 1 an après validation, quel que soit le palier — fixé au
+      -- moment de l'approbation admin (voir POST /api/admin/labels/:id/approve).
+      subscription_expires_at TIMESTAMPTZ,
+      -- true dès que le Label a changé de palier une première fois — la réduction de 25%
+      -- ne s'applique qu'à ce tout premier changement, jamais aux suivants.
+      has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       validated_at TIMESTAMPTZ
     );
@@ -296,7 +302,20 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active';`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS momo_number TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;`);
+  await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
+  // Répare les comptes artiste déjà créés par un Label avant le correctif ci-dessus (colonne
+  // plan jamais renseignée, retombée sur 'discovery' par défaut → faux compte à rebours de
+  // ~100 ans affiché). Ciblé précisément : uniquement les artistes déjà affiliés à un Label,
+  // encore sur 'discovery', avec une échéance clairement anormale (>5 ans) — jamais touché
+  // aux vrais comptes Découverte en cours (échéance normale de 24h).
+  await pool.query(`
+    UPDATE users SET plan = 'artist'
+    WHERE account_type = 'artist' AND plan = 'discovery'
+      AND subscription_expires_at > NOW() + INTERVAL '5 years'
+      AND id IN (SELECT artist_id FROM label_artists);
+  `);
   // ---------- Pass Label — migration de la contrainte account_type ----------
   // Le CREATE TABLE plus haut ne s'exécute qu'une fois (IF NOT EXISTS) — sur une base déjà
   // créée avant l'ajout du Pass Label, la contrainte doit être élargie explicitement.

@@ -672,7 +672,8 @@ app.post('/api/admin/labels/:id/approve', h(async (req, res) => {
   const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
   if (!label) return res.status(404).json({ error: 'Label introuvable.' });
   await db.run(
-    "UPDATE labels SET verification_status = 'validated', validated_at = NOW(), refusal_reason = NULL WHERE id = $1",
+    `UPDATE labels SET verification_status = 'validated', validated_at = NOW(), refusal_reason = NULL,
+      subscription_expires_at = NOW() + INTERVAL '1 year' WHERE id = $1`,
     [label.id],
   );
   res.json({ message: 'Label validé.' });
@@ -791,6 +792,10 @@ async function requireValidatedLabel(req, res, minRole = 'assistant') {
     res.status(403).json({ error: 'Ce compte Label doit être validé par NUNI avant de gérer des artistes.' });
     return null;
   }
+  if (label.subscription_expires_at && new Date(label.subscription_expires_at) < new Date()) {
+    res.status(403).json({ error: 'Votre Pass Label a expiré (1 an révolu). Renouvelez-le depuis votre Dashboard pour continuer.' });
+    return null;
+  }
   if (LABEL_ROLE_RANK[myRole] < LABEL_ROLE_RANK[minRole]) {
     res.status(403).json({ error: `Action réservée aux rôles ${minRole} et supérieurs.` });
     return null;
@@ -839,9 +844,13 @@ app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000),
   const password_hash = await hashPassword(password);
   // Utilise les coordonnées du Label par défaut (l'artiste pourra les modifier lui-même
   // ensuite depuis son propre Dashboard, comme n'importe quel compte artiste).
+  // IMPORTANT : plan doit être explicitement 'artist' — sans ça, la colonne retombe sur sa
+  // valeur par défaut 'discovery', et l'interface affichait alors un faux compte à rebours
+  // de ~100 ans (100 ans étant la durée choisie pour subscription_expires_at, interprétée à
+  // tort comme un essai Découverte sur le point d'expirer).
   const insertedArtist = await db.get(`
-    INSERT INTO users (account_type, first_name, last_name, email, password_hash, age, address, city, country, artist_name, label_or_manager, subscription_status, subscription_expires_at)
-    VALUES ('artist',$1,$2,$3,$4,18,$5,$6,$7,$8,$9,'active', NOW() + INTERVAL '100 years')
+    INSERT INTO users (account_type, first_name, last_name, email, password_hash, age, address, city, country, artist_name, label_or_manager, plan, subscription_status, subscription_expires_at)
+    VALUES ('artist',$1,$2,$3,$4,18,$5,$6,$7,$8,$9,'artist','active', NOW() + INTERVAL '100 years')
     RETURNING id
   `, [firstName, lastName, email, password_hash, label.address, label.city, label.country, artistName, label.label_name]);
   // Compte créé directement par le Label et actif dès la création (statut 'active', pas
@@ -1082,6 +1091,61 @@ app.get('/api/label/catalog', authMiddleware, h(async (req, res) => {
 
 // ---------- Équipe & rôles (Phase 4) ----------
 // PROPRIÉTAIRE (le compte de connexion du Label lui-même) > ADMIN > MANAGER > ASSISTANT.
+// ---------- Changer de palier — calcule le vrai prix (avec 25% de réduction si c'est le
+// tout premier changement), puis renvoie vers WhatsApp pour finaliser le paiement, comme le
+// reste des Pass NUNI. Le changement réel de palier est appliqué par l'admin une fois le
+// paiement confirmé (voir /api/admin/labels/:id/set-plan) — jamais avant, pour ne jamais
+// accorder plus de capacité (plus d'artistes) sans paiement vérifié. ----------
+app.post('/api/label/change-plan-request', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'owner');
+  if (!label) return;
+  const { newPlan } = req.body;
+  if (!['start', 'pro', 'premium', 'elite'].includes(newPlan)) {
+    return res.status(400).json({ error: 'Palier invalide.' });
+  }
+  if (newPlan === label.plan) return res.status(400).json({ error: 'Vous êtes déjà sur ce palier.' });
+  const settings = await getLabelPlanSettings();
+  const fullPrice = settings.prices[newPlan];
+  const discounted = !label.has_changed_plan_once;
+  const finalPrice = discounted ? Math.round(fullPrice * 0.75) : fullPrice;
+  const planLabels = { start: 'Label Start', pro: 'Label Pro', premium: 'Label Premium', elite: 'Label Elite' };
+  res.json({
+    fullPrice,
+    finalPrice,
+    discounted,
+    whatsapp: 'https://wa.me/242068951600',
+    whatsappMessage: `Bonjour NUNI, je souhaite passer ${label.label_name} au palier ${planLabels[newPlan]}` +
+      (discounted ? ` (${finalPrice.toLocaleString('fr-FR')} FCFA au lieu de ${fullPrice.toLocaleString('fr-FR')} FCFA — réduction de 25% pour mon premier changement de palier).` : ` (${finalPrice.toLocaleString('fr-FR')} FCFA).`),
+  });
+}));
+
+// ---------- Admin — applique réellement le changement de palier, une fois le paiement
+// confirmé (jamais automatique, comme tout paiement NUNI) ----------
+app.post('/api/admin/labels/:id/set-plan', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT * FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { newPlan } = req.body;
+  if (!['start', 'pro', 'premium', 'elite'].includes(newPlan)) {
+    return res.status(400).json({ error: 'Palier invalide.' });
+  }
+  const settings = await getLabelPlanSettings();
+  const newMax = settings.maxArtists[newPlan];
+  if (newMax !== null) {
+    const currentCount = (await db.get(
+      "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+    )).c;
+    if (currentCount > newMax) {
+      return res.status(400).json({ error: `Impossible : ce Label gère déjà ${currentCount} artiste(s), au-delà de la limite de ${newMax} du palier ${newPlan}.` });
+    }
+  }
+  await db.run(
+    'UPDATE labels SET plan = $1, has_changed_plan_once = TRUE WHERE id = $2',
+    [newPlan, label.id],
+  );
+  res.json({ message: `Palier changé pour ${newPlan}.` });
+}));
+
 app.get('/api/label/team', authMiddleware, h(async (req, res) => {
   const label = await requireValidatedLabel(req, res, 'assistant');
   if (!label) return;

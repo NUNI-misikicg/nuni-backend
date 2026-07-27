@@ -588,6 +588,17 @@
             ${l.verification_status === 'suspended' ? `<button class="primary" onclick="reactivateLabelAdmin(${l.id})">Réactiver</button>` : ''}
             <button class="secondary" onclick="loadLabelAdminDetails(${l.id})">Voir artistes &amp; revenus</button>
           </div>
+          ${l.verification_status === 'validated' ? `
+          <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+            <span class="muted">Changer de palier (une fois le paiement WhatsApp confirmé) :</span>
+            <select id="admin-setplan-${l.id}">
+              <option value="start" ${l.plan==='start'?'selected':''}>Start</option>
+              <option value="pro" ${l.plan==='pro'?'selected':''}>Pro</option>
+              <option value="premium" ${l.plan==='premium'?'selected':''}>Premium</option>
+              <option value="elite" ${l.plan==='elite'?'selected':''}>Elite</option>
+            </select>
+            <button class="secondary" onclick="setLabelPlanAdmin(${l.id})">Appliquer</button>
+          </div>` : ''}
           <div id="label-details-${l.id}" style="margin-top:10px;"></div>`;
         list.appendChild(row);
       });
@@ -643,6 +654,21 @@
       const res = await fetch('/api/admin/labels/' + id + '/reactivate', { method:'POST', headers:{'x-admin-key':getKey()} });
       const data = await res.json();
       if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels(null);
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+  async function setLabelPlanAdmin(id){
+    const sel = document.getElementById('admin-setplan-' + id);
+    const newPlan = sel.value;
+    if(!confirm('Confirmer le changement de palier vers "' + newPlan + '" ? À faire uniquement une fois le paiement WhatsApp confirmé.')) return;
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/set-plan', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ newPlan }),
+      });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      alert('Palier mis à jour.');
       loadAdminLabels(null);
     }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
