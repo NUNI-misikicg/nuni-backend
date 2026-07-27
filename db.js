@@ -167,7 +167,7 @@ async function initSchema() {
       plan TEXT NOT NULL DEFAULT 'start' CHECK(plan IN ('start','pro','premium','elite')),
       -- 'pending' = vient de s'inscrire, en file d'attente. 'verification' = en cours
       -- d'examen par l'équipe. 'validated' = actif. 'refused' = refusé (avec raison).
-      verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending','verification','validated','refused')),
+      verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending','verification','validated','refused','suspended')),
       refusal_reason TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       validated_at TIMESTAMPTZ
@@ -305,6 +305,8 @@ async function initSchema() {
   // inline sur une colonne), contrairement à un ADD seul qui échouerait au 2e redémarrage.
   await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_type_check;`);
   await pool.query(`ALTER TABLE users ADD CONSTRAINT users_account_type_check CHECK (account_type IN ('consumer','artist','label'));`);
+  await pool.query(`ALTER TABLE labels DROP CONSTRAINT IF EXISTS labels_verification_status_check;`);
+  await pool.query(`ALTER TABLE labels ADD CONSTRAINT labels_verification_status_check CHECK (verification_status IN ('pending','verification','validated','refused','suspended'));`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 
   // ---------- Réinitialisation de mot de passe (code temporaire par email) ----------

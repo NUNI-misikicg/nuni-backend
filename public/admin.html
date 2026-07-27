@@ -340,6 +340,22 @@
       </div>
       <div id="admin-labels-list" style="margin-top:16px;"></div>
     </div>
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">Paliers Label — prix &amp; limites</b>
+      <div class="muted" style="margin-top:4px;">Modifiable à tout moment — s'applique aux futures inscriptions et aux vérifications de quota des Labels déjà inscrits.</div>
+      <table style="width:100%; margin-top:14px; font-size:12.5px; border-collapse:collapse;">
+        <thead><tr style="text-align:left;"><th style="padding:6px 4px;">Palier</th><th style="padding:6px 4px;">Prix (FCFA / trimestre)</th><th style="padding:6px 4px;">Artistes max</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:6px 4px;">Start</td><td><input id="lp-price-start" type="number" min="0" style="width:130px;"></td><td><input id="lp-max-start" type="number" min="1" style="width:80px;"></td></tr>
+          <tr><td style="padding:6px 4px;">Pro</td><td><input id="lp-price-pro" type="number" min="0" style="width:130px;"></td><td><input id="lp-max-pro" type="number" min="1" style="width:80px;"></td></tr>
+          <tr><td style="padding:6px 4px;">Premium</td><td><input id="lp-price-premium" type="number" min="0" style="width:130px;"></td><td><input id="lp-max-premium" type="number" min="1" style="width:80px;"></td></tr>
+          <tr><td style="padding:6px 4px;">Elite</td><td><input id="lp-price-elite" type="number" min="0" style="width:130px;"></td><td style="color:#8a7a68;">Illimité</td></tr>
+        </tbody>
+      </table>
+      <button class="secondary" style="margin-top:12px;" onclick="loadLabelPlanSettingsAdmin()">Charger les valeurs actuelles</button>
+      <button class="primary" style="margin-top:12px;" onclick="saveLabelPlanSettingsAdmin()">Enregistrer</button>
+      <div id="label-plan-settings-msg" style="margin-top:8px;"></div>
+    </div>
   </div>
 
 <script>
@@ -535,7 +551,7 @@
       const data = await res.json();
       if(!res.ok){ list.innerHTML = '<div class="msg err">❌ ' + (data.error||'Erreur') + '</div>'; return; }
       if(!data.labels || !data.labels.length){ list.innerHTML = '<div class="muted">Aucun Label dans cette catégorie.</div>'; return; }
-      const statusLabels = { pending: 'En attente', verification: 'En vérification', validated: 'Validé', refused: 'Refusé' };
+      const statusLabels = { pending: 'En attente', verification: 'En vérification', validated: 'Validé', refused: 'Refusé', suspended: 'Suspendu' };
       const planLabels = { start: 'Start (2 max)', pro: 'Pro (5 max)', premium: 'Premium (10 max)', elite: 'Elite (illimité)' };
       list.innerHTML = '';
       data.labels.forEach(l=>{
@@ -564,11 +580,15 @@
             ${l.description ? `<div style="margin-top:6px;">${l.description}</div>` : ''}
             ${l.refusal_reason ? `<div style="margin-top:6px; color:#e88;"><b>Raison du refus :</b> ${l.refusal_reason}</div>` : ''}
           </div>
-          <div style="display:flex; gap:8px; margin-top:12px;">
+          <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
             ${l.verification_status !== 'validated' ? `<button class="primary" onclick="approveLabel(${l.id})">Approuver</button>` : ''}
             ${l.verification_status !== 'refused' ? `<button class="secondary" onclick="refuseLabel(${l.id})">Refuser</button>` : ''}
             ${l.verification_status === 'pending' ? `<button class="secondary" onclick="markLabelVerification(${l.id})">Marquer "en vérification"</button>` : ''}
-          </div>`;
+            ${l.verification_status === 'validated' ? `<button class="secondary" onclick="suspendLabelAdmin(${l.id})">Suspendre</button>` : ''}
+            ${l.verification_status === 'suspended' ? `<button class="primary" onclick="reactivateLabelAdmin(${l.id})">Réactiver</button>` : ''}
+            <button class="secondary" onclick="loadLabelAdminDetails(${l.id})">Voir artistes &amp; revenus</button>
+          </div>
+          <div id="label-details-${l.id}" style="margin-top:10px;"></div>`;
         list.appendChild(row);
       });
     }catch(e){
@@ -605,6 +625,94 @@
       loadAdminLabels('pending');
     }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
+  async function suspendLabelAdmin(id){
+    const reason = prompt('Raison de la suspension (optionnel, visible par le Label) :', '');
+    if(reason === null) return;
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/suspend', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ reason }),
+      });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels(null);
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+  async function reactivateLabelAdmin(id){
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/reactivate', { method:'POST', headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels(null);
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+  async function loadLabelAdminDetails(id){
+    const box = document.getElementById('label-details-' + id);
+    if(!box) return;
+    if(box.dataset.loaded === '1'){ box.style.display = box.style.display === 'none' ? 'block' : 'none'; return; }
+    box.innerHTML = '<div class="muted">Chargement…</div>';
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/details', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ box.innerHTML = '<div class="msg err">❌ ' + (data.error||'Erreur') + '</div>'; return; }
+      const fmt = n => Number(n||0).toLocaleString('fr-FR');
+      let html = `<div style="padding:10px; background:#1a1410; border-radius:8px; margin-bottom:8px;">
+        <b>${fmt(data.totalStreams)}</b> streams au total · <b>${fmt(data.totalPaidFcfa)} FCFA</b> déjà versés à ses artistes</div>`;
+      if(!data.artists.length){
+        html += '<div class="muted">Aucun artiste rattaché.</div>';
+      } else {
+        data.artists.forEach(a=>{
+          html += `<div style="display:flex; justify-content:space-between; padding:6px 4px; border-bottom:1px solid #2a2015; font-size:12.5px;">
+            <span>${a.artist_name} <span class="muted">(${a.affiliation_status})</span></span>
+            <span>${fmt(a.total_streams)} streams · ${fmt(a.total_paid_fcfa)} FCFA</span>
+          </div>`;
+        });
+      }
+      box.innerHTML = html;
+      box.dataset.loaded = '1';
+    }catch(e){
+      box.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
+    }
+  }
+
+  async function loadLabelPlanSettingsAdmin(){
+    try{
+      const res = await fetch('/api/label-plan-settings');
+      const data = await res.json();
+      ['start','pro','premium','elite'].forEach(p=>{
+        const priceEl = document.getElementById('lp-price-' + p);
+        if(priceEl) priceEl.value = data.prices[p];
+        const maxEl = document.getElementById('lp-max-' + p);
+        if(maxEl && data.maxArtists[p] != null) maxEl.value = data.maxArtists[p];
+      });
+    }catch(e){ document.getElementById('label-plan-settings-msg').innerHTML = '<span class="urgent">Impossible de charger les valeurs actuelles.</span>'; }
+  }
+  async function saveLabelPlanSettingsAdmin(){
+    const msg = document.getElementById('label-plan-settings-msg');
+    msg.textContent = 'Enregistrement…';
+    try{
+      const res = await fetch('/api/admin/label-plan-settings', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({
+          prices: {
+            start: Number(document.getElementById('lp-price-start').value)||0,
+            pro: Number(document.getElementById('lp-price-pro').value)||0,
+            premium: Number(document.getElementById('lp-price-premium').value)||0,
+            elite: Number(document.getElementById('lp-price-elite').value)||0,
+          },
+          maxArtists: {
+            start: Number(document.getElementById('lp-max-start').value)||1,
+            pro: Number(document.getElementById('lp-max-pro').value)||1,
+            premium: Number(document.getElementById('lp-max-premium').value)||1,
+          },
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Paliers mis à jour.</span>';
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+  loadLabelPlanSettingsAdmin();
 
   async function loadNuniInfoForm(){
     try{

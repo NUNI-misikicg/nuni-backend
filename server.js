@@ -573,7 +573,66 @@ app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
 }));
 
 // ================= PASS LABEL (Phase 1) =================
-const LABEL_PLAN_MAX_ARTISTS = { start: 2, pro: 5, premium: 10, elite: null }; // null = illimité
+const LABEL_PLAN_MAX_ARTISTS = { start: 2, pro: 5, premium: 10, elite: null }; // valeurs par défaut, voir getLabelPlanSettings ci-dessous pour les vraies valeurs configurables
+const LABEL_PLAN_DEFAULT_PRICES_FCFA = { start: 15000, pro: 30000, premium: 60000, elite: 120000 }; // par trimestre, valeurs par défaut
+
+// ---------- Paliers Label configurables depuis l'admin (Phase 6) ----------
+// Stockés dans app_settings (même mécanisme que les taux de reversement) — si rien n'a
+// encore été configuré, les valeurs par défaut ci-dessus s'appliquent, jamais de crash.
+async function getLabelPlanSettings() {
+  const keys = [
+    'label_plan_max_start', 'label_plan_max_pro', 'label_plan_max_premium', 'label_plan_max_elite',
+    'label_plan_price_start', 'label_plan_price_pro', 'label_plan_price_premium', 'label_plan_price_elite',
+  ];
+  const rows = await db.query('SELECT key, value FROM app_settings WHERE key = ANY($1)', [keys]);
+  const map = {};
+  rows.forEach((r) => { map[r.key] = r.value; });
+  const parseMax = (v, fallback) => (v === '' || v == null ? fallback : (v === 'null' ? null : Number(v)));
+  return {
+    maxArtists: {
+      start: parseMax(map.label_plan_max_start, LABEL_PLAN_MAX_ARTISTS.start),
+      pro: parseMax(map.label_plan_max_pro, LABEL_PLAN_MAX_ARTISTS.pro),
+      premium: parseMax(map.label_plan_max_premium, LABEL_PLAN_MAX_ARTISTS.premium),
+      elite: parseMax(map.label_plan_max_elite, LABEL_PLAN_MAX_ARTISTS.elite),
+    },
+    prices: {
+      start: map.label_plan_price_start != null ? Number(map.label_plan_price_start) : LABEL_PLAN_DEFAULT_PRICES_FCFA.start,
+      pro: map.label_plan_price_pro != null ? Number(map.label_plan_price_pro) : LABEL_PLAN_DEFAULT_PRICES_FCFA.pro,
+      premium: map.label_plan_price_premium != null ? Number(map.label_plan_price_premium) : LABEL_PLAN_DEFAULT_PRICES_FCFA.premium,
+      elite: map.label_plan_price_elite != null ? Number(map.label_plan_price_elite) : LABEL_PLAN_DEFAULT_PRICES_FCFA.elite,
+    },
+  };
+}
+
+// ---------- Publique — pour afficher les vrais prix/limites sur la page tarifs et le formulaire d'inscription ----------
+app.get('/api/label-plan-settings', h(async (req, res) => {
+  res.json(await getLabelPlanSettings());
+}));
+
+// ---------- Admin — modifier les limites et les prix ----------
+app.post('/api/admin/label-plan-settings', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { maxArtists, prices } = req.body;
+  const pairs = [];
+  if (maxArtists) {
+    ['start', 'pro', 'premium', 'elite'].forEach((p) => {
+      if (maxArtists[p] !== undefined) pairs.push([`label_plan_max_${p}`, maxArtists[p] === null ? 'null' : String(maxArtists[p])]);
+    });
+  }
+  if (prices) {
+    ['start', 'pro', 'premium', 'elite'].forEach((p) => {
+      if (prices[p] !== undefined) pairs.push([`label_plan_price_${p}`, String(prices[p])]);
+    });
+  }
+  for (const [key, value] of pairs) {
+    await db.run(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value],
+    );
+  }
+  res.json({ message: 'Paliers Label mis à jour.', settings: await getLabelPlanSettings() });
+}));
 
 // ---------- Le Label consulte son propre profil + statut de vérification ----------
 app.get('/api/label/me', authMiddleware, h(async (req, res) => {
@@ -585,7 +644,8 @@ app.get('/api/label/me', authMiddleware, h(async (req, res) => {
     "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'",
     [label.id],
   )).c;
-  res.json({ label, artistCount, maxArtists: LABEL_PLAN_MAX_ARTISTS[label.plan] });
+  const planSettings1 = await getLabelPlanSettings();
+  res.json({ label, artistCount, maxArtists: planSettings1.maxArtists[label.plan] });
 }));
 
 // ---------- Admin — liste des Labels (filtrable par statut de vérification) ----------
@@ -631,6 +691,48 @@ app.post('/api/admin/labels/:id/refuse', h(async (req, res) => {
   res.json({ message: 'Label refusé.' });
 }));
 
+// ---------- Admin — suspendre un Label déjà validé (accès Dashboard coupé, comptes
+// artistes affiliés jamais touchés) ----------
+app.post('/api/admin/labels/:id/suspend', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { reason } = req.body;
+  await db.run(
+    "UPDATE labels SET verification_status = 'suspended', refusal_reason = $1 WHERE id = $2",
+    [reason || null, label.id],
+  );
+  res.json({ message: 'Label suspendu.' });
+}));
+app.post('/api/admin/labels/:id/reactivate', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run("UPDATE labels SET verification_status = 'validated', refusal_reason = NULL WHERE id = $1", [label.id]);
+  res.json({ message: 'Label réactivé.' });
+}));
+
+// ---------- Admin — détail d'un Label : artistes liés + revenus, en un coup d'œil ----------
+app.get('/api/admin/labels/:id/details', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get(`
+    SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+    FROM labels l JOIN users u ON u.id = l.user_id WHERE l.id = $1
+  `, [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const artists = await db.query(`
+    SELECT la.status as affiliation_status, u.id as artist_id, u.artist_name, u.email,
+           COALESCE((SELECT SUM(t.streams)::bigint FROM tracks t WHERE t.artist_id = u.id AND t.published = 1), 0) as total_streams,
+           COALESCE((SELECT SUM(ph.amount_fcfa)::bigint FROM payment_history ph WHERE ph.artist_id = u.id), 0) as total_paid_fcfa
+    FROM label_artists la JOIN users u ON u.id = la.artist_id
+    WHERE la.label_id = $1 AND la.status != 'removed'
+    ORDER BY la.created_at DESC
+  `, [label.id]);
+  const totalStreams = artists.reduce((s, a) => s + Number(a.total_streams), 0);
+  const totalPaidFcfa = artists.reduce((s, a) => s + Number(a.total_paid_fcfa), 0);
+  res.json({ label, artists, totalStreams, totalPaidFcfa });
+}));
+
 // ---------- Admin — repasser un Label "en cours de vérification" (étape intermédiaire) ----------
 app.post('/api/admin/labels/:id/mark-verification', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
@@ -659,7 +761,8 @@ async function notifyLabelArtistAdded(label, artistName, newCount) {
     label.user_id, 'label_artist_added', 'Nouvel artiste',
     `${artistName} fait maintenant partie de ${label.label_name}.`, null,
   ).catch(() => {});
-  const max = LABEL_PLAN_MAX_ARTISTS[label.plan];
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
   if (max !== null && newCount >= max) {
     await createNotification(
       label.user_id, 'label_plan_limit', 'Palier atteint',
@@ -708,7 +811,8 @@ app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
     WHERE la.label_id = $1 AND la.status != 'removed'
     ORDER BY la.created_at DESC
   `, [label.id]);
-  res.json({ artists: rows, plan: label.plan, maxArtists: LABEL_PLAN_MAX_ARTISTS[label.plan] });
+  const planSettings2 = await getLabelPlanSettings();
+  res.json({ artists: rows, plan: label.plan, maxArtists: planSettings2.maxArtists[label.plan] });
 }));
 
 // ---------- Créer un nouvel artiste directement sous le Label ----------
@@ -718,7 +822,8 @@ app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000),
   const currentCount = (await db.get(
     "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
   )).c;
-  const max = LABEL_PLAN_MAX_ARTISTS[label.plan];
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
   if (max !== null && currentCount >= max) {
     return res.status(403).json({ error: `Votre palier (${label.plan}) autorise au maximum ${max} artiste(s). Passez à un palier supérieur pour en gérer davantage.` });
   }
@@ -757,7 +862,8 @@ app.post('/api/label/artists/invite', authMiddleware, rateLimit(10, 60 * 60000),
   const currentCount = (await db.get(
     "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
   )).c;
-  const max = LABEL_PLAN_MAX_ARTISTS[label.plan];
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
   if (max !== null && currentCount >= max) {
     return res.status(403).json({ error: `Votre palier (${label.plan}) autorise au maximum ${max} artiste(s).` });
   }
