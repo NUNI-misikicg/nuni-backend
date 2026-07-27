@@ -59,6 +59,7 @@
     <button class="tab-btn" data-tab="playlists">🎧 Playlists</button>
     <button class="tab-btn" data-tab="payouts">💸 Reversements artistes</button>
     <button class="tab-btn" data-tab="events">🎉 NUNI Événements</button>
+    <button class="tab-btn" data-tab="labels">🏢 Labels</button>
   </div>
 
   <!-- ONGLET 1 : ACTIVER UN PASS -->
@@ -326,6 +327,21 @@
     </div>
   </div>
 
+  <div class="pane" id="pane-labels">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🏢 Demandes de Pass Label</b>
+      <div class="muted" style="margin-top:4px;">Délai maximum annoncé : 24h. Consultez les documents fournis avant d'approuver.</div>
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button class="secondary" onclick="loadAdminLabels('pending')">En attente</button>
+        <button class="secondary" onclick="loadAdminLabels('verification')">En vérification</button>
+        <button class="secondary" onclick="loadAdminLabels('validated')">Validés</button>
+        <button class="secondary" onclick="loadAdminLabels('refused')">Refusés</button>
+        <button class="secondary" onclick="loadAdminLabels(null)">Tous</button>
+      </div>
+      <div id="admin-labels-list" style="margin-top:16px;"></div>
+    </div>
+  </div>
+
 <script>
   function getKey(){ const k = document.getElementById('key').value.trim(); localStorage.setItem('nuniAdminKey', k); return k; }
 
@@ -507,6 +523,86 @@
       const data = await res.json();
       if(!res.ok){ alert(data.error || 'Erreur.'); return; }
       loadAdminNuniEvents();
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+
+  async function loadAdminLabels(status){
+    const list = document.getElementById('admin-labels-list');
+    list.innerHTML = 'Chargement…';
+    try{
+      const url = status ? '/api/admin/labels?status=' + encodeURIComponent(status) : '/api/admin/labels';
+      const res = await fetch(url, { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ list.innerHTML = '<div class="msg err">❌ ' + (data.error||'Erreur') + '</div>'; return; }
+      if(!data.labels || !data.labels.length){ list.innerHTML = '<div class="muted">Aucun Label dans cette catégorie.</div>'; return; }
+      const statusLabels = { pending: 'En attente', verification: 'En vérification', validated: 'Validé', refused: 'Refusé' };
+      const planLabels = { start: 'Start (2 max)', pro: 'Pro (5 max)', premium: 'Premium (10 max)', elite: 'Elite (illimité)' };
+      list.innerHTML = '';
+      data.labels.forEach(l=>{
+        const row = document.createElement('div');
+        row.className = 'card';
+        row.style.cssText = 'margin-bottom:10px;';
+        const docsLinks = [
+          l.responsible_id_doc_url ? `<a href="${l.responsible_id_doc_url}" target="_blank" rel="noopener noreferrer">Pièce d'identité</a>` : null,
+          l.label_doc_url ? `<a href="${l.label_doc_url}" target="_blank" rel="noopener noreferrer">Justificatif du label</a>` : null,
+        ].filter(Boolean).join(' · ') || '<span class="muted">Aucun document fourni</span>';
+        row.innerHTML = `
+          <div style="display:flex; align-items:center; gap:12px;">
+            ${l.logo_url ? `<div style="width:44px; height:44px; border-radius:8px; background:url(${l.logo_url}); background-size:cover; background-position:center; flex-shrink:0;"></div>` : ''}
+            <div style="flex:1; min-width:0;">
+              <div style="font-weight:700; font-size:14px;">${l.label_name} <span class="muted">— ${l.legal_name || ''}</span></div>
+              <div class="muted">${statusLabels[l.verification_status] || l.verification_status} · ${planLabels[l.plan] || l.plan}</div>
+            </div>
+          </div>
+          <div style="margin-top:10px; font-size:12.5px; line-height:1.7;">
+            <div><b>Responsable :</b> ${l.responsible_name || '—'} (${l.first_name} ${l.last_name})</div>
+            <div><b>Contact pro :</b> ${l.professional_phone || '—'} · ${l.professional_email || '—'}</div>
+            <div><b>Compte de connexion :</b> ${l.email}${l.phone ? ' · ' + l.phone : ''}</div>
+            <div><b>Localisation :</b> ${l.city || ''}, ${l.country || ''}</div>
+            ${l.website ? `<div><b>Site web :</b> <a href="${l.website}" target="_blank" rel="noopener noreferrer">${l.website}</a></div>` : ''}
+            <div><b>Documents :</b> ${docsLinks}</div>
+            ${l.description ? `<div style="margin-top:6px;">${l.description}</div>` : ''}
+            ${l.refusal_reason ? `<div style="margin-top:6px; color:#e88;"><b>Raison du refus :</b> ${l.refusal_reason}</div>` : ''}
+          </div>
+          <div style="display:flex; gap:8px; margin-top:12px;">
+            ${l.verification_status !== 'validated' ? `<button class="primary" onclick="approveLabel(${l.id})">Approuver</button>` : ''}
+            ${l.verification_status !== 'refused' ? `<button class="secondary" onclick="refuseLabel(${l.id})">Refuser</button>` : ''}
+            ${l.verification_status === 'pending' ? `<button class="secondary" onclick="markLabelVerification(${l.id})">Marquer "en vérification"</button>` : ''}
+          </div>`;
+        list.appendChild(row);
+      });
+    }catch(e){
+      list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
+    }
+  }
+  async function approveLabel(id){
+    if(!confirm('Approuver ce Label ? Son compte sera immédiatement activé.')) return;
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/approve', { method:'POST', headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels(null);
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+  async function refuseLabel(id){
+    const reason = prompt('Raison du refus (visible par le Label) :', '');
+    if(reason === null) return;
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/refuse', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ reason }),
+      });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels(null);
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
+  }
+  async function markLabelVerification(id){
+    try{
+      const res = await fetch('/api/admin/labels/' + id + '/mark-verification', { method:'POST', headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error||'Erreur.'); return; }
+      loadAdminLabels('pending');
     }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
 

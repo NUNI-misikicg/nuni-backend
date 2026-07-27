@@ -35,7 +35,7 @@ async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist')),
+      account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist','label')),
       first_name TEXT NOT NULL,
       last_name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
@@ -141,6 +141,62 @@ async function initSchema() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- ============ PASS LABEL (Phase 1) ============
+    -- Un Label a son propre compte de connexion (une ligne dans users, account_type='label')
+    -- mais ses informations spécifiques (légales, logo, vérification...) vivent ici plutôt
+    -- que de polluer la table users — même logique que artist_name/label_or_manager qui, eux,
+    -- restent sur users car légers et communs à tous les comptes.
+    CREATE TABLE IF NOT EXISTS labels (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+      label_name TEXT NOT NULL,
+      logo_url TEXT,
+      legal_name TEXT,
+      country TEXT,
+      city TEXT,
+      address TEXT,
+      professional_phone TEXT,
+      professional_email TEXT,
+      website TEXT,
+      tax_id TEXT,
+      description TEXT,
+      social_links TEXT,
+      responsible_name TEXT,
+      responsible_id_doc_url TEXT,
+      label_doc_url TEXT,
+      plan TEXT NOT NULL DEFAULT 'start' CHECK(plan IN ('start','pro','premium','elite')),
+      -- 'pending' = vient de s'inscrire, en file d'attente. 'verification' = en cours
+      -- d'examen par l'équipe. 'validated' = actif. 'refused' = refusé (avec raison).
+      verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending','verification','validated','refused')),
+      refusal_reason TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      validated_at TIMESTAMPTZ
+    );
+
+    -- ---------- Artistes gérés par un Label ----------
+    -- IMPORTANT : un compte artiste reste 100% autonome et fonctionnel même sans Label — ceci
+    -- est une AFFILIATION optionnelle, jamais une dépendance. Rien dans le flux de publication
+    -- existant (tracks/clips/concerts, tous rattachés à artist_id) n'est modifié par cette table.
+    CREATE TABLE IF NOT EXISTS label_artists (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('invited','active','suspended','removed')),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(label_id, artist_id)
+    );
+
+    -- ---------- Équipe / rôles du Label ----------
+    CREATE TABLE IF NOT EXISTS label_team_members (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      email TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'assistant' CHECK(role IN ('owner','admin','manager','assistant')),
+      status TEXT NOT NULL DEFAULT 'invited' CHECK(status IN ('invited','active')),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS promo_codes (
       id SERIAL PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
@@ -241,6 +297,14 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS momo_number TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
+  // ---------- Pass Label — migration de la contrainte account_type ----------
+  // Le CREATE TABLE plus haut ne s'exécute qu'une fois (IF NOT EXISTS) — sur une base déjà
+  // créée avant l'ajout du Pass Label, la contrainte doit être élargie explicitement.
+  // DROP puis ADD à chaque démarrage est volontairement inconditionnel : ça reste sans danger
+  // et idempotent (le nom de contrainte suit la convention Postgres par défaut pour un CHECK
+  // inline sur une colonne), contrairement à un ADD seul qui échouerait au 2e redémarrage.
+  await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_type_check;`);
+  await pool.query(`ALTER TABLE users ADD CONSTRAINT users_account_type_check CHECK (account_type IN ('consumer','artist','label'));`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 
   // ---------- Réinitialisation de mot de passe (code temporaire par email) ----------

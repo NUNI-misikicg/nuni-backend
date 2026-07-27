@@ -320,10 +320,60 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
     age, address, city, country, artistName, labelOrManager,
+    // ---- Champs spécifiques au Pass Label ----
+    labelName, logoUrl, legalName, professionalPhone, professionalEmail, website, taxId,
+    labelDescription, socialLinks, responsibleName, responsibleIdDocUrl, labelDocUrl, labelPlan,
   } = req.body;
 
-  if (!['consumer', 'artist'].includes(accountType)) {
-    return res.status(400).json({ error: 'Type de compte invalide (consumer ou artist).' });
+  if (!['consumer', 'artist', 'label'].includes(accountType)) {
+    return res.status(400).json({ error: 'Type de compte invalide (consumer, artist ou label).' });
+  }
+
+  if (accountType === 'label') {
+    // Un Label est une entreprise : pas de vérification d'âge (16 ans) comme pour une
+    // personne physique, mais ses propres champs obligatoires (nom légal, contact pro...).
+    const labelRequired = ['firstName', 'lastName', 'email', 'password', 'address', 'city', 'country', 'labelName', 'legalName', 'professionalPhone', 'professionalEmail'];
+    const missingLabel = required(req.body, labelRequired);
+    if (missingLabel.length) return res.status(400).json({ error: `Champs manquants : ${missingLabel.join(', ')}` });
+    if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+    if (!isEmail(professionalEmail)) return res.status(400).json({ error: 'Email professionnel invalide.' });
+    if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
+    if (await db.get('SELECT id FROM users WHERE email = $1', [email])) {
+      return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
+    }
+    const password_hash = await hashPassword(password);
+    const insertedUser = await db.get(`
+      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING id
+    `, [accountType, firstName, lastName, email, phone || null, password_hash, address, city, country]);
+    const validPlan = ['start', 'pro', 'premium', 'elite'].includes(labelPlan) ? labelPlan : 'start';
+    // Fichiers reçus en base64 (aucun jeton disponible avant que le compte existe, donc pas
+    // d'upload direct signé possible) — le serveur les envoie lui-même à Cloudinary.
+    const [finalLogoUrl, finalIdDocUrl, finalLabelDocUrl] = await Promise.all([
+      uploadIfDataUri(logoUrl, 'image'),
+      uploadIfDataUri(responsibleIdDocUrl, 'auto'),
+      uploadIfDataUri(labelDocUrl, 'auto'),
+    ]);
+    await db.run(`
+      INSERT INTO labels (
+        user_id, label_name, logo_url, legal_name, country, city, address, professional_phone,
+        professional_email, website, tax_id, description, social_links, responsible_name,
+        responsible_id_doc_url, label_doc_url, plan
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+    `, [
+      insertedUser.id, labelName, finalLogoUrl || null, legalName, country, city, address,
+      professionalPhone, professionalEmail, website || null, taxId || null,
+      labelDescription || null, socialLinks || null, responsibleName || null,
+      finalIdDocUrl || null, finalLabelDocUrl || null, validPlan,
+    ]);
+    const labelUser = await db.get('SELECT * FROM users WHERE id = $1', [insertedUser.id]);
+    const token = signToken(labelUser);
+    return res.status(201).json({
+      message: 'Demande envoyée — votre compte Label est en attente de vérification (sous 24h).',
+      token,
+      user: publicUser(labelUser),
+    });
   }
 
   const baseRequired = ['firstName', 'lastName', 'email', 'password', 'age', 'address', 'city', 'country'];
@@ -520,6 +570,74 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
 app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
   await db.run('UPDATE users SET has_seen_artist_contract = 1 WHERE id = $1', [req.user.id]);
   res.json({ ok: true });
+}));
+
+// ================= PASS LABEL (Phase 1) =================
+const LABEL_PLAN_MAX_ARTISTS = { start: 2, pro: 5, premium: 10, elite: null }; // null = illimité
+
+// ---------- Le Label consulte son propre profil + statut de vérification ----------
+app.get('/api/label/me', authMiddleware, h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'label') return res.status(403).json({ error: 'Réservé aux comptes Label.' });
+  const label = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
+  if (!label) return res.status(404).json({ error: 'Profil Label introuvable.' });
+  const artistCount = (await db.get(
+    "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'",
+    [label.id],
+  )).c;
+  res.json({ label, artistCount, maxArtists: LABEL_PLAN_MAX_ARTISTS[label.plan] });
+}));
+
+// ---------- Admin — liste des Labels (filtrable par statut de vérification) ----------
+app.get('/api/admin/labels', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const status = req.query.status;
+  const rows = status
+    ? await db.query(
+        `SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+         FROM labels l JOIN users u ON u.id = l.user_id
+         WHERE l.verification_status = $1 ORDER BY l.created_at DESC`,
+        [status],
+      )
+    : await db.query(
+        `SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+         FROM labels l JOIN users u ON u.id = l.user_id ORDER BY l.created_at DESC`,
+      );
+  res.json({ labels: rows });
+}));
+
+// ---------- Admin — approuver un Label ----------
+app.post('/api/admin/labels/:id/approve', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run(
+    "UPDATE labels SET verification_status = 'validated', validated_at = NOW(), refusal_reason = NULL WHERE id = $1",
+    [label.id],
+  );
+  res.json({ message: 'Label validé.' });
+}));
+
+// ---------- Admin — refuser un Label (avec raison) ----------
+app.post('/api/admin/labels/:id/refuse', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { reason } = req.body;
+  await db.run(
+    "UPDATE labels SET verification_status = 'refused', refusal_reason = $1 WHERE id = $2",
+    [reason || null, label.id],
+  );
+  res.json({ message: 'Label refusé.' });
+}));
+
+// ---------- Admin — repasser un Label "en cours de vérification" (étape intermédiaire) ----------
+app.post('/api/admin/labels/:id/mark-verification', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run("UPDATE labels SET verification_status = 'verification' WHERE id = $1", [label.id]);
+  res.json({ message: 'Marqué en cours de vérification.' });
 }));
 
 app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
