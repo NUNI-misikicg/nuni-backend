@@ -224,6 +224,8 @@ async function initSchema() {
   await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS ticket_price_standard TEXT;`);
   await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`); // lieux physiques, texte libre
   await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`); // numéros séparés par une virgule
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`);
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`);
 
   // ---------- État réel du compte (distinct du Pass/abonnement) ----------
   // subscription_status = état du Pass payant (inactive/pending/active/expired).

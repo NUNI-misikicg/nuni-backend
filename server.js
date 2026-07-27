@@ -1931,6 +1931,7 @@ app.post('/api/admin/nuni-events', h(async (req, res) => {
   const {
     category, title, description, flyerUrl, eventDate, startTime, venue, address,
     gpsLat, gpsLng, price, purchaseLink, capacity, placesRestantes, galleryUrls, promoVideoUrl,
+    purchaseLocations, purchasePhoneNumbers,
   } = req.body;
   if (!category || !title || !eventDate) {
     return res.status(400).json({ error: 'Catégorie, titre et date sont obligatoires.' });
@@ -1938,15 +1939,35 @@ app.post('/api/admin/nuni-events', h(async (req, res) => {
   const row = await db.get(
     `INSERT INTO nuni_events (
       category, title, description, flyer_url, event_date, start_time, venue, address,
-      gps_lat, gps_lng, price, purchase_link, capacity, places_restantes, gallery_urls, promo_video_url
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      gps_lat, gps_lng, price, purchase_link, capacity, places_restantes, gallery_urls, promo_video_url,
+      purchase_locations, purchase_phone_numbers
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
     [
       category, title, description || null, flyerUrl || null, eventDate, startTime || null, venue || null, address || null,
       gpsLat || null, gpsLng || null, price || null, purchaseLink || null, capacity || null,
       placesRestantes || capacity || null, galleryUrls || null, promoVideoUrl || null,
+      purchaseLocations || null, purchasePhoneNumbers || null,
     ],
   );
   res.json({ event: row, message: 'Événement publié — visible immédiatement dans la recherche.' });
+}));
+
+// ---------- Admin — modifier (ex: ajouter points de vente/numéros après coup) ----------
+app.put('/api/admin/nuni-events/:id', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const event = await db.get('SELECT id FROM nuni_events WHERE id = $1', [Number(req.params.id)]);
+  if (!event) return res.status(404).json({ error: 'Événement introuvable.' });
+  const { purchaseLocations, purchasePhoneNumbers, purchaseLink, placesRestantes } = req.body;
+  await db.run(
+    `UPDATE nuni_events SET
+      purchase_locations = COALESCE($1, purchase_locations),
+      purchase_phone_numbers = COALESCE($2, purchase_phone_numbers),
+      purchase_link = COALESCE($3, purchase_link),
+      places_restantes = COALESCE($4, places_restantes)
+     WHERE id = $5`,
+    [purchaseLocations || null, purchasePhoneNumbers || null, purchaseLink || null, placesRestantes ?? null, event.id],
+  );
+  res.json({ message: 'Événement mis à jour.' });
 }));
 
 // ---------- Admin — supprimer ----------

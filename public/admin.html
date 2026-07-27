@@ -279,7 +279,11 @@
 
       <label>Prix</label>
       <input id="ev-price" type="text" placeholder="5 000 FCFA, ou Gratuit">
-      <label>Bouton Acheter — lien</label>
+      <label>Points de vente (optionnel — spécifiques à cet événement)</label>
+      <textarea id="ev-purchase-locations" rows="2" placeholder="Ex : Boutique NUNI Kinshasa, av. de la Paix"></textarea>
+      <label>Numéros à contacter pour cet événement (séparés par une virgule)</label>
+      <input id="ev-purchase-phones" type="text" placeholder="Ex : +242 06 895 16 00, +242 05 123 45 67">
+      <label>Bouton Acheter — lien en ligne (optionnel)</label>
       <input id="ev-purchase-link" type="text" placeholder="https://wa.me/...">
       <label>Nombre de places</label>
       <input id="ev-capacity" type="number" min="0" placeholder="1000">
@@ -426,6 +430,8 @@
           gpsLat: latVal ? Number(latVal) : null,
           gpsLng: lngVal ? Number(lngVal) : null,
           price: document.getElementById('ev-price').value.trim() || null,
+          purchaseLocations: document.getElementById('ev-purchase-locations').value.trim() || null,
+          purchasePhoneNumbers: document.getElementById('ev-purchase-phones').value.trim() || null,
           purchaseLink: document.getElementById('ev-purchase-link').value.trim() || null,
           capacity: capacityVal ? Number(capacityVal) : null,
         }),
@@ -434,7 +440,7 @@
       if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
       msg.innerHTML = '<span style="color:#7ee6a8;">✅ Événement publié.</span>';
       ['ev-title','ev-description','ev-date','ev-time','ev-venue','ev-address','ev-gps-lat','ev-gps-lng',
-       'ev-price','ev-purchase-link','ev-capacity'].forEach(id=>{ document.getElementById(id).value = ''; });
+       'ev-price','ev-purchase-locations','ev-purchase-phones','ev-purchase-link','ev-capacity'].forEach(id=>{ document.getElementById(id).value = ''; });
       pendingEventFlyerFile = null; pendingEventGalleryFiles = []; pendingEventVideoFile = null;
       document.getElementById('ev-flyer-preview').style.backgroundImage = '';
       document.getElementById('ev-flyer-preview').textContent = 'Choisir une image';
@@ -466,12 +472,29 @@
             <div style="font-weight:700; font-size:13px;">${ev.title}</div>
             <div class="muted">${ev.category} · ${dateLabel}${ev.venue ? ' · ' + ev.venue : ''}</div>
           </div>
+          <button class="secondary" onclick='editNuniEvent(${ev.id}, ${JSON.stringify(ev.purchase_locations || "")}, ${JSON.stringify(ev.purchase_phone_numbers || "")})'>Modifier billetterie</button>
           <button class="secondary" onclick="deleteNuniEvent(${ev.id})">Supprimer</button>`;
         list.appendChild(row);
       });
     }catch(e){
       list.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
     }
+  }
+  async function editNuniEvent(id, currentLocations, currentPhones){
+    const locations = prompt('Points de vente pour cet événement (laisser tel quel pour ne pas changer) :', currentLocations || '');
+    if(locations === null) return; // annulé
+    const phones = prompt('Numéros à contacter, séparés par une virgule :', currentPhones || '');
+    if(phones === null) return;
+    try{
+      const res = await fetch('/api/admin/nuni-events/' + id, {
+        method:'PUT', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ purchaseLocations: locations, purchasePhoneNumbers: phones }),
+      });
+      const data = await res.json();
+      if(!res.ok){ alert(data.error || 'Erreur.'); return; }
+      alert('Billetterie mise à jour.');
+      loadAdminNuniEvents();
+    }catch(e){ alert('Impossible de contacter le serveur.'); }
   }
   async function deleteNuniEvent(id){
     if(!confirm('Supprimer définitivement cet événement ?')) return;
