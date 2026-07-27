@@ -216,6 +216,15 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS lyrics TEXT;`);
 
+  // ---------- Concerts — type d'événement, tarifs par catégorie de ticket, et infos d'achat
+  // enrichies (au-delà d'un simple lien : lieux physiques où se procurer un ticket, et/ou
+  // numéros de téléphone à contacter) ----------
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS event_type TEXT DEFAULT 'concert';`); // 'concert' ou 'showcase'
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS ticket_price_vip TEXT;`);
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS ticket_price_standard TEXT;`);
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`); // lieux physiques, texte libre
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`); // numéros séparés par une virgule
+
   // ---------- État réel du compte (distinct du Pass/abonnement) ----------
   // subscription_status = état du Pass payant (inactive/pending/active/expired).
   // account_status = état du COMPTE lui-même, décidé par l'admin :

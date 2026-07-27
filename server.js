@@ -1863,6 +1863,7 @@ app.post('/api/dashboard/concerts', authMiddleware, rateLimit(10, 60000), h(asyn
   const {
     title, description, flyerUrl, eventDate, startTime, endTime, city, country, venue, address,
     gpsLat, gpsLng, ticketPrice, ticketType, capacity, placesRestantes, purchaseLink, tourName,
+    eventType, ticketPriceVip, ticketPriceStandard, purchaseLocations, purchasePhoneNumbers,
   } = req.body;
   if (!title || !eventDate || !city || !country) {
     return res.status(400).json({ error: 'Titre, date, ville et pays sont obligatoires.' });
@@ -1871,16 +1872,18 @@ app.post('/api/dashboard/concerts', authMiddleware, rateLimit(10, 60000), h(asyn
     `INSERT INTO concerts (
       artist_id, title, description, flyer_url, event_date, start_time, end_time, city, country,
       venue, address, gps_lat, gps_lng, ticket_price, ticket_type, capacity, places_restantes,
-      purchase_link, tour_name
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+      purchase_link, tour_name, event_type, ticket_price_vip, ticket_price_standard,
+      purchase_locations, purchase_phone_numbers
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
     [
       req.user.id, title, description || null, flyerUrl || null, eventDate, startTime || null, endTime || null,
       city, country, venue || null, address || null, gpsLat || null, gpsLng || null,
       ticketPrice || null, ticketType || null, capacity || null, placesRestantes || capacity || null,
-      purchaseLink || null, tourName || null,
+      purchaseLink || null, tourName || null, eventType === 'showcase' ? 'showcase' : 'concert',
+      ticketPriceVip || null, ticketPriceStandard || null, purchaseLocations || null, purchasePhoneNumbers || null,
     ],
   );
-  res.json({ concert: row, message: 'Concert publié — visible immédiatement dans la recherche.' });
+  res.json({ concert: row, message: 'Publié — visible immédiatement dans la recherche.' });
 }));
 
 // ---------- Modifier (ex: mettre à jour les places restantes) ----------
