@@ -1113,7 +1113,7 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const {
     title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt,
-    composer, featuring, studio, description, releaseDate,
+    composer, featuring, studio, description, releaseDate, credits,
   } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
@@ -1126,15 +1126,15 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   const inserted = await db.get(`
     INSERT INTO tracks (
       artist_id, title, album, genre, release_type, cover_url, audio_url, lyrics, scheduled_release_at, published,
-      composer, featuring, studio, description, release_date
+      composer, featuring, studio, description, release_date, credits
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     RETURNING id
   `, [
     req.user.id, title, album || null, genre || null, releaseType || 'Single',
     finalCoverUrl || null, finalAudioUrl || null, lyrics || null,
     scheduledReleaseAt || null, isFuture ? 0 : 1,
-    composer || null, featuring || null, studio || null, description || null, releaseDate || null,
+    composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
   ]);
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
 }));
@@ -1173,7 +1173,7 @@ app.get('/api/tracks', h(async (req, res) => {
     SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url, t.lyrics,
            t.streams, t.likes, t.created_at, u.id as artist_id, u.artist_name, u.is_verified,
            u.avatar_url as artist_avatar_url,
-           t.composer, t.featuring, t.studio, t.description, t.release_date
+           t.composer, t.featuring, t.studio, t.description, t.release_date, t.credits
     FROM tracks t JOIN users u ON u.id = t.artist_id
     WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= NOW())
     ORDER BY t.created_at DESC

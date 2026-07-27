@@ -303,6 +303,10 @@ async function initSchema() {
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS composer TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS featuring TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS studio TEXT;`);
+  // Crédits / label — la mention type "℗ 2026 Nom du label" que l'artiste saisit lui-même
+  // avant de publier, affichée en bas de la page album à côté du nombre de titres et de la
+  // durée totale (calculés automatiquement, jamais saisis à la main).
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS credits TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS description TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS release_date TIMESTAMPTZ;`);
 
