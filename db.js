@@ -305,6 +305,9 @@ async function initSchema() {
   await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
+  // Galerie "À propos" de l'artiste — jusqu'à 5 photos, gérées depuis son Dashboard,
+  // affichées dans l'interface "À propos" façon Spotify (carrousel + biographie complète).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS about_gallery_urls TEXT;`);
   // Répare les comptes artiste déjà créés par un Label avant le correctif ci-dessus (colonne
   // plan jamais renseignée, retombée sur 'discovery' par défaut → faux compte à rebours de
   // ~100 ans affiché). Ciblé précisément : uniquement les artistes déjà affiliés à un Label,

@@ -1677,7 +1677,7 @@ app.put('/api/artist/bio', authMiddleware, h(async (req, res) => {
 
 app.get('/api/artist/:id/public-stats', h(async (req, res) => {
   const artistId = Number(req.params.id);
-  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio FROM users WHERE id = $1', [artistId]);
+  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio, about_gallery_urls FROM users WHERE id = $1', [artistId]);
   if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
   const followerCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artistId])).c;
   const trackCount = (await db.get('SELECT COUNT(*)::int as c FROM tracks WHERE artist_id = $1 AND published = 1', [artistId])).c;
@@ -1693,7 +1693,20 @@ app.get('/api/artist/:id/public-stats', h(async (req, res) => {
     follower_count: followerCount, track_count: trackCount,
     avatar_url: artist.avatar_url || null, banner_url: artist.banner_url || null,
     bio: artist.bio || null, monthly_listeners: monthlyListeners,
+    about_gallery_urls: artist.about_gallery_urls ? artist.about_gallery_urls.split(',').filter(Boolean) : [],
   });
+}));
+
+// ---------- L'artiste gère sa propre galerie "À propos" (jusqu'à 5 photos) ----------
+app.put('/api/artist/about-gallery', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const { images } = req.body; // tableau de data-URI (nouvelle photo) ou d'URL déjà en ligne (inchangée), max 5
+  if (!Array.isArray(images) || images.length > 5) {
+    return res.status(400).json({ error: 'Maximum 5 photos.' });
+  }
+  const finalUrls = await Promise.all(images.filter(Boolean).map((img) => uploadIfDataUri(img, 'image')));
+  await db.run('UPDATE users SET about_gallery_urls = $1 WHERE id = $2', [finalUrls.join(','), req.user.id]);
+  res.json({ gallery: finalUrls });
 }));
 
 // "Mur des fans" — avant : 7 initiales codées en dur ("MK","PJ","TN"...), identiques pour
