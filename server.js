@@ -373,10 +373,14 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
     ]);
     const labelUser = await db.get('SELECT * FROM users WHERE id = $1', [insertedUser.id]);
     const token = signToken(labelUser);
+    const planSettingsForMsg = await getLabelPlanSettings();
+    const planLabelsForMsg = { start: 'Label Start', pro: 'Label Pro', premium: 'Label Premium', elite: 'Label Elite' };
     return res.status(201).json({
       message: 'Demande envoyée — votre compte Label est en attente de vérification (sous 24h).',
       token,
       user: publicUser(labelUser),
+      labelPlanName: planLabelsForMsg[validPlan],
+      labelPlanPriceFcfa: planSettingsForMsg.prices[validPlan],
     });
   }
 
