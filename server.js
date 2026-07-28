@@ -1003,6 +1003,30 @@ app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
 // éléments demandés dans le cahier des charges ne sont donc pas inclus ici plutôt que
 // d'afficher des chiffres inventés. Tout le reste (streams, auditeurs, pays, villes,
 // croissance, rétention) vient de vraies données déjà en base (table plays).
+// ---------- "Afrique en direct" — vraie géographie des écoutes, plateforme entière ----------
+// Basé sur le pays/ville renseigné par l'auditeur à son inscription, croisé avec ses vraies
+// écoutes (table plays) — même principe honnête que les analytics Label, mais sans filtre
+// sur un artiste ou un label précis : toute la plateforme.
+app.get('/api/stats/geo', h(async (req, res) => {
+  const topCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country ORDER BY plays DESC LIMIT 8
+  `);
+  const topCities = await db.query(`
+    SELECT u.city, u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != ''
+    GROUP BY u.city, u.country ORDER BY plays DESC LIMIT 8
+  `);
+  const totalPlays = (await db.get('SELECT COUNT(*)::int as c FROM plays')).c;
+  const totalCountries = (await db.get(
+    "SELECT COUNT(DISTINCT u.country)::int as c FROM plays p JOIN users u ON u.id = p.listener_id WHERE u.country IS NOT NULL AND u.country != ''",
+  )).c;
+  res.json({ topCountries, topCities, totalPlays, totalCountries });
+}));
+
 app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
   const label = await requireValidatedLabel(req, res, 'assistant');
   if (!label) return;
