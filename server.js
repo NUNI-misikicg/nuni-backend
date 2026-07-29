@@ -190,13 +190,8 @@ function levelInfoForXp(xp) {
 async function addXp(userId, amount) {
   try { await db.run('UPDATE users SET xp = COALESCE(xp,0) + $1 WHERE id = $2', [amount, userId]); } catch (e) { /* jamais bloquant */ }
 }
-// NUNI Points — monnaie virtuelle dépensée dans la boutique (badges cosmétiques uniquement,
-// aucune conversion en FCFA, aucun lien avec la rémunération réelle des artistes).
-async function addPoints(userId, amount) {
-  try { await db.run('UPDATE users SET nuni_points = COALESCE(nuni_points,0) + $1 WHERE id = $2', [amount, userId]); } catch (e) { /* jamais bloquant */ }
-}
-// Connexion quotidienne : +15 XP et +5 NUNI Points la première fois du jour, et incrémente
-// la vraie série (streak_days) si la dernière activité était bien hier — remise à zéro sinon.
+// Connexion quotidienne : +15 XP la première fois du jour, et incrémente la vraie série
+// (streak_days) si la dernière activité était bien hier — remise à zéro sinon.
 async function touchDailyLogin(userId) {
   try {
     const user = await db.get('SELECT last_active_date, streak_days FROM users WHERE id = $1', [userId]);
@@ -207,71 +202,11 @@ async function touchDailyLogin(userId) {
     const wasYesterday = user.last_active_date && new Date(user.last_active_date).toISOString().slice(0, 10) === yesterday;
     const newStreak = wasYesterday ? (user.streak_days || 0) + 1 : 1;
     await db.run(
-      'UPDATE users SET last_active_date = $1, streak_days = $2, xp = COALESCE(xp,0) + 15, nuni_points = COALESCE(nuni_points,0) + 5 WHERE id = $3',
+      'UPDATE users SET last_active_date = $1, streak_days = $2, xp = COALESCE(xp,0) + 15 WHERE id = $3',
       [today, newStreak, userId],
     );
   } catch (e) { /* jamais bloquant */ }
 }
-
-// ================= BOUTIQUE NUNI POINTS =================
-// Étape 4 de la gamification. Articles purement cosmétiques : des badges collectionnables
-// supplémentaires, achetés une seule fois, qui viennent s'ajouter à "Vos badges d'auditeur".
-const SHOP_ITEMS = [
-  { key: 'badge_gold_disc', name: '🥇 Disque d\'Or', description: 'Badge collector', cost: 100 },
-  { key: 'badge_early_bird', name: '🌅 Lève-tôt NUNI', description: 'Badge collector', cost: 150 },
-  { key: 'badge_flame_king', name: '👑 Roi du Streak', description: 'Badge collector', cost: 250 },
-  { key: 'badge_legend', name: '⚡ Collectionneur', description: 'Badge collector', cost: 400 },
-];
-
-app.get('/api/shop/items', authMiddleware, h(async (req, res) => {
-  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [req.user.id]);
-  const ownedSet = new Set(owned.map((o) => o.item_key));
-  const user = await db.get('SELECT nuni_points FROM users WHERE id = $1', [req.user.id]);
-  res.json({
-    points: user.nuni_points || 0,
-    items: SHOP_ITEMS.map((it) => ({ ...it, owned: ownedSet.has(it.key) })),
-  });
-}));
-
-app.post('/api/shop/items/:key/buy', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
-  const item = SHOP_ITEMS.find((i) => i.key === req.params.key);
-  if (!item) return res.status(404).json({ error: 'Article introuvable.' });
-  if (await db.get('SELECT id FROM shop_purchases WHERE user_id = $1 AND item_key = $2', [req.user.id, item.key])) {
-    return res.status(400).json({ error: 'Déjà acheté.' });
-  }
-  const client = await db.pool.connect();
-  try {
-    await client.query('BEGIN');
-    // Avant : le solde était vérifié AVANT la transaction, puis débité dedans — un
-    // double-clic rapide ou deux onglets pouvaient passer la vérification en même temps
-    // (tous deux liraient le même solde encore suffisant) et faire passer le solde en
-    // négatif. Maintenant : la condition de solde suffisant fait partie de l'UPDATE
-    // lui-même (atomique), donc une seule des deux requêtes concurrentes peut réussir.
-    const updated = await client.query(
-      'UPDATE users SET nuni_points = nuni_points - $1 WHERE id = $2 AND nuni_points >= $1 RETURNING nuni_points',
-      [item.cost, req.user.id],
-    );
-    if (updated.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Pas assez de NUNI Points.' });
-    }
-    await client.query('INSERT INTO shop_purchases (user_id, item_key) VALUES ($1,$2)', [req.user.id, item.key]);
-    await client.query('COMMIT');
-    res.json({ message: `${item.name} débloqué !`, points: updated.rows[0].nuni_points });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    // Cas très rare (deux achats simultanés du même article) : la contrainte d'unicité sur
-    // shop_purchases refuse le doublon — la transaction entière est annulée automatiquement,
-    // donc les points ne sont jamais perdus. On répond proprement plutôt qu'avec une erreur
-    // générique 500, comme avant.
-    if (e.code === '23505') {
-      return res.status(400).json({ error: 'Déjà acheté.' });
-    }
-    throw e;
-  } finally {
-    client.release();
-  }
-}));
 
 // ================= DÉFIS QUOTIDIENS / HEBDOMADAIRES =================
 // Étape 3 de la gamification. Récompense en XP direct (la monnaie NUNI Points arrive à
@@ -376,9 +311,7 @@ app.post('/api/me/challenges/:key/claim', authMiddleware, rateLimit(15, 60000), 
     return res.status(400).json({ error: 'Récompense déjà récupérée.' });
   }
   await addXp(req.user.id, def.xp);
-  const pointsAwarded = Math.round(def.xp / 2);
-  await addPoints(req.user.id, pointsAwarded);
-  res.json({ message: `+${def.xp} XP · +${pointsAwarded} NUNI Points !`, xp_awarded: def.xp, points_awarded: pointsAwarded });
+  res.json({ message: `+${def.xp} XP !`, xp_awarded: def.xp });
 }));
 
 // ================= AUTH =================
@@ -387,10 +320,68 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
     age, address, city, country, artistName, labelOrManager,
+    // ---- Champs spécifiques au Pass Label ----
+    labelName, logoUrl, legalName, professionalPhone, professionalEmail, website, taxId,
+    labelDescription, socialLinks, responsibleName, responsibleIdDocUrl, labelDocUrl, labelPlan,
   } = req.body;
 
-  if (!['consumer', 'artist'].includes(accountType)) {
-    return res.status(400).json({ error: 'Type de compte invalide (consumer ou artist).' });
+  if (!['consumer', 'artist', 'label'].includes(accountType)) {
+    return res.status(400).json({ error: 'Type de compte invalide (consumer, artist ou label).' });
+  }
+
+  if (accountType === 'label') {
+    // Un Label est une entreprise : pas de vérification d'âge (16 ans) comme pour une
+    // personne physique, mais ses propres champs obligatoires (nom légal, contact pro...).
+    const labelRequired = ['firstName', 'lastName', 'email', 'password', 'address', 'city', 'country', 'labelName', 'legalName', 'professionalPhone', 'professionalEmail'];
+    const missingLabel = required(req.body, labelRequired);
+    if (missingLabel.length) return res.status(400).json({ error: `Champs manquants : ${missingLabel.join(', ')}` });
+    if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+    if (!isEmail(professionalEmail)) return res.status(400).json({ error: 'Email professionnel invalide.' });
+    if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
+    if (await db.get('SELECT id FROM users WHERE email = $1', [email])) {
+      return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
+    }
+    const password_hash = await hashPassword(password);
+    // plan='label' explicite — sans ça, la colonne retombe sur 'discovery' par défaut et
+    // casse le routage post-connexion (voir /api/login côté client : il redirige vers la
+    // page des tarifs pour tout compte dont subscription_status n'est pas 'active' ET dont
+    // plan est 'discovery', ce qui décrivait alors n'importe quel compte Label par erreur).
+    const insertedUser = await db.get(`
+      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country, plan)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'label')
+      RETURNING id
+    `, [accountType, firstName, lastName, email, phone || null, password_hash, address, city, country]);
+    const validPlan = ['start', 'pro', 'premium', 'elite'].includes(labelPlan) ? labelPlan : 'start';
+    // Fichiers reçus en base64 (aucun jeton disponible avant que le compte existe, donc pas
+    // d'upload direct signé possible) — le serveur les envoie lui-même à Cloudinary.
+    const [finalLogoUrl, finalIdDocUrl, finalLabelDocUrl] = await Promise.all([
+      uploadIfDataUri(logoUrl, 'image'),
+      uploadIfDataUri(responsibleIdDocUrl, 'auto'),
+      uploadIfDataUri(labelDocUrl, 'auto'),
+    ]);
+    await db.run(`
+      INSERT INTO labels (
+        user_id, label_name, logo_url, legal_name, country, city, address, professional_phone,
+        professional_email, website, tax_id, description, social_links, responsible_name,
+        responsible_id_doc_url, label_doc_url, plan
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+    `, [
+      insertedUser.id, labelName, finalLogoUrl || null, legalName, country, city, address,
+      professionalPhone, professionalEmail, website || null, taxId || null,
+      labelDescription || null, socialLinks || null, responsibleName || null,
+      finalIdDocUrl || null, finalLabelDocUrl || null, validPlan,
+    ]);
+    const labelUser = await db.get('SELECT * FROM users WHERE id = $1', [insertedUser.id]);
+    const token = signToken(labelUser);
+    const planSettingsForMsg = await getLabelPlanSettings();
+    const planLabelsForMsg = { start: 'Label Start', pro: 'Label Pro', premium: 'Label Premium', elite: 'Label Elite' };
+    return res.status(201).json({
+      message: 'Demande envoyée — votre compte Label est en attente de vérification (sous 24h).',
+      token,
+      user: publicUser(labelUser),
+      labelPlanName: planLabelsForMsg[validPlan],
+      labelPlanPriceFcfa: planSettingsForMsg.prices[validPlan],
+    });
   }
 
   const baseRequired = ['firstName', 'lastName', 'email', 'password', 'age', 'address', 'city', 'country'];
@@ -589,6 +580,879 @@ app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ================= PASS LABEL (Phase 1) =================
+const LABEL_PLAN_MAX_ARTISTS = { start: 2, pro: 5, premium: 10, elite: null }; // valeurs par défaut, voir getLabelPlanSettings ci-dessous pour les vraies valeurs configurables
+const LABEL_PLAN_DEFAULT_PRICES_FCFA = { start: 15000, pro: 30000, premium: 60000, elite: 120000 }; // par trimestre, valeurs par défaut
+
+// ---------- Paliers Label configurables depuis l'admin (Phase 6) ----------
+// Stockés dans app_settings (même mécanisme que les taux de reversement) — si rien n'a
+// encore été configuré, les valeurs par défaut ci-dessus s'appliquent, jamais de crash.
+async function getLabelPlanSettings() {
+  const keys = [
+    'label_plan_max_start', 'label_plan_max_pro', 'label_plan_max_premium', 'label_plan_max_elite',
+    'label_plan_price_start', 'label_plan_price_pro', 'label_plan_price_premium', 'label_plan_price_elite',
+  ];
+  const rows = await db.query('SELECT key, value FROM app_settings WHERE key = ANY($1)', [keys]);
+  const map = {};
+  rows.forEach((r) => { map[r.key] = r.value; });
+  const parseMax = (v, fallback) => (v === '' || v == null ? fallback : (v === 'null' ? null : Number(v)));
+  return {
+    maxArtists: {
+      start: parseMax(map.label_plan_max_start, LABEL_PLAN_MAX_ARTISTS.start),
+      pro: parseMax(map.label_plan_max_pro, LABEL_PLAN_MAX_ARTISTS.pro),
+      premium: parseMax(map.label_plan_max_premium, LABEL_PLAN_MAX_ARTISTS.premium),
+      elite: parseMax(map.label_plan_max_elite, LABEL_PLAN_MAX_ARTISTS.elite),
+    },
+    prices: {
+      start: map.label_plan_price_start != null ? Number(map.label_plan_price_start) : LABEL_PLAN_DEFAULT_PRICES_FCFA.start,
+      pro: map.label_plan_price_pro != null ? Number(map.label_plan_price_pro) : LABEL_PLAN_DEFAULT_PRICES_FCFA.pro,
+      premium: map.label_plan_price_premium != null ? Number(map.label_plan_price_premium) : LABEL_PLAN_DEFAULT_PRICES_FCFA.premium,
+      elite: map.label_plan_price_elite != null ? Number(map.label_plan_price_elite) : LABEL_PLAN_DEFAULT_PRICES_FCFA.elite,
+    },
+  };
+}
+
+// ---------- Publique — pour afficher les vrais prix/limites sur la page tarifs et le formulaire d'inscription ----------
+app.get('/api/label-plan-settings', h(async (req, res) => {
+  res.json(await getLabelPlanSettings());
+}));
+
+// ---------- Admin — modifier les limites et les prix ----------
+app.post('/api/admin/label-plan-settings', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { maxArtists, prices } = req.body;
+  const pairs = [];
+  if (maxArtists) {
+    ['start', 'pro', 'premium', 'elite'].forEach((p) => {
+      if (maxArtists[p] !== undefined) pairs.push([`label_plan_max_${p}`, maxArtists[p] === null ? 'null' : String(maxArtists[p])]);
+    });
+  }
+  if (prices) {
+    ['start', 'pro', 'premium', 'elite'].forEach((p) => {
+      if (prices[p] !== undefined) pairs.push([`label_plan_price_${p}`, String(prices[p])]);
+    });
+  }
+  for (const [key, value] of pairs) {
+    await db.run(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value],
+    );
+  }
+  res.json({ message: 'Paliers Label mis à jour.', settings: await getLabelPlanSettings() });
+}));
+
+// ---------- Le Label consulte son propre profil + statut de vérification ----------
+app.get('/api/label/me', authMiddleware, h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'label') return res.status(403).json({ error: 'Réservé aux comptes Label.' });
+  const label = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
+  if (!label) return res.status(404).json({ error: 'Profil Label introuvable.' });
+  const artistCount = (await db.get(
+    "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'",
+    [label.id],
+  )).c;
+  const planSettings1 = await getLabelPlanSettings();
+  res.json({ label, artistCount, maxArtists: planSettings1.maxArtists[label.plan] });
+}));
+
+// ---------- Admin — liste des Labels (filtrable par statut de vérification) ----------
+app.get('/api/admin/labels', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const status = req.query.status;
+  const rows = status
+    ? await db.query(
+        `SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+         FROM labels l JOIN users u ON u.id = l.user_id
+         WHERE l.verification_status = $1 ORDER BY l.created_at DESC`,
+        [status],
+      )
+    : await db.query(
+        `SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+         FROM labels l JOIN users u ON u.id = l.user_id ORDER BY l.created_at DESC`,
+      );
+  res.json({ labels: rows });
+}));
+
+// ---------- Admin — approuver un Label ----------
+app.post('/api/admin/labels/:id/approve', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run(
+    `UPDATE labels SET verification_status = 'validated', validated_at = NOW(), refusal_reason = NULL,
+      subscription_expires_at = NOW() + INTERVAL '1 year' WHERE id = $1`,
+    [label.id],
+  );
+  res.json({ message: 'Label validé.' });
+}));
+
+// ---------- Admin — refuser un Label (avec raison) ----------
+app.post('/api/admin/labels/:id/refuse', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { reason } = req.body;
+  await db.run(
+    "UPDATE labels SET verification_status = 'refused', refusal_reason = $1 WHERE id = $2",
+    [reason || null, label.id],
+  );
+  res.json({ message: 'Label refusé.' });
+}));
+
+// ---------- Admin — suspendre un Label déjà validé (accès Dashboard coupé, comptes
+// artistes affiliés jamais touchés) ----------
+app.post('/api/admin/labels/:id/suspend', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { reason } = req.body;
+  await db.run(
+    "UPDATE labels SET verification_status = 'suspended', refusal_reason = $1 WHERE id = $2",
+    [reason || null, label.id],
+  );
+  res.json({ message: 'Label suspendu.' });
+}));
+app.post('/api/admin/labels/:id/reactivate', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run("UPDATE labels SET verification_status = 'validated', refusal_reason = NULL WHERE id = $1", [label.id]);
+  res.json({ message: 'Label réactivé.' });
+}));
+
+// ---------- Admin — détail d'un Label : artistes liés + revenus, en un coup d'œil ----------
+app.get('/api/admin/labels/:id/details', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get(`
+    SELECT l.*, u.email, u.first_name, u.last_name, u.phone
+    FROM labels l JOIN users u ON u.id = l.user_id WHERE l.id = $1
+  `, [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const artists = await db.query(`
+    SELECT la.status as affiliation_status, u.id as artist_id, u.artist_name, u.email,
+           COALESCE((SELECT SUM(t.streams)::bigint FROM tracks t WHERE t.artist_id = u.id AND t.published = 1), 0) as total_streams,
+           COALESCE((SELECT SUM(ph.amount_fcfa)::bigint FROM payment_history ph WHERE ph.artist_id = u.id), 0) as total_paid_fcfa
+    FROM label_artists la JOIN users u ON u.id = la.artist_id
+    WHERE la.label_id = $1 AND la.status != 'removed'
+    ORDER BY la.created_at DESC
+  `, [label.id]);
+  const totalStreams = artists.reduce((s, a) => s + Number(a.total_streams), 0);
+  const totalPaidFcfa = artists.reduce((s, a) => s + Number(a.total_paid_fcfa), 0);
+  res.json({ label, artists, totalStreams, totalPaidFcfa });
+}));
+
+// ---------- Admin — repasser un Label "en cours de vérification" (étape intermédiaire) ----------
+app.post('/api/admin/labels/:id/mark-verification', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT id FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  await db.run("UPDATE labels SET verification_status = 'verification' WHERE id = $1", [label.id]);
+  res.json({ message: 'Marqué en cours de vérification.' });
+}));
+
+// ================= PASS LABEL — Phase 2 : gestion des artistes + vue d'ensemble =================
+// Un Label validé peut gérer plusieurs artistes depuis son compte. IMPORTANT : "suspendre"
+// ou "retirer" un artiste n'affecte QUE l'affiliation (label_artists) — jamais le compte
+// artiste lui-même (account_status), qui reste sous le contrôle exclusif de l'artiste.
+// Un Label ne peut jamais bloquer l'accès NUNI d'un artiste indépendant.
+//
+// ---------- Système de rôles (Phase 4) ----------
+// Le compte de connexion du Label (labels.user_id) est toujours 'owner', rang le plus élevé.
+// Les membres d'équipe (label_team_members) ont chacun un rôle propre, avec des permissions
+// croissantes : assistant < manager < admin < owner. minRole fixe le rang minimum requis
+// pour l'action demandée — par défaut 'assistant' (accès en lecture pour toute l'équipe).
+const LABEL_ROLE_RANK = { assistant: 1, manager: 2, admin: 3, owner: 4 };
+// Notifie le propriétaire du Label quand un artiste rejoint (création ou invitation
+// acceptée), et signale en plus si le palier de son plan vient d'être atteint.
+async function notifyLabelArtistAdded(label, artistName, newCount) {
+  await createNotification(
+    label.user_id, 'label_artist_added', 'Nouvel artiste',
+    `${artistName} fait maintenant partie de ${label.label_name}.`, null,
+  ).catch(() => {});
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
+  if (max !== null && newCount >= max) {
+    await createNotification(
+      label.user_id, 'label_plan_limit', 'Palier atteint',
+      `${label.label_name} a atteint la limite de ${max} artiste(s) de son palier actuel. Passez à un palier supérieur pour continuer à ajouter des artistes.`, null,
+    ).catch(() => {});
+  }
+}
+
+async function requireValidatedLabel(req, res, minRole = 'assistant') {
+  // Le compte est-il le compte de connexion du Label lui-même (toujours owner) ?
+  const ownLabel = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
+  let label = ownLabel;
+  let myRole = 'owner';
+  if (!label) {
+    // Sinon, est-ce un membre d'équipe actif d'un Label ?
+    const membership = await db.get(
+      "SELECT lt.role, lt.label_id FROM label_team_members lt WHERE lt.user_id = $1 AND lt.status = 'active' LIMIT 1",
+      [req.user.id],
+    );
+    if (!membership) { res.status(403).json({ error: 'Réservé aux comptes Label.' }); return null; }
+    label = await db.get('SELECT * FROM labels WHERE id = $1', [membership.label_id]);
+    myRole = membership.role;
+  }
+  if (!label) { res.status(404).json({ error: 'Profil Label introuvable.' }); return null; }
+  if (label.verification_status !== 'validated') {
+    res.status(403).json({ error: 'Ce compte Label doit être validé par NUNI avant de gérer des artistes.' });
+    return null;
+  }
+  if (label.subscription_expires_at && new Date(label.subscription_expires_at) < new Date()) {
+    res.status(403).json({ error: 'Votre Pass Label a expiré (1 an révolu). Renouvelez-le depuis votre Dashboard pour continuer.' });
+    return null;
+  }
+  if (LABEL_ROLE_RANK[myRole] < LABEL_ROLE_RANK[minRole]) {
+    res.status(403).json({ error: `Action réservée aux rôles ${minRole} et supérieurs.` });
+    return null;
+  }
+  return { ...label, myRole };
+}
+
+// ---------- Liste des artistes gérés par le Label, avec leurs vraies stats ----------
+app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT la.id as affiliation_id, la.status as affiliation_status, la.created_at as joined_at,
+           u.id as artist_id, u.artist_name, u.email, u.avatar_url, u.is_verified,
+           COALESCE((SELECT COUNT(*)::int FROM tracks t WHERE t.artist_id = u.id AND t.published = 1), 0) as track_count,
+           COALESCE((SELECT SUM(t.streams)::bigint FROM tracks t WHERE t.artist_id = u.id AND t.published = 1), 0) as total_streams
+    FROM label_artists la JOIN users u ON u.id = la.artist_id
+    WHERE la.label_id = $1 AND la.status != 'removed'
+    ORDER BY la.created_at DESC
+  `, [label.id]);
+  const planSettings2 = await getLabelPlanSettings();
+  res.json({ artists: rows, plan: label.plan, maxArtists: planSettings2.maxArtists[label.plan] });
+}));
+
+// ---------- Créer un nouvel artiste directement sous le Label ----------
+app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const currentCount = (await db.get(
+    "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).c;
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
+  if (max !== null && currentCount >= max) {
+    return res.status(403).json({ error: `Votre palier (${label.plan}) autorise au maximum ${max} artiste(s). Passez à un palier supérieur pour en gérer davantage.` });
+  }
+  const { artistName, email, password, firstName, lastName } = req.body;
+  if (!artistName || !email || !password || !firstName || !lastName) {
+    return res.status(400).json({ error: 'Nom d\'artiste, prénom, nom, email et mot de passe sont obligatoires.' });
+  }
+  if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
+  if (await db.get('SELECT id FROM users WHERE email = $1', [email])) {
+    return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
+  }
+  const password_hash = await hashPassword(password);
+  // Utilise les coordonnées du Label par défaut (l'artiste pourra les modifier lui-même
+  // ensuite depuis son propre Dashboard, comme n'importe quel compte artiste).
+  // IMPORTANT : plan doit être explicitement 'artist' — sans ça, la colonne retombe sur sa
+  // valeur par défaut 'discovery', et l'interface affichait alors un faux compte à rebours
+  // de ~100 ans (100 ans étant la durée choisie pour subscription_expires_at, interprétée à
+  // tort comme un essai Découverte sur le point d'expirer).
+  const insertedArtist = await db.get(`
+    INSERT INTO users (account_type, first_name, last_name, email, password_hash, age, address, city, country, artist_name, label_or_manager, plan, subscription_status, subscription_expires_at)
+    VALUES ('artist',$1,$2,$3,$4,18,$5,$6,$7,$8,$9,'artist','active', NOW() + INTERVAL '100 years')
+    RETURNING id
+  `, [firstName, lastName, email, password_hash, label.address, label.city, label.country, artistName, label.label_name]);
+  // Compte créé directement par le Label et actif dès la création (statut 'active', pas
+  // 'invited') — cohérent avec "Créer un artiste" dans le cahier des charges, distinct de
+  // "Inviter un artiste" (un compte déjà existant, qui doit lui donner son accord).
+  await db.run(
+    "INSERT INTO label_artists (label_id, artist_id, status) VALUES ($1,$2,'active')",
+    [label.id, insertedArtist.id],
+  );
+  await notifyLabelArtistAdded(label, artistName, currentCount + 1);
+  res.status(201).json({ message: `${artistName} a été créé et rattaché à ${label.label_name}.`, artistId: insertedArtist.id });
+}));
+
+// ---------- Inviter un artiste EXISTANT (déjà inscrit sur NUNI) par email ----------
+app.post('/api/label/artists/invite', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const currentCount = (await db.get(
+    "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).c;
+  const planSettings = await getLabelPlanSettings();
+  const max = planSettings.maxArtists[label.plan];
+  if (max !== null && currentCount >= max) {
+    return res.status(403).json({ error: `Votre palier (${label.plan}) autorise au maximum ${max} artiste(s).` });
+  }
+  const { email } = req.body;
+  if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  const artist = await db.get("SELECT id, artist_name FROM users WHERE email = $1 AND account_type = 'artist'", [email]);
+  if (!artist) return res.status(404).json({ error: 'Aucun compte artiste NUNI ne correspond à cet email.' });
+  if (await db.get('SELECT id FROM label_artists WHERE label_id = $1 AND artist_id = $2', [label.id, artist.id])) {
+    return res.status(400).json({ error: 'Cet artiste est déjà affilié (ou l\'a déjà été) à votre Label.' });
+  }
+  // 'invited' : l'artiste doit accepter lui-même — voir /api/me/label-invites côté artiste.
+  await db.run("INSERT INTO label_artists (label_id, artist_id, status) VALUES ($1,$2,'invited')", [label.id, artist.id]);
+  res.status(201).json({ message: `Invitation envoyée à ${artist.artist_name}.` });
+}));
+
+// ---------- Retirer un artiste du Label (n'affecte jamais le compte artiste lui-même) ----------
+app.delete('/api/label/artists/:id', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
+  await db.run("UPDATE label_artists SET status = 'removed' WHERE id = $1", [aff.id]);
+  res.json({ message: 'Artiste retiré du Label.' });
+}));
+
+// ---------- Suspendre / réactiver l'affiliation (jamais le compte artiste lui-même) ----------
+app.post('/api/label/artists/:id/suspend', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
+  await db.run("UPDATE label_artists SET status = 'suspended' WHERE id = $1", [aff.id]);
+  res.json({ message: 'Affiliation suspendue — le compte artiste reste actif et indépendant sur NUNI.' });
+}));
+app.post('/api/label/artists/:id/reactivate', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
+  await db.run("UPDATE label_artists SET status = 'active' WHERE id = $1", [aff.id]);
+  res.json({ message: 'Affiliation réactivée.' });
+}));
+
+// ---------- Vue d'ensemble (accueil du Dashboard Label) ----------
+app.get('/api/label/overview', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ artistCount: 0, totalStreams: 0, estimatedRevenueFcfa: 0, collectedRevenueFcfa: 0, topArtist: null, topTrack: null });
+  }
+  const totalStreamsRow = await db.get(
+    'SELECT COALESCE(SUM(streams),0)::bigint as total FROM tracks WHERE artist_id = ANY($1) AND published = 1', [artistIds],
+  );
+  const totalStreams = Number(totalStreamsRow.total);
+  const priceRow = await db.get('SELECT value FROM app_settings WHERE key = $1', ['royalty_price_per_stream_fcfa']);
+  const shareRow = await db.get('SELECT value FROM app_settings WHERE key = $1', ['royalty_artist_share_pct']);
+  const pricePerStream = priceRow ? Number(priceRow.value) : 5;
+  const artistShare = shareRow ? Number(shareRow.value) / 100 : 0.75;
+  const estimatedRevenueFcfa = Math.round(totalStreams * pricePerStream * artistShare);
+  const collectedRow = await db.get(
+    'SELECT COALESCE(SUM(amount_fcfa),0)::bigint as total FROM payment_history WHERE artist_id = ANY($1)', [artistIds],
+  ).catch(() => ({ total: 0 }));
+  const topArtist = await db.get(`
+    SELECT u.artist_name, COALESCE(SUM(t.streams),0)::bigint as streams
+    FROM users u LEFT JOIN tracks t ON t.artist_id = u.id AND t.published = 1
+    WHERE u.id = ANY($1) GROUP BY u.id, u.artist_name ORDER BY streams DESC LIMIT 1
+  `, [artistIds]);
+  const topTrack = await db.get(`
+    SELECT t.title, u.artist_name, t.streams
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.artist_id = ANY($1) AND t.published = 1 ORDER BY t.streams DESC LIMIT 1
+  `, [artistIds]);
+  res.json({
+    artistCount: artistIds.length,
+    totalStreams,
+    estimatedRevenueFcfa,
+    collectedRevenueFcfa: Number(collectedRow.total || 0),
+    topArtist: topArtist || null,
+    topTrack: topTrack || null,
+  });
+}));
+
+// ---------- Revenus & versements consolidés (Phase 3) ----------
+// Vue de RAPPORT sur les vrais versements déjà enregistrés (table payment_history, celle que
+// l'admin alimente depuis "Reversements artistes") — le Label ne reçoit ni ne redistribue
+// d'argent lui-même via NUNI, il consulte simplement l'historique réel de ses artistes,
+// consolidé. Rien n'est inventé ou simulé ici.
+app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status != 'removed'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ totalPaidFcfa: 0, byArtist: [], history: [] });
+  }
+  const history = await db.query(`
+    SELECT ph.id, ph.amount_fcfa, ph.streams_covered, ph.period_start, ph.period_end, ph.method, ph.created_at,
+           u.artist_name
+    FROM payment_history ph JOIN users u ON u.id = ph.artist_id
+    WHERE ph.artist_id = ANY($1)
+    ORDER BY ph.created_at DESC
+  `, [artistIds]);
+  const byArtist = await db.query(`
+    SELECT u.id as artist_id, u.artist_name, COALESCE(SUM(ph.amount_fcfa),0)::bigint as total_paid_fcfa,
+           COUNT(ph.id)::int as payment_count
+    FROM users u LEFT JOIN payment_history ph ON ph.artist_id = u.id
+    WHERE u.id = ANY($1) GROUP BY u.id, u.artist_name ORDER BY total_paid_fcfa DESC
+  `, [artistIds]);
+  const totalPaidFcfa = byArtist.reduce((sum, a) => sum + Number(a.total_paid_fcfa), 0);
+  res.json({ totalPaidFcfa, byArtist, history });
+}));
+
+// ================= ANALYTICS + CATALOGUE (Phase 5) =================
+// Important, par honnêteté : NUNI ne suit pas encore la plateforme de lecture (mobile/web/
+// desktop) ni un vrai système de "brouillon" distinct d'une simple publication — ces deux
+// éléments demandés dans le cahier des charges ne sont donc pas inclus ici plutôt que
+// d'afficher des chiffres inventés. Tout le reste (streams, auditeurs, pays, villes,
+// croissance, rétention) vient de vraies données déjà en base (table plays).
+// ---------- "Afrique en direct" — vraie géographie des écoutes, plateforme entière ----------
+// Basé sur le pays/ville renseigné par l'auditeur à son inscription, croisé avec ses vraies
+// écoutes (table plays) — même principe honnête que les analytics Label, mais sans filtre
+// sur un artiste ou un label précis : toute la plateforme.
+// Regroupement pays → région — volontairement centré sur les pays les plus probables pour
+// l'audience de NUNI (Afrique + diaspora). Un pays non reconnu tombe dans "Autres régions"
+// plutôt que d'être ignoré ou classé au hasard.
+const COUNTRY_TO_REGION = {
+  'congo':'Afrique centrale', 'republique du congo':'Afrique centrale', 'rdc':'Afrique centrale',
+  'republique democratique du congo':'Afrique centrale', 'rd congo':'Afrique centrale',
+  'gabon':'Afrique centrale', 'cameroun':'Afrique centrale', 'tchad':'Afrique centrale',
+  'centrafrique':'Afrique centrale', 'guinee equatoriale':'Afrique centrale', 'sao tome':'Afrique centrale',
+  'senegal':'Afrique de l\'Ouest', 'cote d\'ivoire':'Afrique de l\'Ouest', 'ivoire':'Afrique de l\'Ouest',
+  'mali':'Afrique de l\'Ouest', 'burkina faso':'Afrique de l\'Ouest', 'guinee':'Afrique de l\'Ouest',
+  'benin':'Afrique de l\'Ouest', 'togo':'Afrique de l\'Ouest', 'niger':'Afrique de l\'Ouest',
+  'nigeria':'Afrique de l\'Ouest', 'ghana':'Afrique de l\'Ouest', 'sierra leone':'Afrique de l\'Ouest',
+  'liberia':'Afrique de l\'Ouest', 'gambie':'Afrique de l\'Ouest', 'mauritanie':'Afrique de l\'Ouest',
+  'cap-vert':'Afrique de l\'Ouest', 'guinee-bissau':'Afrique de l\'Ouest',
+  'kenya':'Afrique de l\'Est', 'tanzanie':'Afrique de l\'Est', 'ouganda':'Afrique de l\'Est',
+  'ethiopie':'Afrique de l\'Est', 'rwanda':'Afrique de l\'Est', 'burundi':'Afrique de l\'Est',
+  'somalie':'Afrique de l\'Est', 'djibouti':'Afrique de l\'Est', 'soudan':'Afrique de l\'Est',
+  'afrique du sud':'Afrique australe', 'zimbabwe':'Afrique australe', 'zambie':'Afrique australe',
+  'namibie':'Afrique australe', 'botswana':'Afrique australe', 'mozambique':'Afrique australe',
+  'angola':'Afrique australe', 'malawi':'Afrique australe', 'lesotho':'Afrique australe', 'eswatini':'Afrique australe',
+  'maroc':'Afrique du Nord', 'algerie':'Afrique du Nord', 'tunisie':'Afrique du Nord',
+  'egypte':'Afrique du Nord', 'libye':'Afrique du Nord',
+  'france':'Europe', 'belgique':'Europe', 'allemagne':'Europe', 'royaume-uni':'Europe', 'angleterre':'Europe',
+  'suisse':'Europe', 'italie':'Europe', 'espagne':'Europe', 'portugal':'Europe', 'pays-bas':'Europe',
+  'suede':'Europe', 'norvege':'Europe',
+  'etats-unis':'Amérique du Nord', 'usa':'Amérique du Nord', 'canada':'Amérique du Nord', 'mexique':'Amérique du Nord',
+  'bresil':'Amérique du Sud', 'argentine':'Amérique du Sud',
+  'jamaique':'Caraïbes', 'haiti':'Caraïbes', 'cuba':'Caraïbes', 'republique dominicaine':'Caraïbes',
+  'chine':'Asie', 'inde':'Asie', 'japon':'Asie', 'coree du sud':'Asie', 'emirats arabes unis':'Moyen-Orient',
+  'arabie saoudite':'Moyen-Orient', 'liban':'Moyen-Orient', 'qatar':'Moyen-Orient',
+  'australie':'Océanie', 'nouvelle-zelande':'Océanie',
+};
+function normalizeCountryKey(name) {
+  return (name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+function regionForCountry(name) {
+  return COUNTRY_TO_REGION[normalizeCountryKey(name)] || 'Autres régions';
+}
+
+// ---------- Récap personnel mensuel — vrais top artistes/morceaux, par vrai nombre
+// d'écoutes (pas de minutes : ni tracks ni plays ne stockent de durée aujourd'hui). ----------
+app.get('/api/me/recap', authMiddleware, h(async (req, res) => {
+  // Liste des mois où ce compte a réellement écouté quelque chose, du plus récent au plus ancien.
+  const months = await db.query(`
+    SELECT DISTINCT date_trunc('month', p.created_at) as month
+    FROM plays p WHERE p.listener_id = $1
+    ORDER BY month DESC LIMIT 12
+  `, [req.user.id]);
+  const requestedMonth = req.query.month; // format 'YYYY-MM-01', optionnel — sinon le plus récent
+  const targetMonth = requestedMonth || (months[0] ? months[0].month : null);
+  if (!targetMonth) { res.json({ months: [], totalPlays: 0, topArtists: [], topTracks: [] }); return; }
+
+  const totalPlays = (await db.get(`
+    SELECT COUNT(*)::int as c FROM plays p
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+  `, [req.user.id, targetMonth])).c;
+
+  const topArtists = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = t.artist_id
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+    GROUP BY u.id, u.artist_name, u.avatar_url ORDER BY plays DESC LIMIT 3
+  `, [req.user.id, targetMonth]);
+
+  const topTracks = await db.query(`
+    SELECT t.id, t.title, t.cover_url, u.artist_name, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = t.artist_id
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+    GROUP BY t.id, t.title, t.cover_url, u.artist_name ORDER BY plays DESC LIMIT 5
+  `, [req.user.id, targetMonth]);
+
+  res.json({ months: months.map((m) => m.month), targetMonth, totalPlays, topArtists, topTracks });
+}));
+
+app.get('/api/stats/geo', h(async (req, res) => {
+  const topCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country ORDER BY plays DESC LIMIT 10
+  `);
+  const topCities = await db.query(`
+    SELECT u.city, u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != ''
+    GROUP BY u.city, u.country ORDER BY plays DESC LIMIT 10
+  `);
+  // TOUS les pays (pas seulement le top 10) — nécessaire pour un vrai regroupement par
+  // région, sinon les petits pays d'une région seraient ignorés et fausseraient le total.
+  const allCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country
+  `);
+  const regionTotals = {};
+  allCountries.forEach((c) => {
+    const region = regionForCountry(c.country);
+    regionTotals[region] = (regionTotals[region] || 0) + c.plays;
+  });
+  const topRegions = Object.entries(regionTotals)
+    .map(([region, plays]) => ({ region, plays }))
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, 10);
+
+  // ---- Vraies tendances : écoutes des 7 derniers jours vs les 7 jours précédents.
+  // Jamais un pourcentage inventé — et surtout, jamais un pourcentage TROMPEUR : avec très
+  // peu de données (ex: 1 écoute avant, 19 après), un calcul brut donnerait des variations
+  // énormes et illisibles. En dessous d'un seuil minimum sur les deux périodes, la tendance
+  // est marquée "pas assez de recul" plutôt qu'un chiffre qui donne une fausse impression de
+  // précision statistique.
+  const MIN_SAMPLE_FOR_TREND = 5;
+  function computeTrends(lastRows, prevRows, key) {
+    const prevMap = {}; prevRows.forEach((r) => { prevMap[r[key]] = r.plays; });
+    const lastMap = {}; lastRows.forEach((r) => { lastMap[r[key]] = r.plays; });
+    const trends = {};
+    new Set([...lastRows.map((r) => r[key]), ...prevRows.map((r) => r[key])]).forEach((k) => {
+      const now = lastMap[k] || 0;
+      const before = prevMap[k] || 0;
+      if (before === 0 && now === 0) return;
+      if (before === 0) { trends[k] = { direction: 'new' }; return; }
+      if (before < MIN_SAMPLE_FOR_TREND && now < MIN_SAMPLE_FOR_TREND) { trends[k] = { direction: 'low_sample' }; return; }
+      const pct = Math.round(((now - before) / before) * 100);
+      trends[k] = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
+    });
+    return trends;
+  }
+  const last7Countries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '7 days' GROUP BY u.country
+  `);
+  const prev7Countries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days' GROUP BY u.country
+  `);
+  const last7Cities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != '' AND p.created_at >= NOW() - INTERVAL '7 days' GROUP BY u.city
+  `);
+  const prev7Cities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != '' AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days' GROUP BY u.city
+  `);
+  const trends = computeTrends(last7Countries, prev7Countries, 'country');
+  const cityTrends = computeTrends(last7Cities, prev7Cities, 'city');
+  // Régions : recalculées à partir des mêmes lignes pays, regroupées — cohérent avec le
+  // regroupement du total ci-dessus, jamais une seconde source de vérité qui pourrait diverger.
+  function regionize(rows) {
+    const totals = {};
+    rows.forEach((r) => { const region = regionForCountry(r.country); totals[region] = (totals[region] || 0) + r.plays; });
+    return Object.entries(totals).map(([region, plays]) => ({ region, plays }));
+  }
+  const regionTrends = computeTrends(regionize(last7Countries), regionize(prev7Countries), 'region');
+
+  // ---- Tendance réelle du total de la plateforme : ce mois-ci vs le mois précédent.
+  const totalThisMonth = (await db.get(
+    "SELECT COUNT(*)::int as c FROM plays WHERE created_at >= date_trunc('month', NOW())",
+  )).c;
+  const totalLastMonth = (await db.get(
+    "SELECT COUNT(*)::int as c FROM plays WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') AND created_at < date_trunc('month', NOW())",
+  )).c;
+  let totalTrend = { direction: 'flat', pct: 0 };
+  if (totalLastMonth === 0) { totalTrend = totalThisMonth > 0 ? { direction: 'new' } : { direction: 'flat', pct: 0 }; }
+  else {
+    const pct = Math.round(((totalThisMonth - totalLastMonth) / totalLastMonth) * 100);
+    totalTrend = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
+  }
+
+  const totalPlays = (await db.get('SELECT COUNT(*)::int as c FROM plays')).c;
+  const totalCountries = allCountries.length;
+  res.json({ topCountries, topCities, topRegions, trends, cityTrends, regionTrends, totalTrend, totalPlays, totalCountries });
+}));
+
+app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ streamsByMonth: [], topCountries: [], topCities: [], growthPct: null, retentionPct: null });
+  }
+
+  const streamsByMonth = await db.query(`
+    SELECT to_char(date_trunc('month', p.created_at), 'Mon YYYY') as month,
+           COUNT(*)::int as streams, COUNT(DISTINCT p.listener_id)::int as listeners
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = ANY($1) AND p.created_at >= NOW() - INTERVAL '6 months'
+    GROUP BY date_trunc('month', p.created_at)
+    ORDER BY date_trunc('month', p.created_at) ASC
+  `, [artistIds]);
+
+  const topCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = p.listener_id
+    WHERE t.artist_id = ANY($1) AND u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country ORDER BY plays DESC LIMIT 6
+  `, [artistIds]);
+
+  const topCities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = p.listener_id
+    WHERE t.artist_id = ANY($1) AND u.city IS NOT NULL AND u.city != ''
+    GROUP BY u.city ORDER BY plays DESC LIMIT 6
+  `, [artistIds]);
+
+  // Croissance : variation des streams entre les deux derniers mois complets.
+  let growthPct = null;
+  if (streamsByMonth.length >= 2) {
+    const prev = streamsByMonth[streamsByMonth.length - 2].streams;
+    const curr = streamsByMonth[streamsByMonth.length - 1].streams;
+    growthPct = prev > 0 ? Math.round(((curr - prev) / prev) * 1000) / 10 : null;
+  }
+
+  // Rétention : parmi les auditeurs distincts du mois précédent, quelle proportion a
+  // réécouté au moins une fois ce mois-ci.
+  const prevListeners = await db.query(`
+    SELECT DISTINCT p.listener_id FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = ANY($1)
+      AND p.created_at >= date_trunc('month', NOW() - INTERVAL '1 month')
+      AND p.created_at < date_trunc('month', NOW())
+  `, [artistIds]);
+  let retentionPct = null;
+  if (prevListeners.length) {
+    const prevIds = prevListeners.map((r) => r.listener_id);
+    const retained = await db.get(`
+      SELECT COUNT(DISTINCT p.listener_id)::int as c FROM plays p JOIN tracks t ON t.id = p.track_id
+      WHERE t.artist_id = ANY($1) AND p.listener_id = ANY($2) AND p.created_at >= date_trunc('month', NOW())
+    `, [artistIds, prevIds]);
+    retentionPct = Math.round((retained.c / prevIds.length) * 1000) / 10;
+  }
+
+  res.json({ streamsByMonth, topCountries, topCities, growthPct, retentionPct });
+}));
+
+// ---------- Catalogue consolidé (tous les artistes du Label) ----------
+app.get('/api/label/catalog', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ tracks: [], clips: [], scheduled: [] });
+  }
+  const tracks = await db.query(`
+    SELECT t.id, t.title, t.album, t.release_type, t.cover_url, t.streams, t.created_at,
+           u.artist_name
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.artist_id = ANY($1) AND t.published = 1
+    ORDER BY t.created_at DESC
+  `, [artistIds]);
+  const clips = await db.query(`
+    SELECT c.id, c.title, c.thumb_url, c.views, c.created_at, u.artist_name
+    FROM clips c JOIN users u ON u.id = c.artist_id
+    WHERE c.artist_id = ANY($1) AND c.published = 1
+    ORDER BY c.created_at DESC
+  `, [artistIds]);
+  const scheduled = await db.query(`
+    SELECT t.id, t.title, t.album, t.release_type, t.cover_url, t.scheduled_release_at, u.artist_name
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.artist_id = ANY($1) AND t.published = 0 AND t.scheduled_release_at IS NOT NULL
+    ORDER BY t.scheduled_release_at ASC
+  `, [artistIds]);
+  res.json({ tracks, clips, scheduled });
+}));
+
+// ---------- Équipe & rôles (Phase 4) ----------
+// PROPRIÉTAIRE (le compte de connexion du Label lui-même) > ADMIN > MANAGER > ASSISTANT.
+// ---------- Changer de palier — calcule le vrai prix (avec 25% de réduction si c'est le
+// tout premier changement), puis renvoie vers WhatsApp pour finaliser le paiement, comme le
+// reste des Pass NUNI. Le changement réel de palier est appliqué par l'admin une fois le
+// paiement confirmé (voir /api/admin/labels/:id/set-plan) — jamais avant, pour ne jamais
+// accorder plus de capacité (plus d'artistes) sans paiement vérifié. ----------
+app.post('/api/label/change-plan-request', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'owner');
+  if (!label) return;
+  const { newPlan } = req.body;
+  if (!['start', 'pro', 'premium', 'elite'].includes(newPlan)) {
+    return res.status(400).json({ error: 'Palier invalide.' });
+  }
+  if (newPlan === label.plan) return res.status(400).json({ error: 'Vous êtes déjà sur ce palier.' });
+  const settings = await getLabelPlanSettings();
+  const fullPrice = settings.prices[newPlan];
+  const discounted = !label.has_changed_plan_once;
+  const finalPrice = discounted ? Math.round(fullPrice * 0.75) : fullPrice;
+  const planLabels = { start: 'Label Start', pro: 'Label Pro', premium: 'Label Premium', elite: 'Label Elite' };
+  res.json({
+    fullPrice,
+    finalPrice,
+    discounted,
+    whatsapp: 'https://wa.me/242068951600',
+    whatsappMessage: `Bonjour NUNI, je souhaite passer ${label.label_name} au palier ${planLabels[newPlan]}` +
+      (discounted ? ` (${finalPrice.toLocaleString('fr-FR')} FCFA au lieu de ${fullPrice.toLocaleString('fr-FR')} FCFA — réduction de 25% pour mon premier changement de palier).` : ` (${finalPrice.toLocaleString('fr-FR')} FCFA).`),
+  });
+}));
+
+// ---------- Admin — applique réellement le changement de palier, une fois le paiement
+// confirmé (jamais automatique, comme tout paiement NUNI) ----------
+app.post('/api/admin/labels/:id/set-plan', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const label = await db.get('SELECT * FROM labels WHERE id = $1', [Number(req.params.id)]);
+  if (!label) return res.status(404).json({ error: 'Label introuvable.' });
+  const { newPlan } = req.body;
+  if (!['start', 'pro', 'premium', 'elite'].includes(newPlan)) {
+    return res.status(400).json({ error: 'Palier invalide.' });
+  }
+  const settings = await getLabelPlanSettings();
+  const newMax = settings.maxArtists[newPlan];
+  if (newMax !== null) {
+    const currentCount = (await db.get(
+      "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+    )).c;
+    if (currentCount > newMax) {
+      return res.status(400).json({ error: `Impossible : ce Label gère déjà ${currentCount} artiste(s), au-delà de la limite de ${newMax} du palier ${newPlan}.` });
+    }
+  }
+  await db.run(
+    'UPDATE labels SET plan = $1, has_changed_plan_once = TRUE WHERE id = $2',
+    [newPlan, label.id],
+  );
+  res.json({ message: `Palier changé pour ${newPlan}.` });
+}));
+
+app.get('/api/label/team', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT lt.id, lt.role, lt.status, lt.email, lt.created_at, u.first_name, u.last_name
+    FROM label_team_members lt LEFT JOIN users u ON u.id = lt.user_id
+    WHERE lt.label_id = $1 ORDER BY lt.created_at ASC
+  `, [label.id]);
+  const owner = await db.get('SELECT first_name, last_name, email FROM users WHERE id = $1', [label.user_id]);
+  res.json({ members: rows, owner, myRole: label.myRole });
+}));
+
+app.post('/api/label/team/invite', authMiddleware, rateLimit(15, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const { email, role } = req.body;
+  if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  if (!['admin', 'manager', 'assistant'].includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide (admin, manager ou assistant).' });
+  }
+  const invitedUser = await db.get('SELECT id FROM users WHERE email = $1', [email]);
+  if (!invitedUser) return res.status(404).json({ error: 'Aucun compte NUNI ne correspond à cet email — la personne doit d\'abord créer un compte NUNI.' });
+  if (invitedUser.id === label.user_id) return res.status(400).json({ error: 'Cette personne est déjà propriétaire du Label.' });
+  if (await db.get('SELECT id FROM label_team_members WHERE label_id = $1 AND user_id = $2', [label.id, invitedUser.id])) {
+    return res.status(400).json({ error: 'Cette personne fait déjà partie de votre équipe (ou en a déjà fait partie).' });
+  }
+  await db.run(
+    "INSERT INTO label_team_members (label_id, user_id, email, role, status) VALUES ($1,$2,$3,$4,'invited')",
+    [label.id, invitedUser.id, email, role],
+  );
+  await createNotification(invitedUser.id, 'label_team_invite', 'Invitation à rejoindre un Label', `${label.label_name} vous invite à rejoindre son équipe NUNI en tant que ${role}.`, null).catch(() => {});
+  res.status(201).json({ message: 'Invitation envoyée.' });
+}));
+
+app.delete('/api/label/team/:id', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const member = await db.get('SELECT id FROM label_team_members WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!member) return res.status(404).json({ error: 'Membre introuvable.' });
+  await db.run('DELETE FROM label_team_members WHERE id = $1', [member.id]);
+  res.json({ message: 'Membre retiré de l\'équipe.' });
+}));
+
+app.put('/api/label/team/:id/role', authMiddleware, h(async (req, res) => {
+  // Changer le rôle d'un membre est réservé au propriétaire — évite qu'un admin ne se
+  // promeuve lui-même ou ne rétrograde un autre admin par rivalité interne.
+  const label = await requireValidatedLabel(req, res, 'owner');
+  if (!label) return;
+  const { role } = req.body;
+  if (!['admin', 'manager', 'assistant'].includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide (admin, manager ou assistant).' });
+  }
+  const member = await db.get('SELECT id FROM label_team_members WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!member) return res.status(404).json({ error: 'Membre introuvable.' });
+  await db.run('UPDATE label_team_members SET role = $1 WHERE id = $2', [role, member.id]);
+  res.json({ message: 'Rôle mis à jour.' });
+}));
+
+// ---------- Côté UTILISATEUR : invitations d'équipe reçues ----------
+app.get('/api/me/label-team-invites', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT lt.id, lt.role, l.label_name, l.logo_url
+    FROM label_team_members lt JOIN labels l ON l.id = lt.label_id
+    WHERE lt.user_id = $1 AND lt.status = 'invited'
+  `, [req.user.id]);
+  res.json({ invites: rows });
+}));
+app.post('/api/me/label-team-invites/:id/accept', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id FROM label_team_members WHERE id = $1 AND user_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run("UPDATE label_team_members SET status = 'active' WHERE id = $1", [invite.id]);
+  res.json({ message: 'Invitation acceptée.' });
+}));
+app.post('/api/me/label-team-invites/:id/decline', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id FROM label_team_members WHERE id = $1 AND user_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run('DELETE FROM label_team_members WHERE id = $1', [invite.id]);
+  res.json({ message: 'Invitation refusée.' });
+}));
+
+// ---------- Côté ARTISTE : voir/accepter/refuser une invitation reçue d'un Label ----------
+app.get('/api/me/label-invites', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT la.id, l.label_name, l.logo_url
+    FROM label_artists la JOIN labels l ON l.id = la.label_id
+    WHERE la.artist_id = $1 AND la.status = 'invited'
+  `, [req.user.id]);
+  res.json({ invites: rows });
+}));
+app.post('/api/me/label-invites/:id/accept', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id, label_id FROM label_artists WHERE id = $1 AND artist_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run("UPDATE label_artists SET status = 'active' WHERE id = $1", [invite.id]);
+  const label = await db.get('SELECT * FROM labels WHERE id = $1', [invite.label_id]);
+  const artist = await db.get('SELECT artist_name FROM users WHERE id = $1', [req.user.id]);
+  if (label && artist) {
+    const newCount = (await db.get(
+      "SELECT COUNT(*)::int as c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+    )).c;
+    await notifyLabelArtistAdded(label, artist.artist_name, newCount);
+  }
+  res.json({ message: 'Invitation acceptée.' });
+}));
+app.post('/api/me/label-invites/:id/decline', authMiddleware, h(async (req, res) => {
+  const invite = await db.get(
+    "SELECT id FROM label_artists WHERE id = $1 AND artist_id = $2 AND status = 'invited'",
+    [Number(req.params.id), req.user.id],
+  );
+  if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
+  await db.run("UPDATE label_artists SET status = 'removed' WHERE id = $1", [invite.id]);
+  res.json({ message: 'Invitation refusée.' });
+}));
+
 app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
   const { name, desc, link, contact, duration } = req.body;
   if (!name || !link || !contact) {
@@ -641,24 +1505,15 @@ app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   const isTopListener = !!(monthlyRank && Number(monthlyRank.rnk) <= 10);
 
   const badges = [
-    { ic: '🕊️', n: 'Fan de la première heure', locked: false, d: 'Compte créé' },
-    { ic: '🎧', n: '100 titres découverts', locked: distinctTracks < 100, d: `${distinctTracks}/100` },
-    { ic: '🔥', n: `${user.streak_days || 0} jour(s) d'écoute d'affilée`, locked: (user.streak_days || 0) < 7, d: (user.streak_days || 0) >= 7 ? 'Débloqué' : 'Série en cours' },
-    { ic: '🌍', n: '5 genres explorés', locked: distinctGenres < 5, d: `${distinctGenres}/5` },
-    { ic: '💛', n: '10 artistes soutenus', locked: followedArtists < 10, d: `${followedArtists}/10` },
-    { ic: '🏆', n: 'Top auditeur du mois', locked: !isTopListener, d: isTopListener ? `Rang #${monthlyRank.rnk}` : 'Verrouillé' },
+    { icon: 'star', n: 'Fan de la première heure', locked: false, d: 'Compte créé' },
+    { icon: 'headphones', n: '100 titres découverts', locked: distinctTracks < 100, d: `${distinctTracks}/100` },
+    { icon: 'flame', n: `${user.streak_days || 0} jour(s) d'écoute d'affilée`, locked: (user.streak_days || 0) < 7, d: (user.streak_days || 0) >= 7 ? 'Débloqué' : 'Série en cours' },
+    { icon: 'globe', n: '5 genres explorés', locked: distinctGenres < 5, d: `${distinctGenres}/5` },
+    { icon: 'heart', n: '10 artistes soutenus', locked: followedArtists < 10, d: `${followedArtists}/10` },
+    { icon: 'trophy', n: 'Top auditeur du mois', locked: !isTopListener, d: isTopListener ? `Rang #${monthlyRank.rnk}` : 'Verrouillé' },
   ];
 
-  // Badges cosmétiques achetés dans la boutique NUNI Points — toujours débloqués une fois payés.
-  const owned = await db.query('SELECT item_key FROM shop_purchases WHERE user_id = $1', [user.id]);
-  const ownedSet = new Set(owned.map((o) => o.item_key));
-  SHOP_ITEMS.forEach((it) => {
-    if (ownedSet.has(it.key)) {
-      badges.push({ ic: it.name.split(' ')[0], n: it.name.replace(/^\S+\s/, ''), locked: false, d: 'Boutique' });
-    }
-  });
-
-  res.json({ ...levelInfoForXp(user.xp || 0), streak_days: user.streak_days || 0, nuni_points: (await db.get('SELECT nuni_points FROM users WHERE id = $1', [user.id])).nuni_points || 0, badges });
+  res.json({ ...levelInfoForXp(user.xp || 0), streak_days: user.streak_days || 0, badges });
 }));
 
 // ---------- Classement public (XP) — étape 5 gamification ----------
@@ -844,8 +1699,9 @@ app.get('/api/playlists/:id', h(async (req, res) => {
 }));
 
 function checkAdminKey(req, res) {
-  const adminKey = req.headers['x-admin-key'];
-  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+  const adminKey = (req.headers['x-admin-key'] || '').trim();
+  const expectedKey = (process.env.ADMIN_KEY || '').trim();
+  if (!expectedKey || adminKey !== expectedKey) {
     res.status(403).json({ error: 'Clé admin invalide.' });
     return false;
   }
@@ -996,9 +1852,23 @@ app.put('/api/artist/bio', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Biographie mise à jour.', bio: cleaned || null });
 }));
 
+// ---------- Artistes suivis par CET artiste — vraie suggestion pour les auditeurs de sa
+// page, basée sur qui il suit réellement (même mécanisme de suivi que tout le monde). ----------
+app.get('/api/artist/:id/follows', h(async (req, res) => {
+  const artistId = Number(req.params.id);
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, u.is_verified,
+      (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre
+    FROM follows f JOIN users u ON u.id = f.artist_id
+    WHERE f.follower_id = $1 AND u.account_type = 'artist' AND u.id != $1
+    ORDER BY f.created_at DESC LIMIT 12
+  `, [artistId]);
+  res.json({ artists: rows });
+}));
+
 app.get('/api/artist/:id/public-stats', h(async (req, res) => {
   const artistId = Number(req.params.id);
-  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio FROM users WHERE id = $1', [artistId]);
+  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio, about_gallery_urls FROM users WHERE id = $1', [artistId]);
   if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
   const followerCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artistId])).c;
   const trackCount = (await db.get('SELECT COUNT(*)::int as c FROM tracks WHERE artist_id = $1 AND published = 1', [artistId])).c;
@@ -1014,7 +1884,20 @@ app.get('/api/artist/:id/public-stats', h(async (req, res) => {
     follower_count: followerCount, track_count: trackCount,
     avatar_url: artist.avatar_url || null, banner_url: artist.banner_url || null,
     bio: artist.bio || null, monthly_listeners: monthlyListeners,
+    about_gallery_urls: artist.about_gallery_urls ? artist.about_gallery_urls.split(',').filter(Boolean) : [],
   });
+}));
+
+// ---------- L'artiste gère sa propre galerie "À propos" (jusqu'à 5 photos) ----------
+app.put('/api/artist/about-gallery', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const { images } = req.body; // tableau de data-URI (nouvelle photo) ou d'URL déjà en ligne (inchangée), max 5
+  if (!Array.isArray(images) || images.length > 5) {
+    return res.status(400).json({ error: 'Maximum 5 photos.' });
+  }
+  const finalUrls = await Promise.all(images.filter(Boolean).map((img) => uploadIfDataUri(img, 'image')));
+  await db.run('UPDATE users SET about_gallery_urls = $1 WHERE id = $2', [finalUrls.join(','), req.user.id]);
+  res.json({ gallery: finalUrls });
 }));
 
 // "Mur des fans" — avant : 7 initiales codées en dur ("MK","PJ","TN"...), identiques pour
@@ -1188,7 +2071,7 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const {
     title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt,
-    composer, featuring, studio, description, releaseDate,
+    composer, featuring, studio, description, releaseDate, credits,
   } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
@@ -1201,17 +2084,26 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   const inserted = await db.get(`
     INSERT INTO tracks (
       artist_id, title, album, genre, release_type, cover_url, audio_url, lyrics, scheduled_release_at, published,
-      composer, featuring, studio, description, release_date
+      composer, featuring, studio, description, release_date, credits
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     RETURNING id
   `, [
     req.user.id, title, album || null, genre || null, releaseType || 'Single',
     finalCoverUrl || null, finalAudioUrl || null, lyrics || null,
     scheduledReleaseAt || null, isFuture ? 0 : 1,
-    composer || null, featuring || null, studio || null, description || null, releaseDate || null,
+    composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
   ]);
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
+  if (!isFuture) {
+    // Notification "nouvelle sortie" pour le Label — jamais bloquante pour la réponse déjà envoyée.
+    db.get(
+      "SELECT l.user_id, l.label_name, u.artist_name FROM label_artists la JOIN labels l ON l.id = la.label_id JOIN users u ON u.id = la.artist_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
+      [req.user.id],
+    ).then((row) => {
+      if (row) createNotification(row.user_id, 'label_new_release', 'Nouvelle sortie', `${row.artist_name} vient de publier « ${title} » sur NUNI.`, null).catch(() => {});
+    }).catch(() => {});
+  }
 }));
 
 app.post('/api/clips', authMiddleware, h(async (req, res) => {
@@ -1247,7 +2139,8 @@ app.get('/api/tracks', h(async (req, res) => {
   const rows = await db.query(`
     SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url, t.lyrics,
            t.streams, t.likes, t.created_at, u.id as artist_id, u.artist_name, u.is_verified,
-           t.composer, t.featuring, t.studio, t.description, t.release_date
+           u.avatar_url as artist_avatar_url,
+           t.composer, t.featuring, t.studio, t.description, t.release_date, t.credits
     FROM tracks t JOIN users u ON u.id = t.artist_id
     WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= NOW())
     ORDER BY t.created_at DESC
@@ -1323,7 +2216,6 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   )).c;
   if (todayPlaysCount <= DAILY_PLAY_REWARD_CAP) {
     await addXp(listenerId, 5);
-    await addPoints(listenerId, 1);
     await bumpChallenge(listenerId, 'daily_listen_3', 1);
     await bumpChallenge(listenerId, 'weekly_listen_15', 1);
   }
@@ -1630,6 +2522,19 @@ app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
 // automatiquement chaque semaine — via un hash basé sur la semaine calendaire, pas de
 // tâche planifiée nécessaire : la même semaine donne le même ordre pour tout le monde,
 // et l'ordre change tout seul dès qu'on passe à la fenêtre suivante.
+// ---------- Artistes suivis par un artiste donné (vraie table follows) ----------
+// Utilisé sur la page album : "les artistes que [cet artiste] suit" — jamais une
+// recommandation générique, uniquement ce que l'artiste suit réellement lui-même.
+app.get('/api/artist/:id/follows', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, u.is_verified
+    FROM follows f JOIN users u ON u.id = f.artist_id
+    WHERE f.follower_id = $1 AND u.account_type = 'artist'
+    ORDER BY f.created_at DESC LIMIT 10
+  `, [req.params.id]);
+  res.json({ artists: rows });
+}));
+
 app.get('/api/artists/featured', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
@@ -1901,6 +2806,194 @@ app.get('/api/clips', h(async (req, res) => {
   res.json({ clips: rows });
 }));
 
+// ================= CONCERTS (Phase 2) =================
+// Publication directe par l'artiste, aucune validation admin nécessaire — dès qu'il publie,
+// le concert apparaît dans l'onglet Concerts de la recherche (voir GET /api/concerts).
+
+// ---------- Publique — tous les concerts à venir, pour la page Concerts de la recherche ----------
+app.get('/api/concerts', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT co.*, u.artist_name, u.avatar_url as artist_avatar_url, u.is_verified
+    FROM concerts co JOIN users u ON u.id = co.artist_id
+    WHERE co.event_date >= CURRENT_DATE
+    ORDER BY co.event_date ASC
+  `);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Publique — concerts à venir d'un artiste précis (page profil artiste) ----------
+app.get('/api/artists/:id/concerts', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT * FROM concerts WHERE artist_id = $1 AND event_date >= CURRENT_DATE ORDER BY event_date ASC
+  `, [Number(req.params.id)]);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Gestion — les concerts de l'artiste connecté (Dashboard), passés et à venir ----------
+app.get('/api/dashboard/concerts', authMiddleware, h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes artiste.' });
+  const rows = await db.query('SELECT * FROM concerts WHERE artist_id = $1 ORDER BY event_date DESC', [req.user.id]);
+  res.json({ concerts: rows });
+}));
+
+// ---------- Créer un concert ----------
+app.post('/api/dashboard/concerts', authMiddleware, rateLimit(10, 60000), h(async (req, res) => {
+  const user = await db.get('SELECT account_type FROM users WHERE id = $1', [req.user.id]);
+  if (!user || user.account_type !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes artiste.' });
+  const {
+    title, description, flyerUrl, eventDate, startTime, endTime, city, country, venue, address,
+    gpsLat, gpsLng, ticketPrice, ticketType, capacity, placesRestantes, purchaseLink, tourName,
+    eventType, ticketPriceVip, ticketPriceStandard, purchaseLocations, purchasePhoneNumbers,
+  } = req.body;
+  if (!title || !eventDate || !city || !country) {
+    return res.status(400).json({ error: 'Titre, date, ville et pays sont obligatoires.' });
+  }
+  const row = await db.get(
+    `INSERT INTO concerts (
+      artist_id, title, description, flyer_url, event_date, start_time, end_time, city, country,
+      venue, address, gps_lat, gps_lng, ticket_price, ticket_type, capacity, places_restantes,
+      purchase_link, tour_name, event_type, ticket_price_vip, ticket_price_standard,
+      purchase_locations, purchase_phone_numbers
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
+    [
+      req.user.id, title, description || null, flyerUrl || null, eventDate, startTime || null, endTime || null,
+      city, country, venue || null, address || null, gpsLat || null, gpsLng || null,
+      ticketPrice || null, ticketType || null, capacity || null, placesRestantes || capacity || null,
+      purchaseLink || null, tourName || null, eventType === 'showcase' ? 'showcase' : 'concert',
+      ticketPriceVip || null, ticketPriceStandard || null, purchaseLocations || null, purchasePhoneNumbers || null,
+    ],
+  );
+  res.json({ concert: row, message: 'Publié — visible immédiatement dans la recherche.' });
+}));
+
+// ---------- Modifier (ex: mettre à jour les places restantes) ----------
+app.put('/api/dashboard/concerts/:id', authMiddleware, h(async (req, res) => {
+  const concert = await db.get('SELECT id FROM concerts WHERE id = $1 AND artist_id = $2', [Number(req.params.id), req.user.id]);
+  if (!concert) return res.status(404).json({ error: 'Concert introuvable.' });
+  const { placesRestantes } = req.body;
+  if (typeof placesRestantes === 'number') {
+    await db.run('UPDATE concerts SET places_restantes = $1 WHERE id = $2', [placesRestantes, concert.id]);
+  }
+  res.json({ message: 'Concert mis à jour.' });
+}));
+
+// ---------- Supprimer ----------
+app.delete('/api/dashboard/concerts/:id', authMiddleware, h(async (req, res) => {
+  const concert = await db.get('SELECT id FROM concerts WHERE id = $1 AND artist_id = $2', [Number(req.params.id), req.user.id]);
+  if (!concert) return res.status(404).json({ error: 'Concert introuvable.' });
+  await db.run('DELETE FROM concerts WHERE id = $1', [concert.id]);
+  res.json({ message: 'Concert supprimé.' });
+}));
+
+// ================= NUNI ÉVÉNEMENTS (Phase 3) =================
+// Entièrement administrés par NUNI — aucun artiste ne peut y publier, uniquement l'équipe
+// admin via admin.html (protégé par x-admin-key, même mécanisme que le reste de l'admin).
+
+// ---------- Publique — pour la page NUNI Événements de la recherche ----------
+app.get('/api/nuni-events', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT * FROM nuni_events WHERE event_date >= CURRENT_DATE ORDER BY event_date ASC
+  `);
+  res.json({ events: rows });
+}));
+
+// ---------- Admin — liste complète (passés compris, pour la gestion) ----------
+app.get('/api/admin/nuni-events', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query('SELECT * FROM nuni_events ORDER BY event_date DESC');
+  res.json({ events: rows });
+}));
+
+// ---------- Admin — créer ----------
+app.post('/api/admin/nuni-events', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const {
+    category, title, description, flyerUrl, eventDate, startTime, venue, address,
+    gpsLat, gpsLng, price, purchaseLink, capacity, placesRestantes, galleryUrls, promoVideoUrl,
+    purchaseLocations, purchasePhoneNumbers, featuredArtistNames,
+  } = req.body;
+  if (!category || !title || !eventDate) {
+    return res.status(400).json({ error: 'Catégorie, titre et date sont obligatoires.' });
+  }
+  const row = await db.get(
+    `INSERT INTO nuni_events (
+      category, title, description, flyer_url, event_date, start_time, venue, address,
+      gps_lat, gps_lng, price, purchase_link, capacity, places_restantes, gallery_urls, promo_video_url,
+      purchase_locations, purchase_phone_numbers, featured_artist_names
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+    [
+      category, title, description || null, flyerUrl || null, eventDate, startTime || null, venue || null, address || null,
+      gpsLat || null, gpsLng || null, price || null, purchaseLink || null, capacity || null,
+      placesRestantes || capacity || null, galleryUrls || null, promoVideoUrl || null,
+      purchaseLocations || null, purchasePhoneNumbers || null, featuredArtistNames || null,
+    ],
+  );
+  res.json({ event: row, message: 'Événement publié — visible immédiatement dans la recherche.' });
+}));
+
+// ---------- Admin — modifier (ex: ajouter points de vente/numéros après coup) ----------
+app.put('/api/admin/nuni-events/:id', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const event = await db.get('SELECT id FROM nuni_events WHERE id = $1', [Number(req.params.id)]);
+  if (!event) return res.status(404).json({ error: 'Événement introuvable.' });
+  const { purchaseLocations, purchasePhoneNumbers, purchaseLink, placesRestantes, featuredArtistNames } = req.body;
+  await db.run(
+    `UPDATE nuni_events SET
+      purchase_locations = COALESCE($1, purchase_locations),
+      purchase_phone_numbers = COALESCE($2, purchase_phone_numbers),
+      purchase_link = COALESCE($3, purchase_link),
+      places_restantes = COALESCE($4, places_restantes),
+      featured_artist_names = COALESCE($5, featured_artist_names)
+     WHERE id = $6`,
+    [purchaseLocations || null, purchasePhoneNumbers || null, purchaseLink || null, placesRestantes ?? null, featuredArtistNames || null, event.id],
+  );
+  res.json({ message: 'Événement mis à jour.' });
+}));
+
+// ---------- Admin — supprimer ----------
+app.delete('/api/admin/nuni-events/:id', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const event = await db.get('SELECT id FROM nuni_events WHERE id = $1', [Number(req.params.id)]);
+  if (!event) return res.status(404).json({ error: 'Événement introuvable.' });
+  await db.run('DELETE FROM nuni_events WHERE id = $1', [event.id]);
+  res.json({ message: 'Événement supprimé.' });
+}));
+
+// ---------- Informations officielles NUNI (locaux, service client) ----------
+// Affichées à la place d'un lien d'achat pour les événements NUNI Événements qui n'en ont
+// pas — contrairement aux concerts d'artistes, un événement NUNI appartient à la plateforme
+// elle-même, donc ce sont les vraies coordonnées NUNI qui ont du sens ici, pas "bientôt
+// disponible". Stocké dans app_settings, même mécanisme que les taux de reversement.
+const NUNI_INFO_KEYS = ['nuni_info_locations', 'nuni_info_phone', 'nuni_info_email'];
+app.get('/api/nuni-info', h(async (req, res) => {
+  const rows = await db.query('SELECT key, value FROM app_settings WHERE key = ANY($1)', [NUNI_INFO_KEYS]);
+  const map = {};
+  rows.forEach((r) => { map[r.key] = r.value; });
+  res.json({
+    locations: map.nuni_info_locations || null,
+    phone: map.nuni_info_phone || null,
+    email: map.nuni_info_email || null,
+  });
+}));
+app.post('/api/admin/nuni-info', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { locations, phone, email } = req.body;
+  const pairs = [
+    ['nuni_info_locations', locations || ''],
+    ['nuni_info_phone', phone || ''],
+    ['nuni_info_email', email || ''],
+  ];
+  for (const [key, value] of pairs) {
+    await db.run(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value],
+    );
+  }
+  res.json({ message: 'Informations NUNI enregistrées.' });
+}));
+
 app.post('/api/clips/:id/view', h(async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = await db.get('SELECT id, artist_id, views FROM clips WHERE id = $1', [clipId]);
@@ -2097,6 +3190,14 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
     user: artist, amountFcfa: p.amount_due_fcfa, streamsCovered: p.current_period_streams,
     periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
   }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
+
+  // Notification "paiement reçu" pour le Label, si cet artiste lui est affilié.
+  db.get(
+    "SELECT l.user_id, l.label_name FROM label_artists la JOIN labels l ON l.id = la.label_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
+    [artistId],
+  ).then((row) => {
+    if (row) createNotification(row.user_id, 'label_payment_received', 'Paiement reçu', `${artist.artist_name || artist.first_name} a reçu un versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA.`, null).catch(() => {});
+  }).catch(() => {});
 
   res.json({ message: `Versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA enregistré pour ${artist.artist_name || artist.first_name}.`, payment_id: inserted.id });
 }));

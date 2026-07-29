@@ -35,7 +35,7 @@ async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist')),
+      account_type TEXT NOT NULL CHECK(account_type IN ('consumer','artist','label')),
       first_name TEXT NOT NULL,
       last_name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
@@ -48,7 +48,7 @@ async function initSchema() {
       artist_name TEXT,
       label_or_manager TEXT,
       is_verified INTEGER DEFAULT 0,
-      plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist')),
+      plan TEXT DEFAULT 'discovery' CHECK(plan IN ('discovery','consumer','artist','label')),
       subscription_status TEXT DEFAULT 'inactive' CHECK(subscription_status IN ('inactive','pending','active','expired')),
       subscription_started_at TIMESTAMPTZ,
       subscription_expires_at TIMESTAMPTZ,
@@ -84,6 +84,122 @@ async function initSchema() {
       published INTEGER DEFAULT 1,
       views INTEGER DEFAULT 0,
       likes INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ---------- Concerts (Phase 2) — publiés directement par l'artiste, aucune validation
+    -- admin nécessaire. tour_name regroupe plusieurs dates d'une même tournée pour l'affichage
+    -- en timeline côté recherche. places_restantes est saisi/mis à jour manuellement par
+    -- l'artiste (pas de vraie billetterie intégrée à NUNI pour l'instant — honnête plutôt que
+    -- de prétendre suivre les ventes en temps réel). purchase_link pointe vers le canal réel
+    -- de vente (WhatsApp, plateforme de billetterie externe...).
+    CREATE TABLE IF NOT EXISTS concerts (
+      id SERIAL PRIMARY KEY,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      description TEXT,
+      flyer_url TEXT,
+      event_date DATE NOT NULL,
+      start_time TEXT,
+      end_time TEXT,
+      city TEXT NOT NULL,
+      country TEXT NOT NULL,
+      venue TEXT,
+      address TEXT,
+      gps_lat DOUBLE PRECISION,
+      gps_lng DOUBLE PRECISION,
+      ticket_price TEXT,
+      ticket_type TEXT,
+      capacity INTEGER,
+      places_restantes INTEGER,
+      purchase_link TEXT,
+      tour_name TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ---------- NUNI Événements (préparée pour la Phase 3) — gérés uniquement depuis
+    -- l'admin, jamais par un artiste. Table créée dès maintenant pour éviter une migration
+    -- séparée plus tard ; aucune route ne l'utilise encore.
+    CREATE TABLE IF NOT EXISTS nuni_events (
+      id SERIAL PRIMARY KEY,
+      category TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      flyer_url TEXT,
+      event_date DATE NOT NULL,
+      start_time TEXT,
+      venue TEXT,
+      address TEXT,
+      gps_lat DOUBLE PRECISION,
+      gps_lng DOUBLE PRECISION,
+      price TEXT,
+      purchase_link TEXT,
+      capacity INTEGER,
+      places_restantes INTEGER,
+      gallery_urls TEXT,
+      promo_video_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ============ PASS LABEL (Phase 1) ============
+    -- Un Label a son propre compte de connexion (une ligne dans users, account_type='label')
+    -- mais ses informations spécifiques (légales, logo, vérification...) vivent ici plutôt
+    -- que de polluer la table users — même logique que artist_name/label_or_manager qui, eux,
+    -- restent sur users car légers et communs à tous les comptes.
+    CREATE TABLE IF NOT EXISTS labels (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+      label_name TEXT NOT NULL,
+      logo_url TEXT,
+      legal_name TEXT,
+      country TEXT,
+      city TEXT,
+      address TEXT,
+      professional_phone TEXT,
+      professional_email TEXT,
+      website TEXT,
+      tax_id TEXT,
+      description TEXT,
+      social_links TEXT,
+      responsible_name TEXT,
+      responsible_id_doc_url TEXT,
+      label_doc_url TEXT,
+      plan TEXT NOT NULL DEFAULT 'start' CHECK(plan IN ('start','pro','premium','elite')),
+      -- 'pending' = vient de s'inscrire, en file d'attente. 'verification' = en cours
+      -- d'examen par l'équipe. 'validated' = actif. 'refused' = refusé (avec raison).
+      verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending','verification','validated','refused','suspended')),
+      refusal_reason TEXT,
+      -- Le Pass Label expire 1 an après validation, quel que soit le palier — fixé au
+      -- moment de l'approbation admin (voir POST /api/admin/labels/:id/approve).
+      subscription_expires_at TIMESTAMPTZ,
+      -- true dès que le Label a changé de palier une première fois — la réduction de 25%
+      -- ne s'applique qu'à ce tout premier changement, jamais aux suivants.
+      has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      validated_at TIMESTAMPTZ
+    );
+
+    -- ---------- Artistes gérés par un Label ----------
+    -- IMPORTANT : un compte artiste reste 100% autonome et fonctionnel même sans Label — ceci
+    -- est une AFFILIATION optionnelle, jamais une dépendance. Rien dans le flux de publication
+    -- existant (tracks/clips/concerts, tous rattachés à artist_id) n'est modifié par cette table.
+    CREATE TABLE IF NOT EXISTS label_artists (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('invited','active','suspended','removed')),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(label_id, artist_id)
+    );
+
+    -- ---------- Équipe / rôles du Label ----------
+    CREATE TABLE IF NOT EXISTS label_team_members (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      email TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'assistant' CHECK(role IN ('owner','admin','manager','assistant')),
+      status TEXT NOT NULL DEFAULT 'invited' CHECK(status IN ('invited','active')),
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
@@ -162,6 +278,21 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS lyrics TEXT;`);
 
+  // ---------- Concerts — type d'événement, tarifs par catégorie de ticket, et infos d'achat
+  // enrichies (au-delà d'un simple lien : lieux physiques où se procurer un ticket, et/ou
+  // numéros de téléphone à contacter) ----------
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS event_type TEXT DEFAULT 'concert';`); // 'concert' ou 'showcase'
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS ticket_price_vip TEXT;`);
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS ticket_price_standard TEXT;`);
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`); // lieux physiques, texte libre
+  await pool.query(`ALTER TABLE concerts ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`); // numéros séparés par une virgule
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_locations TEXT;`);
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS purchase_phone_numbers TEXT;`);
+  // Artistes participants — noms séparés par une virgule (pas d'ID rigide, cohérent avec le
+  // reste de l'app où les correspondances se font par nom, ex. le genre musical par artiste).
+  // Sert à afficher "Événements auxquels il participe" sur la page profil de chaque artiste.
+  await pool.query(`ALTER TABLE nuni_events ADD COLUMN IF NOT EXISTS featured_artist_names TEXT;`);
+
   // ---------- État réel du compte (distinct du Pass/abonnement) ----------
   // subscription_status = état du Pass payant (inactive/pending/active/expired).
   // account_status = état du COMPTE lui-même, décidé par l'admin :
@@ -171,7 +302,39 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active';`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS momo_number TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;`);
+  await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
+  // Galerie "À propos" de l'artiste — jusqu'à 5 photos, gérées depuis son Dashboard,
+  // affichées dans l'interface "À propos" façon Spotify (carrousel + biographie complète).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS about_gallery_urls TEXT;`);
+  // Répare les comptes artiste déjà créés par un Label avant le correctif ci-dessus (colonne
+  // plan jamais renseignée, retombée sur 'discovery' par défaut → faux compte à rebours de
+  // ~100 ans affiché). Ciblé précisément : uniquement les artistes déjà affiliés à un Label,
+  // encore sur 'discovery', avec une échéance clairement anormale (>5 ans) — jamais touché
+  // aux vrais comptes Découverte en cours (échéance normale de 24h).
+  await pool.query(`
+    UPDATE users SET plan = 'artist'
+    WHERE account_type = 'artist' AND plan = 'discovery'
+      AND subscription_expires_at > NOW() + INTERVAL '5 years'
+      AND id IN (SELECT artist_id FROM label_artists);
+  `);
+  // ---------- Pass Label — migration de la contrainte account_type ----------
+  // Le CREATE TABLE plus haut ne s'exécute qu'une fois (IF NOT EXISTS) — sur une base déjà
+  // créée avant l'ajout du Pass Label, la contrainte doit être élargie explicitement.
+  // DROP puis ADD à chaque démarrage est volontairement inconditionnel : ça reste sans danger
+  // et idempotent (le nom de contrainte suit la convention Postgres par défaut pour un CHECK
+  // inline sur une colonne), contrairement à un ADD seul qui échouerait au 2e redémarrage.
+  await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_type_check;`);
+  await pool.query(`ALTER TABLE users ADD CONSTRAINT users_account_type_check CHECK (account_type IN ('consumer','artist','label'));`);
+  await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_plan_check;`);
+  await pool.query(`ALTER TABLE users ADD CONSTRAINT users_plan_check CHECK (plan IN ('discovery','consumer','artist','label'));`);
+  // Répare les comptes Label déjà créés avant ce correctif : leur colonne "plan" n'était
+  // jamais renseignée à l'inscription, retombée sur 'discovery' par défaut — c'est ce qui
+  // les faisait atterrir sur la page des tarifs après connexion au lieu de leur Dashboard.
+  await pool.query(`UPDATE users SET plan = 'label' WHERE account_type = 'label' AND plan = 'discovery';`);
+  await pool.query(`ALTER TABLE labels DROP CONSTRAINT IF EXISTS labels_verification_status_check;`);
+  await pool.query(`ALTER TABLE labels ADD CONSTRAINT labels_verification_status_check CHECK (verification_status IN ('pending','verification','validated','refused','suspended'));`);
   await pool.query(`UPDATE users SET account_status = 'active' WHERE account_status IS NULL;`);
 
   // ---------- Réinitialisation de mot de passe (code temporaire par email) ----------
@@ -190,6 +353,32 @@ async function initSchema() {
   // champ texte, rempli par l'artiste lui-même depuis son tableau de bord (voir
   // PUT /api/artist/bio dans server.js).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS has_seen_artist_contract INTEGER DEFAULT 0;`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payment_history (
+      id SERIAL PRIMARY KEY,
+      artist_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      amount_fcfa INTEGER NOT NULL,
+      streams_covered INTEGER NOT NULL,
+      period_start TIMESTAMPTZ,
+      period_end TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      method TEXT DEFAULT 'Manuel',
+      reference TEXT,
+      note TEXT,
+      admin_key_used TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_history_artist ON payment_history(artist_id);`);
+
+  // ---------- Codes promo attribués personnellement à un utilisateur ----------
+  // Avant : un code promo était forcément partagé (comme NUNI30, "les 100 premiers
+  // inscrits"). Ici : un code peut être réservé à UNE seule personne — l'admin le crée pour
+  // récompenser un consommateur actif dans les défis quotidiens, ou un artiste. Si cette
+  // colonne est vide, le code reste un code partagé classique (comportement inchangé).
+  await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS assigned_to_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;`);
+  await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS note TEXT;`);
 
   // ---------- Progression réelle (XP, niveaux, série d'écoute) ----------
   // Fondation du système de gamification demandé : plus de badges/niveaux inventés,
@@ -208,6 +397,10 @@ async function initSchema() {
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS composer TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS featuring TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS studio TEXT;`);
+  // Crédits / label — la mention type "℗ 2026 Nom du label" que l'artiste saisit lui-même
+  // avant de publier, affichée en bas de la page album à côté du nombre de titres et de la
+  // durée totale (calculés automatiquement, jamais saisis à la main).
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS credits TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS description TEXT;`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS release_date TIMESTAMPTZ;`);
 
@@ -276,6 +469,21 @@ async function initSchema() {
       item_key TEXT NOT NULL,
       purchased_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(user_id, item_key)
+    );
+  `);
+
+  // ---------- Cosmétiques équipés — personnalisation du profil (barre du haut) ----------
+  // Un seul objet équipé par catégorie (couronne, casque, micro, cadre, badge, effet) —
+  // garanti par la contrainte UNIQUE(user_id, category) + UPSERT atomique dans la route
+  // d'équipement (même pattern que le reste : pas de check-then-write).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_equipped_cosmetics (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      category TEXT NOT NULL,
+      item_key TEXT NOT NULL,
+      equipped_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, category)
     );
   `);
 
