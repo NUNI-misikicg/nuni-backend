@@ -1077,40 +1077,72 @@ app.get('/api/stats/geo', h(async (req, res) => {
     .sort((a, b) => b.plays - a.plays)
     .slice(0, 10);
 
-  // ---- Vraie tendance : écoutes des 7 derniers jours vs les 7 jours précédents, par pays.
-  // Jamais un pourcentage inventé — s'il n'y a aucune écoute sur la période précédente, la
-  // tendance est marquée "nouveau" plutôt que d'afficher un +∞% absurde.
-  const last7 = await db.query(`
-    SELECT u.country, COUNT(*)::int as plays
-    FROM plays p JOIN users u ON u.id = p.listener_id
-    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '7 days'
-    GROUP BY u.country
-  `);
-  const prev7 = await db.query(`
-    SELECT u.country, COUNT(*)::int as plays
-    FROM plays p JOIN users u ON u.id = p.listener_id
-    WHERE u.country IS NOT NULL AND u.country != ''
-      AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days'
-    GROUP BY u.country
-  `);
-  const prevMap = {};
-  prev7.forEach((r) => { prevMap[r.country] = r.plays; });
-  const lastMap = {};
-  last7.forEach((r) => { lastMap[r.country] = r.plays; });
-  const trends = {};
-  topCountries.forEach((c) => {
-    const now = lastMap[c.country] || 0;
-    const before = prevMap[c.country] || 0;
-    if (before === 0) { trends[c.country] = now > 0 ? { direction: 'new' } : { direction: 'flat', pct: 0 }; }
-    else {
+  // ---- Vraies tendances : écoutes des 7 derniers jours vs les 7 jours précédents.
+  // Jamais un pourcentage inventé — et surtout, jamais un pourcentage TROMPEUR : avec très
+  // peu de données (ex: 1 écoute avant, 19 après), un calcul brut donnerait des variations
+  // énormes et illisibles. En dessous d'un seuil minimum sur les deux périodes, la tendance
+  // est marquée "pas assez de recul" plutôt qu'un chiffre qui donne une fausse impression de
+  // précision statistique.
+  const MIN_SAMPLE_FOR_TREND = 5;
+  function computeTrends(lastRows, prevRows, key) {
+    const prevMap = {}; prevRows.forEach((r) => { prevMap[r[key]] = r.plays; });
+    const lastMap = {}; lastRows.forEach((r) => { lastMap[r[key]] = r.plays; });
+    const trends = {};
+    new Set([...lastRows.map((r) => r[key]), ...prevRows.map((r) => r[key])]).forEach((k) => {
+      const now = lastMap[k] || 0;
+      const before = prevMap[k] || 0;
+      if (before === 0 && now === 0) return;
+      if (before === 0) { trends[k] = { direction: 'new' }; return; }
+      if (before < MIN_SAMPLE_FOR_TREND && now < MIN_SAMPLE_FOR_TREND) { trends[k] = { direction: 'low_sample' }; return; }
       const pct = Math.round(((now - before) / before) * 100);
-      trends[c.country] = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
-    }
-  });
+      trends[k] = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
+    });
+    return trends;
+  }
+  const last7Countries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '7 days' GROUP BY u.country
+  `);
+  const prev7Countries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days' GROUP BY u.country
+  `);
+  const last7Cities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != '' AND p.created_at >= NOW() - INTERVAL '7 days' GROUP BY u.city
+  `);
+  const prev7Cities = await db.query(`
+    SELECT u.city, COUNT(*)::int as plays FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.city IS NOT NULL AND u.city != '' AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days' GROUP BY u.city
+  `);
+  const trends = computeTrends(last7Countries, prev7Countries, 'country');
+  const cityTrends = computeTrends(last7Cities, prev7Cities, 'city');
+  // Régions : recalculées à partir des mêmes lignes pays, regroupées — cohérent avec le
+  // regroupement du total ci-dessus, jamais une seconde source de vérité qui pourrait diverger.
+  function regionize(rows) {
+    const totals = {};
+    rows.forEach((r) => { const region = regionForCountry(r.country); totals[region] = (totals[region] || 0) + r.plays; });
+    return Object.entries(totals).map(([region, plays]) => ({ region, plays }));
+  }
+  const regionTrends = computeTrends(regionize(last7Countries), regionize(prev7Countries), 'region');
+
+  // ---- Tendance réelle du total de la plateforme : ce mois-ci vs le mois précédent.
+  const totalThisMonth = (await db.get(
+    "SELECT COUNT(*)::int as c FROM plays WHERE created_at >= date_trunc('month', NOW())",
+  )).c;
+  const totalLastMonth = (await db.get(
+    "SELECT COUNT(*)::int as c FROM plays WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') AND created_at < date_trunc('month', NOW())",
+  )).c;
+  let totalTrend = { direction: 'flat', pct: 0 };
+  if (totalLastMonth === 0) { totalTrend = totalThisMonth > 0 ? { direction: 'new' } : { direction: 'flat', pct: 0 }; }
+  else {
+    const pct = Math.round(((totalThisMonth - totalLastMonth) / totalLastMonth) * 100);
+    totalTrend = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
+  }
 
   const totalPlays = (await db.get('SELECT COUNT(*)::int as c FROM plays')).c;
   const totalCountries = allCountries.length;
-  res.json({ topCountries, topCities, topRegions, trends, totalPlays, totalCountries });
+  res.json({ topCountries, topCities, topRegions, trends, cityTrends, regionTrends, totalTrend, totalPlays, totalCountries });
 }));
 
 app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
