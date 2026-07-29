@@ -1046,6 +1046,41 @@ function regionForCountry(name) {
   return COUNTRY_TO_REGION[normalizeCountryKey(name)] || 'Autres régions';
 }
 
+// ---------- Récap personnel mensuel — vrais top artistes/morceaux, par vrai nombre
+// d'écoutes (pas de minutes : ni tracks ni plays ne stockent de durée aujourd'hui). ----------
+app.get('/api/me/recap', authMiddleware, h(async (req, res) => {
+  // Liste des mois où ce compte a réellement écouté quelque chose, du plus récent au plus ancien.
+  const months = await db.query(`
+    SELECT DISTINCT date_trunc('month', p.created_at) as month
+    FROM plays p WHERE p.listener_id = $1
+    ORDER BY month DESC LIMIT 12
+  `, [req.user.id]);
+  const requestedMonth = req.query.month; // format 'YYYY-MM-01', optionnel — sinon le plus récent
+  const targetMonth = requestedMonth || (months[0] ? months[0].month : null);
+  if (!targetMonth) { res.json({ months: [], totalPlays: 0, topArtists: [], topTracks: [] }); return; }
+
+  const totalPlays = (await db.get(`
+    SELECT COUNT(*)::int as c FROM plays p
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+  `, [req.user.id, targetMonth])).c;
+
+  const topArtists = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = t.artist_id
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+    GROUP BY u.id, u.artist_name, u.avatar_url ORDER BY plays DESC LIMIT 3
+  `, [req.user.id, targetMonth]);
+
+  const topTracks = await db.query(`
+    SELECT t.id, t.title, t.cover_url, u.artist_name, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id JOIN users u ON u.id = t.artist_id
+    WHERE p.listener_id = $1 AND date_trunc('month', p.created_at) = $2::timestamptz
+    GROUP BY t.id, t.title, t.cover_url, u.artist_name ORDER BY plays DESC LIMIT 5
+  `, [req.user.id, targetMonth]);
+
+  res.json({ months: months.map((m) => m.month), targetMonth, totalPlays, topArtists, topTracks });
+}));
+
 app.get('/api/stats/geo', h(async (req, res) => {
   const topCountries = await db.query(`
     SELECT u.country, COUNT(*)::int as plays
