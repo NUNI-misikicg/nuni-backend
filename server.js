@@ -2508,6 +2508,19 @@ app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
 // automatiquement chaque semaine — via un hash basé sur la semaine calendaire, pas de
 // tâche planifiée nécessaire : la même semaine donne le même ordre pour tout le monde,
 // et l'ordre change tout seul dès qu'on passe à la fenêtre suivante.
+// ---------- Artistes suivis par un artiste donné (vraie table follows) ----------
+// Utilisé sur la page album : "les artistes que [cet artiste] suit" — jamais une
+// recommandation générique, uniquement ce que l'artiste suit réellement lui-même.
+app.get('/api/artist/:id/follows', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, u.is_verified
+    FROM follows f JOIN users u ON u.id = f.artist_id
+    WHERE f.follower_id = $1 AND u.account_type = 'artist'
+    ORDER BY f.created_at DESC LIMIT 10
+  `, [req.params.id]);
+  res.json({ artists: rows });
+}));
+
 app.get('/api/artists/featured', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
