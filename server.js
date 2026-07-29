@@ -1007,24 +1007,110 @@ app.get('/api/label/payments', authMiddleware, h(async (req, res) => {
 // Basé sur le pays/ville renseigné par l'auditeur à son inscription, croisé avec ses vraies
 // écoutes (table plays) — même principe honnête que les analytics Label, mais sans filtre
 // sur un artiste ou un label précis : toute la plateforme.
+// Regroupement pays → région — volontairement centré sur les pays les plus probables pour
+// l'audience de NUNI (Afrique + diaspora). Un pays non reconnu tombe dans "Autres régions"
+// plutôt que d'être ignoré ou classé au hasard.
+const COUNTRY_TO_REGION = {
+  'congo':'Afrique centrale', 'republique du congo':'Afrique centrale', 'rdc':'Afrique centrale',
+  'republique democratique du congo':'Afrique centrale', 'rd congo':'Afrique centrale',
+  'gabon':'Afrique centrale', 'cameroun':'Afrique centrale', 'tchad':'Afrique centrale',
+  'centrafrique':'Afrique centrale', 'guinee equatoriale':'Afrique centrale', 'sao tome':'Afrique centrale',
+  'senegal':'Afrique de l\'Ouest', 'cote d\'ivoire':'Afrique de l\'Ouest', 'ivoire':'Afrique de l\'Ouest',
+  'mali':'Afrique de l\'Ouest', 'burkina faso':'Afrique de l\'Ouest', 'guinee':'Afrique de l\'Ouest',
+  'benin':'Afrique de l\'Ouest', 'togo':'Afrique de l\'Ouest', 'niger':'Afrique de l\'Ouest',
+  'nigeria':'Afrique de l\'Ouest', 'ghana':'Afrique de l\'Ouest', 'sierra leone':'Afrique de l\'Ouest',
+  'liberia':'Afrique de l\'Ouest', 'gambie':'Afrique de l\'Ouest', 'mauritanie':'Afrique de l\'Ouest',
+  'cap-vert':'Afrique de l\'Ouest', 'guinee-bissau':'Afrique de l\'Ouest',
+  'kenya':'Afrique de l\'Est', 'tanzanie':'Afrique de l\'Est', 'ouganda':'Afrique de l\'Est',
+  'ethiopie':'Afrique de l\'Est', 'rwanda':'Afrique de l\'Est', 'burundi':'Afrique de l\'Est',
+  'somalie':'Afrique de l\'Est', 'djibouti':'Afrique de l\'Est', 'soudan':'Afrique de l\'Est',
+  'afrique du sud':'Afrique australe', 'zimbabwe':'Afrique australe', 'zambie':'Afrique australe',
+  'namibie':'Afrique australe', 'botswana':'Afrique australe', 'mozambique':'Afrique australe',
+  'angola':'Afrique australe', 'malawi':'Afrique australe', 'lesotho':'Afrique australe', 'eswatini':'Afrique australe',
+  'maroc':'Afrique du Nord', 'algerie':'Afrique du Nord', 'tunisie':'Afrique du Nord',
+  'egypte':'Afrique du Nord', 'libye':'Afrique du Nord',
+  'france':'Europe', 'belgique':'Europe', 'allemagne':'Europe', 'royaume-uni':'Europe', 'angleterre':'Europe',
+  'suisse':'Europe', 'italie':'Europe', 'espagne':'Europe', 'portugal':'Europe', 'pays-bas':'Europe',
+  'suede':'Europe', 'norvege':'Europe',
+  'etats-unis':'Amérique du Nord', 'usa':'Amérique du Nord', 'canada':'Amérique du Nord', 'mexique':'Amérique du Nord',
+  'bresil':'Amérique du Sud', 'argentine':'Amérique du Sud',
+  'jamaique':'Caraïbes', 'haiti':'Caraïbes', 'cuba':'Caraïbes', 'republique dominicaine':'Caraïbes',
+  'chine':'Asie', 'inde':'Asie', 'japon':'Asie', 'coree du sud':'Asie', 'emirats arabes unis':'Moyen-Orient',
+  'arabie saoudite':'Moyen-Orient', 'liban':'Moyen-Orient', 'qatar':'Moyen-Orient',
+  'australie':'Océanie', 'nouvelle-zelande':'Océanie',
+};
+function normalizeCountryKey(name) {
+  return (name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+function regionForCountry(name) {
+  return COUNTRY_TO_REGION[normalizeCountryKey(name)] || 'Autres régions';
+}
+
 app.get('/api/stats/geo', h(async (req, res) => {
   const topCountries = await db.query(`
     SELECT u.country, COUNT(*)::int as plays
     FROM plays p JOIN users u ON u.id = p.listener_id
     WHERE u.country IS NOT NULL AND u.country != ''
-    GROUP BY u.country ORDER BY plays DESC LIMIT 8
+    GROUP BY u.country ORDER BY plays DESC LIMIT 10
   `);
   const topCities = await db.query(`
     SELECT u.city, u.country, COUNT(*)::int as plays
     FROM plays p JOIN users u ON u.id = p.listener_id
     WHERE u.city IS NOT NULL AND u.city != ''
-    GROUP BY u.city, u.country ORDER BY plays DESC LIMIT 8
+    GROUP BY u.city, u.country ORDER BY plays DESC LIMIT 10
   `);
+  // TOUS les pays (pas seulement le top 10) — nécessaire pour un vrai regroupement par
+  // région, sinon les petits pays d'une région seraient ignorés et fausseraient le total.
+  const allCountries = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != ''
+    GROUP BY u.country
+  `);
+  const regionTotals = {};
+  allCountries.forEach((c) => {
+    const region = regionForCountry(c.country);
+    regionTotals[region] = (regionTotals[region] || 0) + c.plays;
+  });
+  const topRegions = Object.entries(regionTotals)
+    .map(([region, plays]) => ({ region, plays }))
+    .sort((a, b) => b.plays - a.plays)
+    .slice(0, 10);
+
+  // ---- Vraie tendance : écoutes des 7 derniers jours vs les 7 jours précédents, par pays.
+  // Jamais un pourcentage inventé — s'il n'y a aucune écoute sur la période précédente, la
+  // tendance est marquée "nouveau" plutôt que d'afficher un +∞% absurde.
+  const last7 = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != '' AND p.created_at >= NOW() - INTERVAL '7 days'
+    GROUP BY u.country
+  `);
+  const prev7 = await db.query(`
+    SELECT u.country, COUNT(*)::int as plays
+    FROM plays p JOIN users u ON u.id = p.listener_id
+    WHERE u.country IS NOT NULL AND u.country != ''
+      AND p.created_at >= NOW() - INTERVAL '14 days' AND p.created_at < NOW() - INTERVAL '7 days'
+    GROUP BY u.country
+  `);
+  const prevMap = {};
+  prev7.forEach((r) => { prevMap[r.country] = r.plays; });
+  const lastMap = {};
+  last7.forEach((r) => { lastMap[r.country] = r.plays; });
+  const trends = {};
+  topCountries.forEach((c) => {
+    const now = lastMap[c.country] || 0;
+    const before = prevMap[c.country] || 0;
+    if (before === 0) { trends[c.country] = now > 0 ? { direction: 'new' } : { direction: 'flat', pct: 0 }; }
+    else {
+      const pct = Math.round(((now - before) / before) * 100);
+      trends[c.country] = { direction: pct > 3 ? 'up' : pct < -3 ? 'down' : 'flat', pct };
+    }
+  });
+
   const totalPlays = (await db.get('SELECT COUNT(*)::int as c FROM plays')).c;
-  const totalCountries = (await db.get(
-    "SELECT COUNT(DISTINCT u.country)::int as c FROM plays p JOIN users u ON u.id = p.listener_id WHERE u.country IS NOT NULL AND u.country != ''",
-  )).c;
-  res.json({ topCountries, topCities, totalPlays, totalCountries });
+  const totalCountries = allCountries.length;
+  res.json({ topCountries, topCities, topRegions, trends, totalPlays, totalCountries });
 }));
 
 app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
