@@ -1852,6 +1852,20 @@ app.put('/api/artist/bio', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Biographie mise à jour.', bio: cleaned || null });
 }));
 
+// ---------- Artistes suivis par CET artiste — vraie suggestion pour les auditeurs de sa
+// page, basée sur qui il suit réellement (même mécanisme de suivi que tout le monde). ----------
+app.get('/api/artist/:id/follows', h(async (req, res) => {
+  const artistId = Number(req.params.id);
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.avatar_url, u.is_verified,
+      (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre
+    FROM follows f JOIN users u ON u.id = f.artist_id
+    WHERE f.follower_id = $1 AND u.account_type = 'artist' AND u.id != $1
+    ORDER BY f.created_at DESC LIMIT 12
+  `, [artistId]);
+  res.json({ artists: rows });
+}));
+
 app.get('/api/artist/:id/public-stats', h(async (req, res) => {
   const artistId = Number(req.params.id);
   const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio, about_gallery_urls FROM users WHERE id = $1', [artistId]);
