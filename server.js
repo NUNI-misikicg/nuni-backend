@@ -10,7 +10,7 @@ const {
   initAuth, hashPassword, verifyPassword, needsRehash, signToken, verifyToken, generateAccessCode,
   generateResetCode, hashResetCode, authMiddleware,
 } = require('./auth');
-const { sendAccessCodeEmail, sendPasswordResetEmail } = require('./mailer');
+const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail } = require('./mailer');
 
 const app = express();
 // ---------- CORS restreint (durcissement sécurité) ----------
@@ -119,7 +119,7 @@ function basePriceFor(plan, durationDays) {
   return Math.round((ref / refDays) * durationDays);
 }
 
-async function resolvePromoDiscount(code, plan) {
+async function resolvePromoDiscount(code, plan, userId) {
   if (!code) return { pct: 0, valid: true, code: null };
   const promo = await db.get('SELECT * FROM promo_codes WHERE code = $1', [String(code).toUpperCase().trim()]);
   if (!promo) return { pct: 0, valid: false, error: 'Code promo introuvable.' };
@@ -127,6 +127,11 @@ async function resolvePromoDiscount(code, plan) {
   if (promo.expires_at && new Date(promo.expires_at) < new Date()) return { pct: 0, valid: false, error: 'Code promo expiré.' };
   if (promo.used_count >= promo.max_uses) return { pct: 0, valid: false, error: "Ce code a atteint sa limite d'utilisation." };
   if (promo.applies_to_plan && promo.applies_to_plan !== plan) return { pct: 0, valid: false, error: "Ce code ne s'applique pas à ce Pass." };
+  // Code personnel : réservé à un seul compte, personne d'autre ne peut l'utiliser même en
+  // le devinant ou en le voyant passer quelque part.
+  if (promo.assigned_to_user_id && promo.assigned_to_user_id !== userId) {
+    return { pct: 0, valid: false, error: 'Ce code est réservé à un autre compte.' };
+  }
   return { pct: promo.discount_pct, valid: true, code: promo.code };
 }
 
@@ -378,7 +383,7 @@ app.post('/api/me/challenges/:key/claim', authMiddleware, rateLimit(15, 60000), 
 
 // ================= AUTH =================
 
-app.post('/api/register', h(async (req, res) => {
+app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
     age, address, city, country, artistName, labelOrManager,
@@ -428,7 +433,7 @@ app.post('/api/register', h(async (req, res) => {
 // (subscription_expires_at réel, vérifié par enforceSubscriptionExpiry comme n'importe quel
 // autre Pass). Après expiration, 2h de grâce pour valider un vrai Pass (voir
 // enforceDiscoveryDeletion plus bas) avant suppression complète et définitive du compte.
-app.post('/api/register-discovery', h(async (req, res) => {
+app.post('/api/register-discovery', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
     age, address, city, country, artistName, labelOrManager,
@@ -475,7 +480,7 @@ app.post('/api/register-discovery', h(async (req, res) => {
 // n'est pas confirmé exact. Ce n'est qu'APRÈS un mot de passe correct qu'on vérifie si le
 // compte est suspendu/supprimé — sinon on donnerait à n'importe qui un moyen de deviner
 // quels emails ont un compte suspendu, juste en essayant de se connecter avec.
-app.post('/api/login', h(async (req, res) => {
+app.post('/api/login', rateLimit(10, 15 * 60000), h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const { email, password } = req.body;
   const user = await db.get('SELECT * FROM users WHERE email = $1', [email || '']);
@@ -577,6 +582,23 @@ app.get('/api/me', authMiddleware, h(async (req, res) => {
     return res.status(403).json({ error: 'Votre compte a été suspendu par l\'administration. Contactez le support.' });
   }
   res.json({ user: publicUser(await withArtistStats(user)) });
+}));
+
+app.post('/api/me/mark-contract-seen', authMiddleware, h(async (req, res) => {
+  await db.run('UPDATE users SET has_seen_artist_contract = 1 WHERE id = $1', [req.user.id]);
+  res.json({ ok: true });
+}));
+
+app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
+  const { name, desc, link, contact, duration } = req.body;
+  if (!name || !link || !contact) {
+    return res.status(400).json({ error: 'Merci de renseigner au minimum le nom du produit, un lien et un contact.' });
+  }
+  const result = await sendAdRequestEmail({ name, desc, link, contact, duration });
+  if (!result.sent) {
+    return res.status(502).json({ error: "La demande n'a pas pu être envoyée pour l'instant — réessayez plus tard." });
+  }
+  res.json({ message: 'Votre demande a bien été envoyée — NUNI vous recontactera bientôt.' });
 }));
 
 // ---------- Progression réelle : niveau, XP, et les 6 badges calculés à partir de vraies actions ----------
@@ -700,7 +722,7 @@ async function activateAndNotify(user, plan, durationDays, promoCode) {
     WHERE id = $4
   `, [plan, String(durationDays), access_code, user.id]);
 
-  const promoResult = await resolvePromoDiscount(promoCode, plan);
+  const promoResult = await resolvePromoDiscount(promoCode, plan, user.id);
   const base = basePriceFor(plan, durationDays);
   // Double protection : même si une ligne invalide existait déjà en base avant le garde-fou
   // à la création, on borne ici aussi et on ne laisse jamais un prix final négatif ou nul.
@@ -962,13 +984,37 @@ app.put('/api/artist/banner', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Photo de couverture mise à jour.', banner_url: bannerUrl });
 }));
 
+// ---------- Vraie biographie artiste — remplie par l'artiste lui-même ----------
+// Avant : texte générique codé en dur, jamais modifiable, affiché pour tout artiste réel
+// (page artiste + lecteur plein écran). Ici : un vrai champ, visible par tout le monde une
+// fois enregistré.
+app.put('/api/artist/bio', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const { bio } = req.body;
+  const cleaned = String(bio || '').trim().slice(0, 600);
+  await db.run('UPDATE users SET bio = $1 WHERE id = $2', [cleaned || null, req.user.id]);
+  res.json({ message: 'Biographie mise à jour.', bio: cleaned || null });
+}));
+
 app.get('/api/artist/:id/public-stats', h(async (req, res) => {
   const artistId = Number(req.params.id);
-  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url FROM users WHERE id = $1', [artistId]);
+  const artist = await db.get('SELECT id, account_type, avatar_url, banner_url, bio FROM users WHERE id = $1', [artistId]);
   if (!artist || artist.account_type !== 'artist') return res.status(404).json({ error: 'Artiste introuvable.' });
   const followerCount = (await db.get('SELECT COUNT(*)::int as c FROM follows WHERE artist_id = $1', [artistId])).c;
   const trackCount = (await db.get('SELECT COUNT(*)::int as c FROM tracks WHERE artist_id = $1 AND published = 1', [artistId])).c;
-  res.json({ follower_count: followerCount, track_count: trackCount, avatar_url: artist.avatar_url || null, banner_url: artist.banner_url || null });
+  // Auditeurs par mois — le frontend l'attendait depuis longtemps, jamais calculé côté
+  // serveur jusqu'ici. Vrai nombre de comptes distincts ayant réellement écouté un morceau
+  // de cet artiste depuis le 1er du mois calendaire en cours (table plays, horodatée).
+  const monthlyListeners = (await db.get(`
+    SELECT COUNT(DISTINCT p.listener_id)::int as c
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = $1 AND p.created_at >= date_trunc('month', NOW())
+  `, [artistId])).c;
+  res.json({
+    follower_count: followerCount, track_count: trackCount,
+    avatar_url: artist.avatar_url || null, banner_url: artist.banner_url || null,
+    bio: artist.bio || null, monthly_listeners: monthlyListeners,
+  });
 }));
 
 // "Mur des fans" — avant : 7 initiales codées en dur ("MK","PJ","TN"...), identiques pour
@@ -1212,6 +1258,26 @@ app.get('/api/tracks', h(async (req, res) => {
 const NUNI_PRICE_PER_STREAM_FCFA = 2;
 const NUNI_ARTIST_SHARE_PCT = 75;
 const MONTH_LABELS_FR = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Juin', 'Juil', 'Août', 'Sep', 'Oct', 'Nov', 'Déc'];
+
+// ---------- Taux de reversement configurables (module Reversements artistes) ----------
+// Stockés dans app_settings (déjà utilisée pour le secret JWT) — pas de nouvelle table
+// pour deux valeurs. Si jamais rien n'a été configuré, on retombe sur les constantes
+// historiques ci-dessus (celles déjà utilisées par le Dashboard artiste classique).
+async function getRoyaltySettings() {
+  const priceRow = await db.get('SELECT value FROM app_settings WHERE key = $1', ['royalty_price_per_stream_fcfa']);
+  const shareRow = await db.get('SELECT value FROM app_settings WHERE key = $1', ['royalty_artist_share_pct']);
+  return {
+    price_per_stream_fcfa: priceRow ? Number(priceRow.value) : NUNI_PRICE_PER_STREAM_FCFA,
+    artist_share_pct: shareRow ? Number(shareRow.value) : NUNI_ARTIST_SHARE_PCT,
+  };
+}
+async function setRoyaltySetting(key, value) {
+  await db.run(
+    `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, String(value)],
+  );
+}
 
 app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   const trackId = Number(req.params.id);
@@ -1561,8 +1627,8 @@ app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
 // Avant : 6 noms codés en dur ("Bibi Mwana", "Ndombe Junior"...), identiques pour tout le
 // monde, indéfiniment. Ici : une vraie sélection aléatoire parmi les artistes ayant
 // réellement payé leur Pass Artiste (donc de vrais comptes actifs à soutenir), qui change
-// automatiquement toutes les 30 minutes — via un hash basé sur l'heure, pas de tâche
-// planifiée nécessaire : la même fenêtre de 30 min donne le même ordre pour tout le monde,
+// automatiquement chaque semaine — via un hash basé sur la semaine calendaire, pas de
+// tâche planifiée nécessaire : la même semaine donne le même ordre pour tout le monde,
 // et l'ordre change tout seul dès qu'on passe à la fenêtre suivante.
 app.get('/api/artists/featured', h(async (req, res) => {
   const rows = await db.query(`
@@ -1570,7 +1636,7 @@ app.get('/api/artists/featured', h(async (req, res) => {
       (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre
     FROM users u
     WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
-    ORDER BY md5(u.id::text || floor(extract(epoch from now())/1800)::text)
+    ORDER BY md5(u.id::text || floor(extract(epoch from now())/604800)::text)
     LIMIT 6
   `);
   res.json({ artists: rows });
@@ -1747,6 +1813,22 @@ async function createNotification(userId, type, title, body, link) {
 }
 
 app.get('/api/notifications', authMiddleware, h(async (req, res) => {
+  // Rappel régulier pour consulter "Opportunités" — pas un vrai cron (aucun scheduler dans
+  // ce projet), mais un déclenchement naturel : à chaque fois que la personne consulte ses
+  // notifications, on vérifie si son dernier rappel Opportunités date de plus de 7 jours ;
+  // si oui, on en recrée un tout de suite. Résultat : un rappel qui revient vraiment
+  // régulièrement, sans jamais spammer (au plus un par semaine et par personne).
+  const lastReminder = await db.get(
+    "SELECT created_at FROM notifications WHERE user_id = $1 AND type = 'opportunites_reminder' ORDER BY created_at DESC LIMIT 1",
+    [req.user.id],
+  );
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  if (!lastReminder || new Date(lastReminder.created_at).getTime() < sevenDaysAgo) {
+    await createNotification(
+      req.user.id, 'opportunites_reminder', 'De nouvelles opportunités vous attendent',
+      "Sponsors, mises en avant, collaborations — jetez un œil à la section Opportunités, ça bouge régulièrement.", '/opportunites',
+    );
+  }
   const rows = await db.query(
     'SELECT id, type, title, body, link, is_read, created_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30',
     [req.user.id],
@@ -1906,6 +1988,136 @@ app.get('/api/admin/subscriptions', h(async (req, res) => {
   res.json({ subscriptions: rows, total_collected_fcfa: totalRow.total });
 }));
 
+// ================= REVERSEMENTS ARTISTES (royalties) =================
+// Principe central, jamais dévié : tracks.streams (les streams publics — profil, classements,
+// pages morceaux) n'est JAMAIS modifié par ce module, nulle part. Le "compteur de période"
+// n'est pas une valeur stockée à réinitialiser (risque de désync) : c'est un calcul dérivé —
+// total_streams actuel moins la somme des streams déjà couverts par un paiement passé
+// (payment_history.streams_covered). Payer un artiste ne fait qu'ajouter une ligne à
+// l'historique ; les vrais streams publics ne bougent jamais.
+
+app.get('/api/admin/royalty-settings', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  res.json(await getRoyaltySettings());
+}));
+
+app.put('/api/admin/royalty-settings', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { price_per_stream_fcfa, artist_share_pct } = req.body;
+  if (price_per_stream_fcfa != null) {
+    const p = Number(price_per_stream_fcfa);
+    if (!(p > 0)) return res.status(400).json({ error: 'Le prix par stream doit être positif.' });
+    await setRoyaltySetting('royalty_price_per_stream_fcfa', p);
+  }
+  if (artist_share_pct != null) {
+    const pct = Number(artist_share_pct);
+    if (!(pct > 0 && pct <= 100)) return res.status(400).json({ error: 'Le pourcentage artiste doit être entre 1 et 100.' });
+    await setRoyaltySetting('royalty_artist_share_pct', pct);
+  }
+  res.json({ message: 'Taux de reversement mis à jour.', settings: await getRoyaltySettings() });
+}));
+
+// Calcule pour un artiste : streams déjà payés (somme de l'historique), streams de la
+// période en cours (dérivé, jamais stocké), montant dû, date du dernier paiement.
+async function computeArtistPayout(artistId, settings) {
+  const totalStreamsRow = await db.get(
+    'SELECT COALESCE(SUM(streams), 0)::int as c FROM tracks WHERE artist_id = $1', [artistId],
+  );
+  const paidRow = await db.get(
+    'SELECT COALESCE(SUM(streams_covered), 0)::int as c, MAX(paid_at)::text as last_paid FROM (SELECT streams_covered, period_end as paid_at FROM payment_history WHERE artist_id = $1) x',
+    [artistId],
+  );
+  const totalStreams = totalStreamsRow.c;
+  const alreadyPaidStreams = paidRow.c;
+  const currentPeriodStreams = Math.max(0, totalStreams - alreadyPaidStreams);
+  const amountDueFcfa = Math.round(currentPeriodStreams * settings.price_per_stream_fcfa * settings.artist_share_pct / 100);
+  return {
+    total_streams: totalStreams,
+    current_period_streams: currentPeriodStreams,
+    amount_due_fcfa: amountDueFcfa,
+    last_payment_at: paidRow.last_paid || null,
+    status: currentPeriodStreams === 0 ? 'à jour' : (amountDueFcfa > 0 ? 'prêt à payer' : 'en attente'),
+  };
+}
+
+app.get('/api/admin/artist-payouts', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const settings = await getRoyaltySettings();
+  const artists = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.email, u.account_status
+    FROM users u WHERE u.account_type = 'artist'
+    ORDER BY u.artist_name ASC NULLS LAST, u.first_name ASC
+  `);
+  const payouts = [];
+  for (const a of artists) {
+    const p = await computeArtistPayout(a.id, settings);
+    payouts.push({
+      id: a.id, pseudo: a.artist_name || a.first_name, real_name: `${a.first_name}`, email: a.email,
+      account_status: a.account_status, ...p,
+    });
+  }
+  payouts.sort((x, y) => y.amount_due_fcfa - x.amount_due_fcfa);
+  const totalDueFcfa = payouts.reduce((sum, p) => sum + p.amount_due_fcfa, 0);
+  res.json({ payouts, total_due_fcfa: totalDueFcfa, ...settings });
+}));
+
+app.get('/api/admin/artist-payouts/:artistId/history', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(
+    'SELECT id, amount_fcfa, streams_covered, period_start, period_end, method, reference, note, created_at FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC',
+    [Number(req.params.artistId)],
+  );
+  res.json({ history: rows });
+}));
+
+// Enregistre un vrai versement — ne touche jamais tracks.streams. Envoie un email à
+// l'artiste pour trace écrite, jamais bloquant si l'email échoue.
+app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const artistId = Number(req.params.artistId);
+  const artist = await db.get('SELECT * FROM users WHERE id = $1 AND account_type = $2', [artistId, 'artist']);
+  if (!artist) return res.status(404).json({ error: 'Artiste introuvable.' });
+
+  const settings = await getRoyaltySettings();
+  const p = await computeArtistPayout(artistId, settings);
+  if (p.current_period_streams <= 0) {
+    return res.status(400).json({ error: "Aucun stream en attente de paiement pour cet artiste." });
+  }
+  const { method, reference, note } = req.body || {};
+  const lastPayment = await db.get(
+    'SELECT period_end FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 1', [artistId],
+  );
+  const inserted = await db.get(
+    `INSERT INTO payment_history (artist_id, amount_fcfa, streams_covered, period_start, period_end, method, reference, note)
+     VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7) RETURNING id`,
+    [artistId, p.amount_due_fcfa, p.current_period_streams, lastPayment ? lastPayment.period_end : artist.created_at,
+      method || 'Manuel', reference || null, note || null],
+  );
+  sendArtistPaymentEmail({
+    user: artist, amountFcfa: p.amount_due_fcfa, streamsCovered: p.current_period_streams,
+    periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
+  }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
+
+  res.json({ message: `Versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA enregistré pour ${artist.artist_name || artist.first_name}.`, payment_id: inserted.id });
+}));
+
+// ---------- Côté artiste : son propre statut de paiement et son propre historique ----------
+app.get('/api/artist/payment-status', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const settings = await getRoyaltySettings();
+  const p = await computeArtistPayout(req.user.id, settings);
+  res.json({ ...p, price_per_stream_fcfa: settings.price_per_stream_fcfa, artist_share_pct: settings.artist_share_pct });
+}));
+
+app.get('/api/artist/payment-history', authMiddleware, h(async (req, res) => {
+  if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const rows = await db.query(
+    'SELECT amount_fcfa, streams_covered, period_start, period_end, method, created_at FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC',
+    [req.user.id],
+  );
+  res.json({ history: rows });
+}));
+
 // ---------- Suspension d'un compte : coupe le Pass ET bloque totalement la connexion ----------
 // Contrairement à avant, ceci fixe désormais account_status='suspended', qui est vérifié
 // à CHAQUE connexion et à CHAQUE requête authentifiée — pas seulement l'abonnement.
@@ -1941,6 +2153,7 @@ async function fullyDeleteUser(userId) {
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query('DELETE FROM payment_history WHERE artist_id = $1', [userId]);
     await client.query('DELETE FROM clip_views WHERE viewer_id = $1', [userId]);
     await client.query('DELETE FROM plays WHERE listener_id = $1', [userId]);
     await client.query('DELETE FROM track_likes WHERE user_id = $1', [userId]);
@@ -2036,7 +2249,7 @@ app.get('/api/admin/promo-codes', h(async (req, res) => {
 
 app.post('/api/admin/promo-codes', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
-  const { code, discount_pct, applies_to_plan, max_uses, expires_at } = req.body;
+  const { code, discount_pct, applies_to_plan, max_uses, expires_at, assigned_to_email, note } = req.body;
   if (!code || !discount_pct) return res.status(400).json({ error: 'Le code et le pourcentage de réduction sont obligatoires.' });
   // Garde-fou contre une erreur de frappe (ex: "500" au lieu de "50") qui donnerait un prix
   // négatif une fois appliqué — aucune vraie utilité commerciale à un code >100% ou négatif.
@@ -2044,18 +2257,39 @@ app.post('/api/admin/promo-codes', h(async (req, res) => {
   if (!(pct > 0 && pct <= 100)) {
     return res.status(400).json({ error: 'Le pourcentage de réduction doit être compris entre 1 et 100.' });
   }
+  // Code personnel : réservé à un seul compte (récompense pour un consommateur actif dans
+  // les défis, ou un artiste) — on résout l'email en vrai ID utilisateur tout de suite,
+  // jamais stocké comme simple texte libre (garantit que le compte existe vraiment).
+  let assignedUserId = null;
+  if (assigned_to_email) {
+    const targetUser = await db.get('SELECT id, first_name, email FROM users WHERE LOWER(email) = LOWER($1)', [String(assigned_to_email).trim()]);
+    if (!targetUser) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+    assignedUserId = targetUser.id;
+  }
   try {
     await db.run(`
-      INSERT INTO promo_codes (code, discount_pct, applies_to_plan, max_uses, expires_at)
-      VALUES ($1,$2,$3,$4,$5)
+      INSERT INTO promo_codes (code, discount_pct, applies_to_plan, max_uses, expires_at, assigned_to_user_id, note)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
     `, [
       String(code).toUpperCase().trim(), pct, applies_to_plan || null,
-      Number(max_uses) || 1, expires_at || null,
+      Number(max_uses) || 1, expires_at || null, assignedUserId, note || null,
     ]);
   } catch (e) {
     return res.status(400).json({ error: 'Ce code existe déjà.' });
   }
-  res.json({ message: 'Code promo créé.' });
+  res.json({ message: assignedUserId ? 'Code promo personnel créé et attribué.' : 'Code promo créé.' });
+}));
+
+// ---------- Codes promo personnels — vus par l'utilisateur lui-même ----------
+app.get('/api/me/promo-codes', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(
+    `SELECT code, discount_pct, applies_to_plan, expires_at, note FROM promo_codes
+     WHERE assigned_to_user_id = $1 AND active = 1 AND used_count < max_uses
+       AND (expires_at IS NULL OR expires_at > NOW())
+     ORDER BY id DESC`,
+    [req.user.id],
+  );
+  res.json({ codes: rows });
 }));
 
 app.post('/api/admin/promo-codes/toggle', h(async (req, res) => {

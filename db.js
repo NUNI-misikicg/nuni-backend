@@ -183,6 +183,14 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_attempts INTEGER DEFAULT 0;`);
 
+  // ---------- Biographie réelle de l'artiste ----------
+  // Avant : la bio affichée (page artiste + lecteur plein écran) venait d'un dictionnaire
+  // codé en dur avec 6 faux artistes de démo — n'importe quel vrai artiste tombait sur un
+  // texte générique ("Découvrez l'univers de X sur NUNI."), jamais modifiable. Ici : un vrai
+  // champ texte, rempli par l'artiste lui-même depuis son tableau de bord (voir
+  // PUT /api/artist/bio dans server.js).
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;`);
+
   // ---------- Progression réelle (XP, niveaux, série d'écoute) ----------
   // Fondation du système de gamification demandé : plus de badges/niveaux inventés,
   // tout est calculé à partir de vraies actions (écoutes, connexions, suivis, achats de Pass).
