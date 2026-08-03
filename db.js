@@ -578,6 +578,23 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
   `);
+
+  // ---------- Historique des envois admin (Centre de Communication) ----------
+  // Une ligne par envoi groupé déclenché depuis admin.html (pas une ligne par destinataire —
+  // ça, c'est déjà dans "notifications"). Sert uniquement à afficher l'onglet "Historique
+  // des envois" : quoi, à qui, quand, combien de comptes touchés. Rien d'inventé : chaque
+  // ligne correspond à un vrai envoi réellement effectué (voir POST /api/admin/notifications/send).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_broadcasts (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      link TEXT,
+      audience TEXT NOT NULL,
+      recipient_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };

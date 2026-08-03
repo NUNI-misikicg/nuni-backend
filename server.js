@@ -3458,6 +3458,66 @@ app.post('/api/admin/verification/reset', h(async (req, res) => {
 // "payment-88"...) construit à partir du vrai id de la ligne source, pour que admin.html
 // puisse retenir localement ce qui a déjà été vu (la clé admin est partagée par l'équipe,
 // donc l'état "lu" est géré par navigateur, pas par compte individuel).
+// ================= COMMUNICATION — notifications manuelles vers une audience =================
+// Réutilise createNotification (donc aussi le vrai push web) pour chaque destinataire réel —
+// aucune notification de masse "magique" à part : on boucle simplement sur de vrais comptes.
+// Le type 'admin_broadcast' permet de les distinguer des notifications automatiques (follower,
+// nouvelle sortie...) si besoin plus tard côté app utilisateur.
+app.post('/api/admin/notifications/send', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { title, body, link, audience, specific_email } = req.body;
+  if (!title || !String(title).trim() || !body || !String(body).trim()) {
+    return res.status(400).json({ error: 'Le titre et le message sont obligatoires.' });
+  }
+  const validAudiences = ['all', 'artist', 'label', 'consumer', 'specific'];
+  if (!validAudiences.includes(audience)) {
+    return res.status(400).json({ error: 'Audience invalide.' });
+  }
+
+  let targetIds = [];
+  let audienceLabel = audience;
+  if (audience === 'specific') {
+    if (!isEmail(specific_email)) return res.status(400).json({ error: 'Email invalide.' });
+    const user = await db.get('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [String(specific_email).trim()]);
+    if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+    targetIds = [user.id];
+    audienceLabel = specific_email.trim();
+  } else if (audience === 'all') {
+    const rows = await db.query('SELECT id FROM users');
+    targetIds = rows.map(r => r.id);
+  } else {
+    const rows = await db.query('SELECT id FROM users WHERE account_type = $1', [audience]);
+    targetIds = rows.map(r => r.id);
+  }
+
+  if (!targetIds.length) {
+    return res.status(400).json({ error: 'Aucun compte ne correspond à cette audience.' });
+  }
+
+  const cleanTitle = String(title).trim();
+  const cleanBody = String(body).trim();
+  const cleanLink = link ? String(link).trim() : null;
+
+  for (const userId of targetIds) {
+    await createNotification(userId, 'admin_broadcast', cleanTitle, cleanBody, cleanLink);
+  }
+
+  await db.run(
+    `INSERT INTO admin_broadcasts (title, body, link, audience, recipient_count) VALUES ($1,$2,$3,$4,$5)`,
+    [cleanTitle, cleanBody, cleanLink, audienceLabel, targetIds.length],
+  );
+
+  res.json({ message: `Notification envoyée à ${targetIds.length} compte(s).`, recipient_count: targetIds.length });
+}));
+
+app.get('/api/admin/notifications/history', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(
+    'SELECT id, title, body, link, audience, recipient_count, created_at FROM admin_broadcasts ORDER BY created_at DESC LIMIT 100',
+  );
+  res.json({ broadcasts: rows });
+}));
+
 app.get('/api/admin/notifications', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
 

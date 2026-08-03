@@ -199,6 +199,11 @@
       <div class="nav-group-label">Événements</div>
       <button class="tab-btn" data-tab="events"><span class="tab-icon">📅</span> NUNI Événements</button>
     </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">💬 Communication</div>
+      <button class="tab-btn" data-tab="comm-notif"><span class="tab-icon">🔔</span> Notifications NUNI</button>
+    </div>
   </aside>
 
   <main class="main">
@@ -540,6 +545,46 @@
       <button class="secondary" style="margin-top:12px;" onclick="loadLabelPlanSettingsAdmin()">Charger les valeurs actuelles</button>
       <button class="primary" style="margin-top:12px;" onclick="saveLabelPlanSettingsAdmin()">Enregistrer</button>
       <div id="label-plan-settings-msg" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <!-- ONGLET : COMMUNICATION — Notifications NUNI -->
+  <div class="pane" id="pane-comm-notif">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🔔 Envoyer une notification</b>
+      <div class="muted" style="margin-top:4px;">Reçue immédiatement dans l'onglet Notifications des comptes ciblés (et en push, si activé sur leur appareil).</div>
+
+      <label>Titre *</label>
+      <input id="comm-title" type="text" placeholder="Ex : Promotion NUNI">
+
+      <label>Message *</label>
+      <textarea id="comm-body" rows="3" placeholder="Ex : Profitez de 50% de réduction sur votre prochain Pass Artiste."></textarea>
+
+      <label>Lien (optionnel — ouvert au tap sur la notification)</label>
+      <input id="comm-link" type="text" placeholder="/pass ou https://...">
+
+      <label>Audience</label>
+      <select id="comm-audience" onchange="document.getElementById('comm-specific-wrap').style.display = this.value==='specific' ? 'block' : 'none';">
+        <option value="all">Tous les utilisateurs</option>
+        <option value="artist">Tous les artistes</option>
+        <option value="label">Tous les labels</option>
+        <option value="consumer">Tous les consommateurs</option>
+        <option value="specific">Un utilisateur spécifique</option>
+      </select>
+
+      <div id="comm-specific-wrap" style="display:none;">
+        <label>Email de l'utilisateur ciblé</label>
+        <input id="comm-specific-email" type="text" placeholder="email@exemple.com">
+      </div>
+
+      <button class="primary" style="margin-top:14px; width:100%;" onclick="sendAdminNotification()">🚀 Envoyer</button>
+      <div id="comm-send-msg" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">📜 Historique des envois</b>
+      <button class="secondary" style="margin-top:10px;" onclick="loadNotifHistory()">Charger l'historique</button>
+      <div id="comm-history" style="margin-top:14px;"></div>
     </div>
   </div>
 
@@ -1744,6 +1789,68 @@
   // la page toutes les 5 minutes.
   window.addEventListener('load', () => { setTimeout(loadNotifications, 300); });
   setInterval(loadNotifications, 30000);
+
+  // ============ COMMUNICATION — Notifications NUNI ============
+  async function sendAdminNotification(){
+    const title = document.getElementById('comm-title').value.trim();
+    const body = document.getElementById('comm-body').value.trim();
+    const link = document.getElementById('comm-link').value.trim();
+    const audience = document.getElementById('comm-audience').value;
+    const specificEmail = document.getElementById('comm-specific-email').value.trim();
+    const msg = document.getElementById('comm-send-msg');
+
+    if(!title || !body){
+      msg.innerHTML = '<div class="msg err">❌ Le titre et le message sont obligatoires.</div>';
+      return;
+    }
+    if(audience === 'specific' && !specificEmail){
+      msg.innerHTML = '<div class="msg err">❌ Précisez l\'email de l\'utilisateur ciblé.</div>';
+      return;
+    }
+
+    msg.innerHTML = '<div class="muted">Envoi en cours…</div>';
+    try{
+      const res = await fetch('/api/admin/notifications/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-key': getKey() },
+        body: JSON.stringify({ title, body, link: link || null, audience, specific_email: specificEmail || null }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<div class="msg err">❌ ' + (data.error || 'Erreur.') + '</div>'; return; }
+      msg.innerHTML = '<div class="msg ok">✅ ' + data.message + '</div>';
+      document.getElementById('comm-title').value = '';
+      document.getElementById('comm-body').value = '';
+      document.getElementById('comm-link').value = '';
+      document.getElementById('comm-specific-email').value = '';
+      loadNotifHistory();
+      loadNotifications(); // rafraîchit aussi la cloche admin si c'était une notif pertinente
+    }catch(e){
+      msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
+    }
+  }
+
+  const AUDIENCE_LABELS = { all: 'Tous les utilisateurs', artist: 'Tous les artistes', label: 'Tous les labels', consumer: 'Tous les consommateurs' };
+
+  async function loadNotifHistory(){
+    const wrap = document.getElementById('comm-history');
+    wrap.innerHTML = '<div class="muted">Chargement…</div>';
+    try{
+      const res = await fetch('/api/admin/notifications/history', { headers: { 'x-admin-key': getKey() } });
+      const data = await res.json();
+      if(!res.ok){ wrap.innerHTML = '<div class="msg err">❌ ' + (data.error || 'Erreur.') + '</div>'; return; }
+      const rows = data.broadcasts || [];
+      if(!rows.length){ wrap.innerHTML = '<div class="muted">Aucun envoi pour le moment.</div>'; return; }
+      let html = '<table><tr><th>Date</th><th>Titre</th><th>Audience</th><th>Destinataires</th></tr>';
+      rows.forEach(b => {
+        const audienceLabel = AUDIENCE_LABELS[b.audience] || b.audience; // sinon c'est un email précis
+        html += `<tr><td>${new Date(b.created_at).toLocaleString('fr-FR')}</td><td><b>${b.title}</b><div class="muted" style="max-width:280px;">${b.body}</div></td><td>${audienceLabel}</td><td>${b.recipient_count.toLocaleString('fr-FR')}</td></tr>`;
+      });
+      html += '</table>';
+      wrap.innerHTML = html;
+    }catch(e){
+      wrap.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>';
+    }
+  }
 </script>
 </body>
 </html>
