@@ -4,66 +4,186 @@
 <meta charset="UTF-8">
 <title>NUNI — Tableau de bord admin</title>
 <style>
+  :root{
+    --bg:#050816; --bg-soft:#080B1C; --card:#10172B; --card-hover:#141C36;
+    --line:rgba(255,255,255,0.07); --line-strong:rgba(255,255,255,0.12);
+    --gold:#D8B26E; --gold-soft:rgba(216,178,110,0.16);
+    --violet:#8B5CF6; --violet-soft:rgba(139,92,246,0.16);
+    --text:#F2F1EC; --muted:#8B93A8; --muted-dim:#5D6478;
+    --green:#3DDC97; --green-soft:rgba(61,220,151,0.14);
+    --red:#F2555A; --red-soft:rgba(242,85,90,0.14);
+    --radius:16px; --radius-sm:10px;
+    --shadow: 0 8px 30px rgba(0,0,0,0.35);
+  }
   * { box-sizing: border-box; }
-  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:#0A0A10; color:#EDEDED; max-width:900px; margin:0 auto; padding:30px 20px 80px;}
-  h1{color:#D4AF6A; font-size:22px; margin-bottom:4px;}
-  .subtitle{color:#888; font-size:13px; margin-bottom:24px;}
-  label{font-size:13px; color:#999; display:block; margin-top:10px;}
-  input, select{width:100%; padding:10px; margin:6px 0 4px; border-radius:8px; border:1px solid #292940; background:#151520; color:#fff; box-sizing:border-box; font-size:14px;}
-  button{padding:9px 18px; border-radius:20px; border:none; font-weight:700; cursor:pointer; font-size:13px;}
-  .tabs{display:flex; gap:8px; margin:20px 0 24px; flex-wrap:wrap; border-bottom:1px solid #23233a; padding-bottom:14px;}
-  .tab-btn{background:#151520; color:#999; border:1px solid #292940; border-radius:20px; padding:8px 16px;}
-  .tab-btn.active{background:linear-gradient(135deg,#D4AF6A,#8E63C9); color:#141220; border-color:transparent;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(139,92,246,0.10), transparent 60%),
+      radial-gradient(1200px 700px at 100% 0%, rgba(216,178,110,0.08), transparent 55%),
+      var(--bg);
+    color:var(--text); margin:0; padding:0; min-height:100vh;}
+  h1{color:var(--gold); font-size:19px; margin:0; letter-spacing:.2px;}
+  .subtitle{color:var(--muted); font-size:12.5px; margin-top:2px;}
+  label{font-size:12.5px; color:var(--muted); display:block; margin-top:10px; font-weight:600; letter-spacing:.2px;}
+  input, select, textarea{width:100%; padding:10px 12px; margin:6px 0 4px; border-radius:var(--radius-sm); border:1px solid var(--line-strong); background:#0B1226; color:#fff; box-sizing:border-box; font-size:14px; font-family:inherit; transition:border-color .15s;}
+  input:focus, select:focus, textarea:focus{outline:none; border-color:var(--violet);}
+  button{padding:9px 18px; border-radius:20px; border:none; font-weight:700; cursor:pointer; font-size:13px; transition:transform .1s, opacity .15s; font-family:inherit;}
+  button:hover{opacity:.92;}
+  button:active{transform:scale(0.98);}
+
+  /* ---------- App shell : sidebar fixe + contenu ---------- */
+  .app-shell{display:flex; min-height:100vh;}
+  .sidebar{
+    width:246px; flex:0 0 246px; background:linear-gradient(180deg, rgba(16,23,43,0.9), rgba(8,11,28,0.9));
+    border-right:1px solid var(--line); padding:20px 14px; position:sticky; top:0; height:100vh; overflow-y:auto;
+    backdrop-filter:blur(14px);
+  }
+  .brand{display:flex; align-items:center; gap:9px; padding:2px 8px 18px; border-bottom:1px solid var(--line); margin-bottom:14px;}
+  .brand .logo{width:30px; height:30px; border-radius:9px; background:linear-gradient(135deg,var(--gold),var(--violet)); display:flex; align-items:center; justify-content:center; font-size:15px; flex:0 0 auto;}
+  .brand b{color:var(--gold); font-size:14px; letter-spacing:.3px;}
+  .nav-group{margin-bottom:14px;}
+  .nav-group-label{font-size:10.5px; text-transform:uppercase; letter-spacing:.09em; color:var(--muted-dim); padding:8px 10px 6px; font-weight:700;}
+  .tab-btn{
+    display:flex; align-items:center; gap:9px; width:100%; text-align:left;
+    background:transparent; color:var(--muted); border:1px solid transparent; border-radius:10px;
+    padding:9px 10px; font-size:13px; font-weight:600; margin-bottom:2px;
+  }
+  .tab-btn:hover{background:rgba(255,255,255,0.04); color:var(--text);}
+  .tab-btn.active{background:linear-gradient(135deg, var(--gold-soft), var(--violet-soft)); color:var(--text); border-color:var(--line-strong); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.02);}
+  .tab-icon{font-size:15px; width:18px; text-align:center; flex:0 0 auto;}
+
+  .main{flex:1; min-width:0; padding:22px 28px 90px; max-width:1180px;}
+  .topbar{
+    display:flex; justify-content:space-between; align-items:flex-start; gap:20px; flex-wrap:wrap;
+    padding-bottom:16px; margin-bottom:20px; border-bottom:1px solid var(--line);
+  }
+  .key-box{min-width:260px;}
+  .key-box label{margin-top:0;}
+
   .pane{display:none;}
   .pane.active{display:block;}
-  .card{background:#141420; border:1px solid #23233a; border-radius:12px; padding:16px; margin-bottom:12px;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:18px; margin-bottom:14px; box-shadow:var(--shadow);}
   .row{display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;}
-  .muted{color:#888; font-size:12.5px;}
-  .approve{background:#1E8449; color:#fff;}
-  .reject{background:#7a2020; color:#fff;}
-  .primary{background:linear-gradient(135deg,#D4AF6A,#8E63C9); color:#141220;}
-  .secondary{background:#7a5c20; color:#fff;}
-  .danger{background:#7a2020; color:#fff;}
-  .msg{font-size:13px; margin-top:10px; padding:8px 12px; border-radius:8px;}
-  .msg.ok{background:rgba(30,132,73,0.2); color:#7ee6a8;}
-  .msg.err{background:rgba(122,32,32,0.25); color:#f29a9a;}
+  .muted{color:var(--muted); font-size:12.5px;}
+  .approve{background:var(--green); color:#062018;}
+  .reject{background:var(--red); color:#fff;}
+  .primary{background:linear-gradient(135deg,var(--gold),var(--violet)); color:#141220;}
+  .secondary{background:rgba(255,255,255,0.06); color:var(--text); border:1px solid var(--line-strong);}
+  .danger{background:rgba(242,85,90,0.16); color:#ff9a9d; border:1px solid rgba(242,85,90,0.35);}
+  .msg{font-size:13px; margin-top:10px; padding:8px 12px; border-radius:var(--radius-sm);}
+  .msg.ok{background:var(--green-soft); color:#7ee6a8;}
+  .msg.err{background:var(--red-soft); color:#f29a9a;}
   table{width:100%; border-collapse:collapse; font-size:12.5px; margin-top:10px;}
-  th, td{padding:8px; text-align:left; border-bottom:1px solid #23233a;}
-  th{color:#D4AF6A; font-weight:700;}
-  .pill{display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:700;}
-  .pill.artist{background:rgba(212,175,106,0.18); color:#D4AF6A;}
-  .pill.consumer{background:rgba(110,69,168,0.2); color:#b79bea;}
-  .pill.verified{background:rgba(30,132,73,0.2); color:#7ee6a8;}
-  .pill.active{background:rgba(30,132,73,0.2); color:#7ee6a8;}
-  .pill.pending{background:rgba(212,175,106,0.18); color:#D4AF6A;}
-  .pill.expired{background:rgba(122,32,32,0.25); color:#f29a9a;}
-  .urgent{color:#f29a9a; font-weight:700;}
-  .cover-thumb{width:44px; height:44px; border-radius:6px; background-size:cover; background-position:center; background-color:#222;}
+  th, td{padding:9px 8px; text-align:left; border-bottom:1px solid var(--line);}
+  th{color:var(--gold); font-weight:700; font-size:11.5px; text-transform:uppercase; letter-spacing:.05em;}
+  .pill{display:inline-block; padding:2px 9px; border-radius:12px; font-size:11px; font-weight:700;}
+  .pill.artist{background:var(--gold-soft); color:var(--gold);}
+  .pill.consumer{background:var(--violet-soft); color:#c3aeff;}
+  .pill.verified{background:var(--green-soft); color:#7ee6a8;}
+  .pill.active{background:var(--green-soft); color:#7ee6a8;}
+  .pill.pending{background:var(--gold-soft); color:var(--gold);}
+  .pill.expired{background:var(--red-soft); color:#f29a9a;}
+  .urgent{color:#ff9a9d; font-weight:700;}
+  .cover-thumb{width:44px; height:44px; border-radius:8px; background-size:cover; background-position:center; background-color:#1b1f33;}
+
+  /* ---------- Dashboard ---------- */
+  .stat-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:14px; margin-bottom:16px;}
+  .stat-card{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:18px; box-shadow:var(--shadow); position:relative; overflow:hidden;}
+  .stat-card .stat-icon{font-size:20px; opacity:.85;}
+  .stat-card .stat-value{font-size:26px; font-weight:800; color:#fff; margin-top:10px; letter-spacing:.2px;}
+  .stat-card .stat-label{font-size:12px; color:var(--muted); margin-top:2px;}
+  .dash-grid{display:grid; grid-template-columns:1.4fr 1fr; gap:16px;}
+  @media (max-width:880px){ .dash-grid{grid-template-columns:1fr;} }
+  .feed{list-style:none; margin:0; padding:0;}
+  .feed li{display:flex; align-items:flex-start; gap:10px; padding:10px 4px; border-bottom:1px solid var(--line); font-size:13px;}
+  .feed li:last-child{border-bottom:none;}
+  .dot{width:8px; height:8px; border-radius:50%; margin-top:5px; flex:0 0 auto;}
+  .dot.red{background:var(--red); box-shadow:0 0 8px rgba(242,85,90,0.6);}
+  .dot.orange{background:var(--gold); box-shadow:0 0 8px rgba(216,178,110,0.5);}
+  .dot.green{background:var(--green); box-shadow:0 0 8px rgba(61,220,151,0.5);}
+  .card-title{color:var(--gold); font-size:13px; font-weight:700; display:flex; align-items:center; gap:6px;}
 </style>
 </head>
 <body>
-  <h1>🛠️ NUNI — Tableau de bord admin</h1>
-  <div class="subtitle">Un seul endroit pour tout gérer : Pass, certifications, morceaux, utilisateurs.</div>
+<div class="app-shell">
 
-  <label>Clé admin (secrète)</label>
-  <input id="key" type="password" placeholder="Votre clé admin">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">🛠️</div>
+      <div><b>NUNI ADMIN</b><div class="subtitle" style="margin-top:0;">Tableau de bord</div></div>
+    </div>
 
-  <div class="tabs">
-    <button class="tab-btn active" data-tab="activate">💳 Activer un Pass</button>
-    <button class="tab-btn" data-tab="subs">💰 Argent à encaisser</button>
-    <button class="tab-btn" data-tab="promo">🎁 Codes promo</button>
-    <button class="tab-btn" data-tab="cert">🏅 Certifications</button>
-    <button class="tab-btn" data-tab="tracks">🎵 Morceaux</button>
-    <button class="tab-btn" data-tab="users">👥 Utilisateurs</button>
-    <button class="tab-btn" data-tab="hero">🖼️ Bannières</button>
-    <button class="tab-btn" data-tab="playlists">🎧 Playlists</button>
-    <button class="tab-btn" data-tab="payouts">💸 Reversements artistes</button>
-    <button class="tab-btn" data-tab="events">🎉 NUNI Événements</button>
-    <button class="tab-btn" data-tab="labels">🏢 Labels</button>
-  </div>
+    <div class="nav-group">
+      <button class="tab-btn active" data-tab="dashboard"><span class="tab-icon">🏠</span> Tableau de bord</button>
+    </div>
 
-  <!-- ONGLET 1 : ACTIVER UN PASS -->
-  <div class="pane active" id="pane-activate">
+    <div class="nav-group">
+      <div class="nav-group-label">Gestion utilisateurs</div>
+      <button class="tab-btn" data-tab="users"><span class="tab-icon">👥</span> Utilisateurs</button>
+      <button class="tab-btn" data-tab="cert"><span class="tab-icon">🏅</span> Vérifications</button>
+      <button class="tab-btn" data-tab="labels"><span class="tab-icon">🏢</span> Labels</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Catalogue musical</div>
+      <button class="tab-btn" data-tab="tracks"><span class="tab-icon">🎵</span> Morceaux</button>
+      <button class="tab-btn" data-tab="playlists"><span class="tab-icon">🎧</span> Playlists</button>
+      <button class="tab-btn" data-tab="hero"><span class="tab-icon">🖼️</span> Bannières</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Revenus</div>
+      <button class="tab-btn" data-tab="subs"><span class="tab-icon">💰</span> Argent à encaisser</button>
+      <button class="tab-btn" data-tab="promo"><span class="tab-icon">🎁</span> Codes promo</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Paiements artistes</div>
+      <button class="tab-btn" data-tab="payouts"><span class="tab-icon">💸</span> Reversements</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Pass NUNI</div>
+      <button class="tab-btn" data-tab="activate"><span class="tab-icon">🎟</span> Activer un Pass</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Événements</div>
+      <button class="tab-btn" data-tab="events"><span class="tab-icon">📅</span> NUNI Événements</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>🛠️ NUNI — Tableau de bord admin</h1>
+        <div class="subtitle">Un seul endroit pour tout gérer : Pass, certifications, morceaux, utilisateurs.</div>
+      </div>
+      <div class="key-box">
+        <label>Clé admin (secrète)</label>
+        <input id="key" type="password" placeholder="Votre clé admin">
+      </div>
+    </div>
+
+    <!-- TABLEAU DE BORD -->
+    <div class="pane active" id="pane-dashboard">
+      <button class="secondary" onclick="loadDashboard()">Charger le tableau de bord</button>
+      <div id="dash-stats" class="stat-grid" style="margin-top:16px;"></div>
+      <div class="dash-grid">
+        <div class="card">
+          <div class="card-title">📢 Centre NUNI</div>
+          <div class="muted" style="margin-top:4px;">Ce qui attend une action, calculé à partir des données réelles de la plateforme.</div>
+          <ul class="feed" id="dash-feed" style="margin-top:10px;"><li class="muted">Cliquez sur « Charger le tableau de bord ».</li></ul>
+        </div>
+        <div class="card">
+          <div class="card-title">🛡 Sécurité</div>
+          <div class="muted" style="margin-top:4px;">Statut de la clé admin utilisée sur cet appareil.</div>
+          <ul class="feed" id="dash-security"><li class="muted">Non vérifié pour le moment.</li></ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ONGLET 1 : ACTIVER UN PASS -->
+    <div class="pane" id="pane-activate">
     <div class="card">
       <label>Email du client (utilisé à l'inscription)</label>
       <input id="act-email" type="text" placeholder="email@exemple.com">
@@ -358,8 +478,85 @@
     </div>
   </div>
 
+  </main>
+</div>
+
 <script>
   function getKey(){ const k = document.getElementById('key').value.trim(); localStorage.setItem('nuniAdminKey', k); return k; }
+
+  // ============ TABLEAU DE BORD ============
+  // Pas d'endpoint "stats" dédié : on calcule tout à partir des vraies routes admin déjà
+  // existantes (utilisateurs, labels, abonnements, certifications en attente, signalements).
+  // Rien n'est inventé — si une requête échoue, la carte correspondante affiche 0 plutôt
+  // qu'une fausse valeur.
+  async function loadDashboard(){
+    const statsWrap = document.getElementById('dash-stats');
+    const feed = document.getElementById('dash-feed');
+    const security = document.getElementById('dash-security');
+    statsWrap.innerHTML = '<div class="muted">Chargement…</div>';
+    feed.innerHTML = '<li class="muted">Chargement…</li>';
+    const headers = { 'x-admin-key': getKey() };
+
+    const safeGet = async (url) => {
+      try{
+        const res = await fetch(url, { headers });
+        const data = await res.json();
+        if(!res.ok) return { ok:false, error: data.error || 'Erreur.' };
+        return { ok:true, data };
+      }catch(e){ return { ok:false, error: 'Serveur injoignable.' }; }
+    };
+
+    const [usersR, labelsR, subsR, pendingR, reportsR] = await Promise.all([
+      safeGet('/api/admin/users'),
+      safeGet('/api/admin/labels'),
+      safeGet('/api/admin/subscriptions'),
+      safeGet('/api/admin/verification/pending'),
+      safeGet('/api/admin/track-reports'),
+    ]);
+
+    if(!usersR.ok){
+      statsWrap.innerHTML = '<div class="msg err">❌ ' + usersR.error + '</div>';
+      feed.innerHTML = '<li class="muted">Impossible de charger — vérifiez la clé admin.</li>';
+      return;
+    }
+
+    const users = usersR.data.users || [];
+    const totalUsers = users.length;
+    const totalArtists = users.filter(u => u.account_type === 'artist').length;
+    const totalLabels = labelsR.ok ? (labelsR.data.labels || []).length : 0;
+    const totalRevenue = subsR.ok ? (subsR.data.total_collected_fcfa || 0) : 0;
+
+    statsWrap.innerHTML = `
+      <div class="stat-card"><div class="stat-icon">👥</div><div class="stat-value">${totalUsers.toLocaleString('fr-FR')}</div><div class="stat-label">Utilisateurs</div></div>
+      <div class="stat-card"><div class="stat-icon">🎤</div><div class="stat-value">${totalArtists.toLocaleString('fr-FR')}</div><div class="stat-label">Artistes</div></div>
+      <div class="stat-card"><div class="stat-icon">🏢</div><div class="stat-value">${totalLabels.toLocaleString('fr-FR')}</div><div class="stat-label">Labels</div></div>
+      <div class="stat-card"><div class="stat-icon">💰</div><div class="stat-value">${totalRevenue.toLocaleString('fr-FR')}</div><div class="stat-label">FCFA encaissés</div></div>
+    `;
+
+    const items = [];
+    if(pendingR.ok && pendingR.data.pending && pendingR.data.pending.length){
+      items.push({ dot:'red', text: pendingR.data.pending.length + ' certification(s) artiste en attente', tab:'cert' });
+    }
+    if(labelsR.ok){
+      const pendingLabels = (labelsR.data.labels || []).filter(l => l.verification_status === 'pending' || l.verification_status === 'verification');
+      if(pendingLabels.length) items.push({ dot:'orange', text: pendingLabels.length + ' Label en attente de validation', tab:'labels' });
+    }
+    if(reportsR.ok && reportsR.data.reports && reportsR.data.reports.length){
+      items.push({ dot:'red', text: reportsR.data.reports.length + ' signalement(s) de morceaux à examiner', tab:'tracks' });
+    }
+    if(subsR.ok){
+      const pendingSubs = (subsR.data.subscriptions || []).filter(s => s.subscription_status === 'pending');
+      if(pendingSubs.length) items.push({ dot:'orange', text: pendingSubs.length + ' abonnement(s) en attente de paiement', tab:'subs' });
+      const expiring = (subsR.data.subscriptions || []).filter(s => s.subscription_status === 'active' && s.days_remaining != null && s.days_remaining <= 3);
+      if(expiring.length) items.push({ dot:'orange', text: expiring.length + ' abonnement(s) expirent dans ≤ 3 jours', tab:'subs' });
+    }
+    if(!items.length){
+      items.push({ dot:'green', text: 'Rien n\'attend d\'action pour le moment — tout est à jour.' });
+    }
+    feed.innerHTML = items.map(it => `<li><span class="dot ${it.dot}"></span><span>${it.text}${it.tab ? ' <a href="#" style="color:#c3aeff;" onclick="event.preventDefault(); document.querySelector(\'[data-tab=' + it.tab + ']\').click();">Voir →</a>' : ''}</span></li>`).join('');
+
+    security.innerHTML = `<li><span class="dot green"></span><span>Clé admin acceptée par le serveur — accès aux données confirmé.</span></li>`;
+  }
 
   // ---------- Diagnostic automatique de la clé admin (affiché directement dans la page,
   // pas besoin de console) — compare ce qui est tapé avec ce que le serveur attend. ----------
