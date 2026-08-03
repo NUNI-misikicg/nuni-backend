@@ -1724,7 +1724,13 @@ function rateLimitKeyFor(req) {
 }
 function rateLimit(maxRequests, windowMs) {
   return (req, res, next) => {
-    const key = rateLimitKeyFor(req);
+    // Avant : la clé ne comportait que l'identité (IP ou compte), donc TOUTES les routes
+    // protégées (jouer un morceau, liker, suivre, se connecter, créer un compte...) partageaient
+    // le même compteur. Une personne qui écoutait plusieurs morceaux pouvait ainsi se retrouver
+    // bloquée pour créer un compte, sans aucun rapport entre les deux actions. On inclut
+    // maintenant la route elle-même dans la clé : chaque endpoint a son propre compteur, comme prévu.
+    const routePart = (req.route && req.route.path) || req.path;
+    const key = routePart + '|' + rateLimitKeyFor(req);
     const now = Date.now();
     let bucket = rateLimitBuckets.get(key);
     if (!bucket || now > bucket.resetAt) {
@@ -3441,6 +3447,91 @@ app.post('/api/admin/verification/reset', h(async (req, res) => {
   if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
   await db.run(`UPDATE users SET is_verified = 0, verification_status = 'none' WHERE id = $1`, [user.id]);
   res.json({ message: `Certification réinitialisée pour ${user.artist_name || user.first_name}.` });
+}));
+
+// ================= CENTRE DE NOTIFICATIONS ADMIN (cloche) =================
+// Agrège de VRAIS événements déjà présents en base — jamais de contenu inventé :
+// certifications artiste en attente, Labels à valider, signalements de morceaux (ces deux
+// premiers restent tant qu'ils ne sont pas traités, exactement comme dans le Tableau de bord),
+// et paiements / inscriptions récents (fenêtre de 14 jours, sinon la cloche resterait polluée
+// indéfiniment par de très vieilles inscriptions). Chaque item a un id stable ("cert-12",
+// "payment-88"...) construit à partir du vrai id de la ligne source, pour que admin.html
+// puisse retenir localement ce qui a déjà été vu (la clé admin est partagée par l'équipe,
+// donc l'état "lu" est géré par navigateur, pas par compte individuel).
+app.get('/api/admin/notifications', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+
+  const [pendingCerts, pendingLabels, reports, recentPayments, recentSignups] = await Promise.all([
+    db.query(`
+      SELECT id, first_name, artist_name, created_at FROM users
+      WHERE account_type = 'artist' AND verification_status = 'pending'
+      ORDER BY created_at DESC LIMIT 20
+    `),
+    db.query(`
+      SELECT id, label_name, created_at FROM labels
+      WHERE verification_status IN ('pending','verification')
+      ORDER BY created_at DESC LIMIT 20
+    `),
+    db.query(`
+      SELECT tr.id, tr.created_at, t.title, u.artist_name, u.first_name as artist_first_name
+      FROM track_reports tr
+      JOIN tracks t ON t.id = tr.track_id
+      JOIN users u ON u.id = t.artist_id
+      ORDER BY tr.created_at DESC LIMIT 20
+    `),
+    db.query(`
+      SELECT p.id, p.amount_fcfa, p.created_at, u.first_name, u.last_name, u.artist_name
+      FROM payments p JOIN users u ON u.id = p.user_id
+      WHERE p.created_at > NOW() - INTERVAL '14 days'
+      ORDER BY p.created_at DESC LIMIT 20
+    `),
+    db.query(`
+      SELECT id, first_name, last_name, account_type, artist_name, created_at
+      FROM users
+      WHERE created_at > NOW() - INTERVAL '14 days'
+      ORDER BY created_at DESC LIMIT 20
+    `),
+  ]);
+
+  const items = [];
+  for (const c of pendingCerts) {
+    items.push({
+      id: 'cert-' + c.id, dot: 'red',
+      text: `🏅 Certification en attente : ${c.artist_name || c.first_name}`,
+      tab: 'cert', created_at: c.created_at,
+    });
+  }
+  for (const l of pendingLabels) {
+    items.push({
+      id: 'label-' + l.id, dot: 'orange',
+      text: `🏢 Nouveau Label à valider : ${l.label_name}`,
+      tab: 'labels', created_at: l.created_at,
+    });
+  }
+  for (const r of reports) {
+    items.push({
+      id: 'report-' + r.id, dot: 'red',
+      text: `🚩 Signalement : « ${r.title} » (${r.artist_name || r.artist_first_name})`,
+      tab: 'tracks', created_at: r.created_at,
+    });
+  }
+  for (const p of recentPayments) {
+    items.push({
+      id: 'payment-' + p.id, dot: 'green',
+      text: `💰 Paiement reçu : ${Number(p.amount_fcfa).toLocaleString('fr-FR')} FCFA (${p.artist_name || (p.first_name + ' ' + p.last_name)})`,
+      tab: 'subs', created_at: p.created_at,
+    });
+  }
+  for (const u of recentSignups) {
+    items.push({
+      id: 'signup-' + u.id, dot: 'green',
+      text: `✨ Nouvelle inscription : ${u.artist_name || (u.first_name + ' ' + u.last_name)} (${u.account_type})`,
+      tab: 'users', created_at: u.created_at,
+    });
+  }
+
+  items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ notifications: items.slice(0, 40) });
 }));
 
 app.get('/admin-verify.html', (req, res) => {
