@@ -1,10 +1,12 @@
 // server.js — Serveur NUNI (Express + Postgres/Neon + Cloudinary)
 require('dotenv').config();
 const path = require('path');
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const cloudinary = require('cloudinary').v2;
 const webpush = require('web-push');
+const { WebSocketServer } = require('ws');
 const db = require('./db');
 const {
   initAuth, hashPassword, verifyPassword, needsRehash, signToken, verifyToken, generateAccessCode,
@@ -40,6 +42,123 @@ function h(fn) {
     res.status(500).json({ error: 'Erreur serveur.' });
   });
 }
+
+// ================= MESSAGERIE TEMPS RÉEL (WebSocket) =================
+// Un seul canal /ws, partagé par les navigateurs admin (clé partagée par l'équipe, comme le
+// reste de l'admin) et les comptes utilisateurs connectés (identifiés par leur vrai JWT — même
+// vérification que authMiddleware). Pas de bibliothèque tierce de chat : juste de vraies lignes
+// en base (conversations/messages) + une diffusion en direct à qui est connecté à ce moment-là.
+// Si personne n'est connecté côté destinataire, le message reste quand même en base (visible à
+// la prochaine ouverture) et déclenche en plus une vraie notification (bell + push) côté user.
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+const adminSockets = new Set(); // navigateurs admin.html actuellement connectés
+const userSockets = new Map();  // userId -> Set de sockets (plusieurs onglets/appareils possibles)
+
+function wsSend(socket, payload) {
+  if (socket.readyState === socket.OPEN) {
+    try { socket.send(JSON.stringify(payload)); } catch (e) { /* socket fermé entre-temps, sans gravité */ }
+  }
+}
+function broadcastToAdmins(payload) {
+  for (const socket of adminSockets) wsSend(socket, payload);
+}
+function sendToUser(userId, payload) {
+  const sockets = userSockets.get(userId);
+  if (!sockets) return;
+  for (const socket of sockets) wsSend(socket, payload);
+}
+
+async function getOrCreateConversation(userId) {
+  let conv = await db.get('SELECT * FROM conversations WHERE user_id = $1', [userId]);
+  if (!conv) {
+    conv = await db.get('INSERT INTO conversations (user_id) VALUES ($1) RETURNING *', [userId]);
+  }
+  return conv;
+}
+
+// Point d'entrée UNIQUE pour enregistrer un message, que ce soit envoyé via WebSocket (temps
+// réel) ou via les routes REST /api/admin/messages/send et /api/messages/send (utilisées quand
+// le socket n'est pas encore ouvert, ou pas supporté par le client). Toujours la même vérité en
+// base, jamais deux chemins différents pour la même action.
+async function recordAndBroadcastMessage(userId, sender, rawBody) {
+  const body = String(rawBody || '').trim();
+  if (!body) throw new Error('Message vide.');
+  const conv = await getOrCreateConversation(userId);
+  const msg = await db.get(
+    'INSERT INTO messages (conversation_id, sender, body) VALUES ($1,$2,$3) RETURNING *',
+    [conv.id, sender, body],
+  );
+  const unreadField = sender === 'admin' ? 'unread_by_user' : 'unread_by_admin';
+  await db.run(
+    `UPDATE conversations SET last_message_at = NOW(), last_message_preview = $1, ${unreadField} = ${unreadField} + 1 WHERE id = $2`,
+    [body.slice(0, 140), conv.id],
+  );
+  const payload = { type: 'new_message', user_id: userId, message: msg };
+  broadcastToAdmins(payload);
+  sendToUser(userId, payload);
+  if (sender === 'admin') {
+    // Filet de sécurité si l'utilisateur n'a pas le chat ouvert à cet instant : la vraie
+    // notification (bell + push) prend le relais, avec le même mécanisme que le reste de NUNI.
+    createNotification(userId, 'admin_message', 'Nouveau message de NUNI', body.slice(0, 140), '/messages').catch(() => {});
+  }
+  return msg;
+}
+
+wss.on('connection', (socket, req) => {
+  let query;
+  try { query = new URL(req.url, 'http://localhost').searchParams; } catch (e) { socket.close(); return; }
+
+  const adminKey = (query.get('adminKey') || '').trim();
+  const token = query.get('token') || '';
+  const expectedAdminKey = (process.env.ADMIN_KEY || '').trim();
+
+  let role = null;
+  let userId = null;
+
+  if (adminKey && expectedAdminKey && adminKey === expectedAdminKey) {
+    role = 'admin';
+    adminSockets.add(socket);
+  } else if (token) {
+    const payload = verifyToken(token);
+    if (payload && payload.id) {
+      role = 'user';
+      userId = payload.id;
+      if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+      userSockets.get(userId).add(socket);
+    }
+  }
+
+  if (!role) {
+    wsSend(socket, { type: 'error', error: 'Authentification WebSocket invalide.' });
+    socket.close();
+    return;
+  }
+
+  socket.on('message', async (raw) => {
+    try {
+      const data = JSON.parse(raw.toString());
+      if (data.type === 'send_message' && typeof data.body === 'string') {
+        if (role === 'admin') {
+          const targetUserId = Number(data.user_id);
+          if (!targetUserId) return;
+          await recordAndBroadcastMessage(targetUserId, 'admin', data.body);
+        } else if (role === 'user') {
+          await recordAndBroadcastMessage(userId, 'user', data.body);
+        }
+      }
+    } catch (e) { console.error('Erreur message WebSocket:', e); }
+  });
+
+  socket.on('close', () => {
+    if (role === 'admin') adminSockets.delete(socket);
+    else if (role === 'user' && userSockets.has(userId)) {
+      userSockets.get(userId).delete(socket);
+      if (userSockets.get(userId).size === 0) userSockets.delete(userId);
+    }
+  });
+});
 
 async function uploadIfDataUri(value, resourceType) {
   if (!value) return null;
@@ -3356,7 +3475,7 @@ app.get('/api/admin/promo-codes', h(async (req, res) => {
 
 app.post('/api/admin/promo-codes', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
-  const { code, discount_pct, applies_to_plan, max_uses, expires_at, assigned_to_email, note } = req.body;
+  const { code, discount_pct, applies_to_plan, max_uses, expires_at, assigned_to_email, note, notify } = req.body;
   if (!code || !discount_pct) return res.status(400).json({ error: 'Le code et le pourcentage de réduction sont obligatoires.' });
   // Garde-fou contre une erreur de frappe (ex: "500" au lieu de "50") qui donnerait un prix
   // négatif une fois appliqué — aucune vraie utilité commerciale à un code >100% ou négatif.
@@ -3373,18 +3492,55 @@ app.post('/api/admin/promo-codes', h(async (req, res) => {
     if (!targetUser) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
     assignedUserId = targetUser.id;
   }
+  const cleanCode = String(code).toUpperCase().trim();
   try {
     await db.run(`
       INSERT INTO promo_codes (code, discount_pct, applies_to_plan, max_uses, expires_at, assigned_to_user_id, note)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
     `, [
-      String(code).toUpperCase().trim(), pct, applies_to_plan || null,
+      cleanCode, pct, applies_to_plan || null,
       Number(max_uses) || 1, expires_at || null, assignedUserId, note || null,
     ]);
   } catch (e) {
     return res.status(400).json({ error: 'Ce code existe déjà.' });
   }
-  res.json({ message: assignedUserId ? 'Code promo personnel créé et attribué.' : 'Code promo créé.' });
+
+  // ---------- Notification automatique du/des bénéficiaire(s) (brique Communication) ----------
+  // notify est vrai par défaut côté formulaire admin.html, mais reste désactivable (ex: import
+  // en masse de codes de test). Réutilise le même chemin que les notifications manuelles :
+  // createNotification pour chaque destinataire réel, plus une ligne dans admin_broadcasts
+  // pour que ça remonte aussi dans l'historique des envois.
+  let recipientCount = 0;
+  if (notify !== false) {
+    const title = `🎁 Nouveau code promo : ${cleanCode}`;
+    const body = `Profitez de ${pct}% de réduction${note ? ' — ' + note : ''}.`;
+    let targetIds = [];
+    let audienceLabel;
+    if (assignedUserId) {
+      targetIds = [assignedUserId];
+      audienceLabel = assigned_to_email;
+    } else {
+      const planTypes = applies_to_plan ? [applies_to_plan] : ['artist', 'consumer'];
+      const rows = await db.query('SELECT id FROM users WHERE account_type = ANY($1)', [planTypes]);
+      targetIds = rows.map((r) => r.id);
+      audienceLabel = applies_to_plan || 'artist+consumer';
+    }
+    for (const userId of targetIds) {
+      await createNotification(userId, 'promo_code', title, body, '/pass');
+    }
+    recipientCount = targetIds.length;
+    if (recipientCount > 0) {
+      await db.run(
+        `INSERT INTO admin_broadcasts (title, body, link, audience, recipient_count) VALUES ($1,$2,$3,$4,$5)`,
+        [title, body, '/pass', audienceLabel, recipientCount],
+      );
+    }
+  }
+
+  res.json({
+    message: assignedUserId ? 'Code promo personnel créé et attribué.' : 'Code promo créé.',
+    notified_count: recipientCount,
+  });
 }));
 
 // ---------- Codes promo personnels — vus par l'utilisateur lui-même ----------
@@ -3518,6 +3674,73 @@ app.get('/api/admin/notifications/history', h(async (req, res) => {
   res.json({ broadcasts: rows });
 }));
 
+// ================= MESSAGERIE PRIVÉE TEMPS RÉEL (support admin ↔ utilisateur) =================
+// Le temps réel lui-même (envoi/réception instantanés) passe par le serveur WebSocket configuré
+// plus bas (voir wss.on('connection', ...)). Les routes REST ci-dessous ne servent qu'au
+// CHARGEMENT initial (historique, liste des conversations) — jamais à l'envoi, qui passe
+// uniquement par le WebSocket pour rester réellement instantané des deux côtés.
+
+// Résout un email en compte réel — utilisé par admin.html pour démarrer une conversation avec
+// un utilisateur qui n'a encore aucun historique (donc absent de /api/admin/conversations).
+app.get('/api/admin/users/lookup', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const email = String(req.query.email || '').trim();
+  if (!isEmail(email)) return res.status(400).json({ error: 'Email invalide.' });
+  const user = await db.get(
+    'SELECT id, first_name, last_name, email, artist_name, account_type FROM users WHERE LOWER(email) = LOWER($1)',
+    [email],
+  );
+  if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+  res.json({ user });
+}));
+
+app.get('/api/admin/conversations', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(`
+    SELECT c.id as conversation_id, c.user_id, c.last_message_at, c.last_message_preview, c.unread_by_admin,
+           u.first_name, u.last_name, u.email, u.artist_name, u.account_type
+    FROM support_conversations c JOIN users u ON u.id = c.user_id
+    ORDER BY c.last_message_at DESC NULLS LAST
+  `);
+  res.json({ conversations: rows });
+}));
+
+// Historique d'une conversation, ouverte depuis la liste ou depuis la fiche utilisateur.
+// Ne CRÉE jamais la conversation ici (juste une lecture) — elle n'existe que si au moins un
+// message a déjà été envoyé (voir wss.on('connection') plus bas). Remet unread_by_admin à 0 :
+// ouvrir le fil équivaut à le marquer lu côté équipe NUNI.
+app.get('/api/admin/conversations/:userId/messages', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const userId = Number(req.params.userId);
+  const conv = await db.get('SELECT * FROM support_conversations WHERE user_id = $1', [userId]);
+  if (!conv) return res.json({ messages: [] });
+  const rows = await db.query(
+    'SELECT id, sender_type, body, created_at FROM support_messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 300',
+    [conv.id],
+  );
+  await db.run('UPDATE support_conversations SET unread_by_admin = 0 WHERE id = $1', [conv.id]);
+  res.json({ messages: rows });
+}));
+
+// Côté utilisateur (appli NUNI) : historique de SA propre conversation avec le support.
+app.get('/api/me/support/messages', authMiddleware, h(async (req, res) => {
+  const conv = await db.get('SELECT * FROM support_conversations WHERE user_id = $1', [req.user.id]);
+  if (!conv) return res.json({ messages: [] });
+  const rows = await db.query(
+    'SELECT id, sender_type, body, created_at FROM support_messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 300',
+    [conv.id],
+  );
+  await db.run('UPDATE support_conversations SET unread_by_user = 0 WHERE id = $1', [conv.id]);
+  res.json({ messages: rows });
+}));
+
+// Compteur non lu, SANS marquer comme lu — utilisé pour le badge au chargement de l'appli,
+// avant que la personne ait ouvert le chat (même logique que /api/notifications/unread-count).
+app.get('/api/me/support/unread-count', authMiddleware, h(async (req, res) => {
+  const conv = await db.get('SELECT unread_by_user FROM support_conversations WHERE user_id = $1', [req.user.id]);
+  res.json({ count: conv ? conv.unread_by_user : 0 });
+}));
+
 app.get('/api/admin/notifications', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
 
@@ -3592,6 +3815,85 @@ app.get('/api/admin/notifications', h(async (req, res) => {
 
   items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   res.json({ notifications: items.slice(0, 40) });
+}));
+
+// ================= MESSAGERIE PRIVÉE (admin ↔ utilisateur) =================
+// Toutes les routes REST délèguent à recordAndBroadcastMessage (défini plus haut, avec le
+// serveur WebSocket) — un envoi via REST ou via le socket suit exactement le même chemin,
+// donc la même vérité en base et la même diffusion temps réel dans les deux cas.
+
+app.get('/api/admin/conversations', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(`
+    SELECT c.id, c.user_id, c.last_message_at, c.last_message_preview, c.unread_by_admin, c.created_at,
+           u.first_name, u.last_name, u.email, u.account_type, u.artist_name, u.plan
+    FROM conversations c JOIN users u ON u.id = c.user_id
+    ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC
+  `);
+  res.json({ conversations: rows });
+}));
+
+app.get('/api/admin/conversations/:userId/messages', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const userId = Number(req.params.userId);
+  const user = await db.get(
+    'SELECT id, first_name, last_name, email, account_type, artist_name, plan, is_verified, created_at FROM users WHERE id = $1',
+    [userId],
+  );
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+  const conv = await getOrCreateConversation(userId);
+  const messages = await db.query(
+    'SELECT id, sender, body, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
+    [conv.id],
+  );
+  await db.run('UPDATE conversations SET unread_by_admin = 0 WHERE id = $1', [conv.id]);
+  res.json({ user, messages });
+}));
+
+app.post('/api/admin/messages/send', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { user_id, email, body } = req.body;
+  let targetId = Number(user_id) || null;
+  if (!targetId && email) {
+    const user = await db.get('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [String(email).trim()]);
+    if (!user) return res.status(404).json({ error: "Aucun compte NUNI n'existe avec cet email." });
+    targetId = user.id;
+  }
+  if (!targetId) return res.status(400).json({ error: 'Utilisateur cible manquant.' });
+  if (!body || !String(body).trim()) return res.status(400).json({ error: 'Message vide.' });
+  try {
+    const msg = await recordAndBroadcastMessage(targetId, 'admin', body);
+    res.json({ message: msg });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Erreur.' });
+  }
+}));
+
+// ---------- Côté utilisateur (appli NUNI) ----------
+app.get('/api/messages', authMiddleware, h(async (req, res) => {
+  const conv = await getOrCreateConversation(req.user.id);
+  const messages = await db.query(
+    'SELECT id, sender, body, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
+    [conv.id],
+  );
+  await db.run('UPDATE conversations SET unread_by_user = 0 WHERE id = $1', [conv.id]);
+  res.json({ messages });
+}));
+
+app.get('/api/messages/unread-count', authMiddleware, h(async (req, res) => {
+  const conv = await db.get('SELECT unread_by_user FROM conversations WHERE user_id = $1', [req.user.id]);
+  res.json({ count: conv ? conv.unread_by_user : 0 });
+}));
+
+app.post('/api/messages/send', authMiddleware, h(async (req, res) => {
+  const { body } = req.body;
+  if (!body || !String(body).trim()) return res.status(400).json({ error: 'Message vide.' });
+  try {
+    const msg = await recordAndBroadcastMessage(req.user.id, 'user', body);
+    res.json({ message: msg });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Erreur.' });
+  }
 }));
 
 app.get('/admin-verify.html', (req, res) => {
@@ -3700,7 +4002,7 @@ async function start() {
   setInterval(enforceDiscoveryDeletion, 5 * 60 * 1000);
 
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`NUNI backend en écoute sur http://localhost:${PORT}`));
+  server.listen(PORT, () => console.log(`NUNI backend en écoute sur http://localhost:${PORT} (HTTP + WebSocket /ws)`));
 }
 
 start().catch((err) => {
