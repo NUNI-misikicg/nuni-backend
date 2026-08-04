@@ -622,7 +622,7 @@
           <b style="color:var(--gold); font-size:12.5px;">Conversations</b>
           <button class="secondary" style="padding:4px 10px; font-size:11px;" onclick="loadConversations()">↻</button>
         </div>
-        <div id="msg-conv-list" style="flex:1; overflow-y:auto;"><div class="muted" style="padding:14px;">Chargement…</div></div>
+        <div id="msg-conv-list" style="flex:1; overflow-y:auto;"><div class="muted msg-conv-loading" style="padding:14px;">Chargement…</div></div>
       </div>
       <div class="msg-chat-col">
         <div id="msg-chat-header" class="msg-chat-header muted">Sélectionnez une conversation à gauche.</div>
@@ -1935,17 +1935,33 @@
     adminWS.onerror = () => { try{ adminWS.close(); }catch(e){} };
   }
 
+  let convRetryTimer = null;
   async function loadConversations(){
     const key = getAdminKeyStored();
     const wrap = document.getElementById('msg-conv-list');
     if(!key || !wrap) return;
+    clearTimeout(convRetryTimer);
+    const stillLoading = !!wrap.querySelector('.msg-conv-loading');
     try{
       const res = await fetch('/api/admin/conversations', { headers:{ 'x-admin-key': key } });
       const data = await res.json();
-      if(!res.ok) return;
+      if(!res.ok){
+        if(stillLoading){
+          wrap.innerHTML = `<div class="muted msg-conv-loading" style="padding:14px;">❌ ${data.error || 'Erreur.'}<br>Nouvelle tentative dans 5s…</div>`;
+          convRetryTimer = setTimeout(loadConversations, 5000);
+        }
+        return;
+      }
       conversationsCache = data.conversations || [];
       renderConversationList();
-    }catch(e){ /* on garde la dernière liste affichée */ }
+    }catch(e){
+      // Sur l'offre gratuite Render, le serveur peut mettre jusqu'à ~1 min à se réveiller
+      // après une période sans trafic — on réessaie tout seul plutôt que de rester bloqué.
+      if(stillLoading){
+        wrap.innerHTML = '<div class="muted msg-conv-loading" style="padding:14px;">⏳ Le serveur se réveille (jusqu\'à 1 min sur l\'offre gratuite)… nouvelle tentative automatique.</div>';
+        convRetryTimer = setTimeout(loadConversations, 5000);
+      }
+    }
   }
 
   function renderConversationList(){
@@ -2028,6 +2044,12 @@
   // Connexion WebSocket dès que la clé admin est disponible, pour recevoir les messages en
   // direct même si l'onglet Messagerie n'a pas encore été ouvert.
   window.addEventListener('load', () => { setTimeout(connectAdminWS, 500); });
+  // Filet de sécurité : tant que l'onglet Messagerie est affiché, on rafraîchit la liste
+  // toutes les 20s même si le WebSocket a raté un événement (reconnexion, veille Render...).
+  setInterval(() => {
+    const pane = document.getElementById('pane-comm-msg');
+    if(pane && pane.classList.contains('active')) loadConversations();
+  }, 20000);
 </script>
 </body>
 </html>
