@@ -1081,6 +1081,27 @@ app.get('/api/me/recap', authMiddleware, h(async (req, res) => {
   res.json({ months: months.map((m) => m.month), targetMonth, totalPlays, topArtists, topTracks });
 }));
 
+// ---------- "Écoutés récemment" — vrai historique d'écoute, un morceau une seule fois
+// (regroupé par morceau, daté par sa toute dernière écoute) — jamais une liste brute de
+// lignes "plays" qui répéterait le même morceau plusieurs fois s'il a été relancé souvent.
+app.get('/api/me/recently-played', authMiddleware, h(async (req, res) => {
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 15));
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+           u.id as artist_id, u.artist_name, u.first_name, u.is_verified, u.avatar_url as artist_avatar_url,
+           MAX(p.created_at) as last_played_at
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    JOIN users u ON u.id = t.artist_id
+    WHERE p.listener_id = $1
+    GROUP BY t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+             u.id, u.artist_name, u.first_name, u.is_verified, u.avatar_url
+    ORDER BY last_played_at DESC
+    LIMIT $2
+  `, [req.user.id, limit]);
+  res.json({ tracks: rows });
+}));
+
 app.get('/api/stats/geo', h(async (req, res) => {
   const topCountries = await db.query(`
     SELECT u.country, COUNT(*)::int as plays
