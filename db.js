@@ -532,6 +532,23 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
   `);
 
+  // ---------- "Reprendre l'écoute" — vraie position de lecture, par compte et par morceau ----------
+  // Un seul enregistrement par (utilisateur, morceau) — la position la plus récente écrase
+  // la précédente. Sauvegardée périodiquement pendant la lecture (voir /api/me/playback-position
+  // dans server.js) et effacée dès que le morceau se termine naturellement — jamais de
+  // "reprendre" proposé sur un morceau déjà fini.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS playback_positions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      position_seconds INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, track_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_playback_positions_user ON playback_positions(user_id, updated_at DESC);
+  `);
+
   // ---------- Playlists NUNI — curées par l'équipe depuis admin.html ----------
   // Jamais de playlist générée automatiquement sans validation humaine (voir l'onglet
   // Playlists de admin.html, avec tirage aléatoire proposé comme point de départ seulement).

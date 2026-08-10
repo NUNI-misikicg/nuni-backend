@@ -1102,6 +1102,48 @@ app.get('/api/me/recently-played', authMiddleware, h(async (req, res) => {
   res.json({ tracks: rows });
 }));
 
+// ---------- "Reprendre l'écoute" — vraie position de lecture par morceau ----------
+// Sauvegarde périodique pendant la lecture (voir app.js, appelée toutes les ~10s pendant
+// qu'un vrai morceau audio joue). Une position trop proche du début ne vaut pas la peine
+// d'être retenue (reprendrait pratiquement du début de toute façon).
+app.post('/api/me/playback-position', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.body.trackId);
+  const positionSeconds = Math.max(0, Math.round(Number(req.body.positionSeconds) || 0));
+  if (!trackId) return res.status(400).json({ error: 'trackId requis.' });
+  if (positionSeconds < 15) {
+    await db.run('DELETE FROM playback_positions WHERE user_id = $1 AND track_id = $2', [req.user.id, trackId]);
+    return res.json({ ok: true, cleared: true });
+  }
+  await db.run(`
+    INSERT INTO playback_positions (user_id, track_id, position_seconds, updated_at)
+    VALUES ($1,$2,$3,NOW())
+    ON CONFLICT (user_id, track_id) DO UPDATE SET position_seconds = $3, updated_at = NOW()
+  `, [req.user.id, trackId, positionSeconds]);
+  res.json({ ok: true });
+}));
+
+// Efface une position précise — morceau terminé naturellement, ou relancé depuis le début.
+app.delete('/api/me/playback-position/:trackId', authMiddleware, h(async (req, res) => {
+  await db.run('DELETE FROM playback_positions WHERE user_id = $1 AND track_id = $2', [req.user.id, Number(req.params.trackId)]);
+  res.json({ ok: true });
+}));
+
+// Morceaux à reprendre — les plus récemment laissés en cours d'abord, jusqu'à 5.
+app.get('/api/me/resume', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT pp.track_id, pp.position_seconds, pp.updated_at,
+           t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+           u.id as artist_id, u.artist_name, u.first_name, u.is_verified, u.avatar_url as artist_avatar_url
+    FROM playback_positions pp
+    JOIN tracks t ON t.id = pp.track_id
+    JOIN users u ON u.id = t.artist_id
+    WHERE pp.user_id = $1
+    ORDER BY pp.updated_at DESC
+    LIMIT 5
+  `, [req.user.id]);
+  res.json({ resumes: rows });
+}));
+
 app.get('/api/stats/geo', h(async (req, res) => {
   const topCountries = await db.query(`
     SELECT u.country, COUNT(*)::int as plays
