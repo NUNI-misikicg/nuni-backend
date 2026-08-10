@@ -1144,6 +1144,33 @@ app.get('/api/me/resume', authMiddleware, h(async (req, res) => {
   res.json({ resumes: rows });
 }));
 
+// ---------- "Votre sélection NUNI" — vraie sélection basée sur les genres que ce compte
+// écoute le plus (table plays), jamais un algorithme flou ou des chiffres inventés. Sans
+// historique d'écoute, la sélection est simplement absente (pas de repli aléatoire déguisé
+// en "personnalisé") — le frontend masque alors la section entière.
+app.get('/api/me/selection', authMiddleware, h(async (req, res) => {
+  const topGenres = await db.query(`
+    SELECT t.genre, COUNT(*)::int as plays
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE p.listener_id = $1 AND t.genre IS NOT NULL
+    GROUP BY t.genre ORDER BY plays DESC LIMIT 3
+  `, [req.user.id]);
+  if (!topGenres.length) return res.json({ genres: [], tracks: [] });
+  const genreNames = topGenres.map((g) => g.genre);
+  // Morceaux réels de ces genres, en excluant ceux déjà beaucoup écoutés par cette même
+  // personne (on veut prolonger ses goûts, pas juste lui rejouer ce qu'elle connaît déjà).
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+           u.id as artist_id, u.artist_name, u.first_name, u.is_verified, u.avatar_url as artist_avatar_url,
+           COALESCE((SELECT COUNT(*)::int FROM plays p2 WHERE p2.track_id = t.id AND p2.listener_id = $1), 0) as my_plays
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.published = 1 AND t.genre = ANY($2::text[])
+    ORDER BY my_plays ASC, t.streams DESC
+    LIMIT 20
+  `, [req.user.id, genreNames]);
+  res.json({ genres: genreNames, tracks: rows });
+}));
+
 app.get('/api/stats/geo', h(async (req, res) => {
   const topCountries = await db.query(`
     SELECT u.country, COUNT(*)::int as plays
