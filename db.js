@@ -595,32 +595,6 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
-  // ---------- Messagerie privée temps réel (admin ↔ utilisateur) ----------
-  // Une conversation par compte utilisateur (support à 2 parties, pas un groupe) — un seul
-  // fil qui mélange les messages de l'équipe NUNI et de la personne, comme un vrai support
-  // Messenger/Discord. Créée à la volée au tout premier message envoyé (par l'un ou l'autre
-  // côté). unread_by_admin / unread_by_user sont de vrais compteurs incrémentés à chaque
-  // message et remis à 0 à la lecture (voir server.js, recordAndBroadcastMessage).
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-      last_message_at TIMESTAMPTZ,
-      last_message_preview TEXT,
-      unread_by_admin INTEGER NOT NULL DEFAULT 0,
-      unread_by_user INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-      id SERIAL PRIMARY KEY,
-      conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      sender TEXT NOT NULL CHECK(sender IN ('user','admin')),
-      body TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
-  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };
