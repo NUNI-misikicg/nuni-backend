@@ -41,14 +41,27 @@ function h(fn) {
   });
 }
 
+// Avant : toute valeur qui n'était pas une data-URI était renvoyée TELLE QUELLE, sans
+// aucune vérification — utilisé par la création de morceaux (cover/audio), de clips
+// (thumb/vidéo), la galerie "À propos", et les documents Label. N'importe quel champ pouvait
+// donc recevoir une URL externe arbitraire au lieu d'un vrai fichier uploadé sur Cloudinary,
+// stockée telle quelle et servie ensuite comme si c'était un vrai contenu NUNI (risque de
+// contenu non modéré, de lien piégé, ou de traceur invisible). Maintenant : une valeur qui
+// n'est ni une data-URI ni déjà une vraie URL Cloudinary est refusée (null) plutôt
+// qu'acceptée aveuglément.
 async function uploadIfDataUri(value, resourceType) {
   if (!value) return null;
-  if (!String(value).startsWith('data:')) return value;
+  if (!String(value).startsWith('data:')) {
+    return isCloudinaryUrl(value) ? value : null;
+  }
   const result = await cloudinary.uploader.upload(value, {
     resource_type: resourceType,
     folder: 'nuni',
   });
   return result.secure_url;
+}
+function isCloudinaryUrl(url) {
+  return typeof url === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(url);
 }
 
 app.get('/api/upload-signature', authMiddleware, h(async (req, res) => {
@@ -475,10 +488,15 @@ app.post('/api/login', rateLimit(10, 15 * 60000), h(async (req, res) => {
   await enforceSubscriptionExpiry();
   const { email, password } = req.body;
   const user = await db.get('SELECT * FROM users WHERE email = $1', [email || '']);
-  if (!user) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
-
-  const ok = await verifyPassword(password || '', user.password_hash);
-  if (!ok) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
+  // Avant : répondre "email inconnu" était quasi instantané, alors que "mauvais mot de
+  // passe" prenait le temps du calcul Argon2id (volontairement lent) sur un vrai hash — la
+  // différence de délai entre les deux permettait de deviner quels emails ont un compte
+  // NUNI, juste en chronométrant les réponses (email enumeration par timing). Un compte
+  // inexistant déclenche maintenant quand même une vraie vérification, contre un hash
+  // factice fixe, pour un temps de réponse cohérent dans les deux cas.
+  const DUMMY_HASH = '$argon2id$v=19$m=65536,p=4,t=3$FFEARNH0EaLUJ5yNEJYXeg$pzICrPiEaM5VBe02AHRDPmjPuqCNHhGG2AlvpQ87WPg';
+  const ok = await verifyPassword(password || '', user ? user.password_hash : DUMMY_HASH);
+  if (!user || !ok) return res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
 
   // Migration Argon2id transparente : si ce compte a encore un ancien hash bcrypt, on le
   // ré-hache maintenant qu'on connaît le mot de passe en clair (juste le temps de cette
@@ -2049,9 +2067,15 @@ app.put('/api/artist/momo', authMiddleware, h(async (req, res) => {
 // Avant : "Changer la photo de profil" ne faisait qu'un aperçu local dans le navigateur,
 // jamais envoyé au serveur — perdu au rechargement, et jamais visible sur la vraie page
 // artiste (qui affichait toujours les initiales, sans jamais vérifier une vraie photo).
+// Avant : avatarUrl/bannerUrl acceptaient n'importe quelle URL commençant par "http" — un
+// compte aurait pu y mettre un lien externe arbitraire (traceur invisible qui logue les
+// visiteurs du profil, contenu inapproprié jamais passé par la modération Cloudinary, etc.).
+// Maintenant : uniquement une vraie URL Cloudinary (isCloudinaryUrl, définie plus haut avec
+// uploadIfDataUri), cohérente avec le seul vrai chemin d'upload de l'app.
+
 app.put('/api/artist/avatar', authMiddleware, h(async (req, res) => {
   const { avatarUrl } = req.body;
-  if (!avatarUrl || !String(avatarUrl).startsWith('http')) return res.status(400).json({ error: 'URL de photo invalide.' });
+  if (!isCloudinaryUrl(avatarUrl)) return res.status(400).json({ error: 'URL de photo invalide.' });
   await db.run('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, req.user.id]);
   res.json({ message: 'Photo de profil mise à jour.', avatar_url: avatarUrl });
 }));
@@ -2062,7 +2086,7 @@ app.put('/api/artist/avatar', authMiddleware, h(async (req, res) => {
 app.put('/api/artist/banner', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
   const { bannerUrl } = req.body;
-  if (!bannerUrl || !String(bannerUrl).startsWith('http')) return res.status(400).json({ error: 'URL de photo invalide.' });
+  if (!isCloudinaryUrl(bannerUrl)) return res.status(400).json({ error: 'URL de photo invalide.' });
   await db.run('UPDATE users SET banner_url = $1 WHERE id = $2', [bannerUrl, req.user.id]);
   res.json({ message: 'Photo de couverture mise à jour.', banner_url: bannerUrl });
 }));
