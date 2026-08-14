@@ -569,6 +569,26 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id, position);
   `);
 
+  // ---------- Playlists PERSONNELLES — créées par chaque utilisateur, jamais mélangées
+  // avec les playlists officielles NUNI ci-dessus (curées par l'équipe) ----------
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_playlists (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS user_playlist_tracks (
+      id SERIAL PRIMARY KEY,
+      playlist_id INTEGER NOT NULL REFERENCES user_playlists(id) ON DELETE CASCADE,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(playlist_id, track_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_playlist_tracks_playlist ON user_playlist_tracks(playlist_id, added_at);
+    CREATE INDEX IF NOT EXISTS idx_user_playlists_user ON user_playlists(user_id, created_at);
+  `);
+
   // ---------- Signalements de morceaux — vrais, consultables côté admin ----------
   // Avant : le bouton "Signaler" affichait juste un message de confirmation, sans jamais
   // rien enregistrer nulle part. Maintenant : un vrai signalement, avec motif.

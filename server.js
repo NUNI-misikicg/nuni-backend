@@ -1791,6 +1791,74 @@ app.get('/api/playlists/:id', h(async (req, res) => {
   res.json({ playlist, tracks });
 }));
 
+// ---------- Playlists PERSONNELLES — créées par chaque utilisateur, jamais mélangées avec
+// les playlists officielles NUNI ci-dessus (même esprit, mais rattachées à un compte précis
+// via user_id, avec vérification systématique du propriétaire avant toute modification). ----------
+app.get('/api/me/playlists', authMiddleware, h(async (req, res) => {
+  const playlists = await db.query('SELECT id, title, created_at FROM user_playlists WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+  for (const p of playlists) {
+    const countRow = await db.get('SELECT COUNT(*)::int as c FROM user_playlist_tracks WHERE playlist_id = $1', [p.id]);
+    p.track_count = countRow.c;
+    const firstCover = await db.get(`
+      SELECT t.cover_url FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id
+      WHERE upt.playlist_id = $1 ORDER BY upt.added_at LIMIT 1
+    `, [p.id]);
+    p.cover_url = firstCover ? firstCover.cover_url : null;
+  }
+  res.json({ playlists });
+}));
+
+app.post('/api/me/playlists', authMiddleware, rateLimit(20, 60000), h(async (req, res) => {
+  const title = (req.body && req.body.title ? String(req.body.title) : '').trim().slice(0, 100);
+  if (!title) return res.status(400).json({ error: 'Un nom de playlist est requis.' });
+  const row = await db.get(
+    'INSERT INTO user_playlists (user_id, title) VALUES ($1, $2) RETURNING id, title, created_at',
+    [req.user.id, title],
+  );
+  res.json({ playlist: { ...row, track_count: 0, cover_url: null } });
+}));
+
+app.delete('/api/me/playlists/:id', authMiddleware, h(async (req, res) => {
+  const playlist = await db.get('SELECT id FROM user_playlists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist introuvable.' });
+  await db.run('DELETE FROM user_playlists WHERE id = $1', [req.params.id]);
+  res.json({ deleted: true });
+}));
+
+app.get('/api/me/playlists/:id', authMiddleware, h(async (req, res) => {
+  const playlist = await db.get('SELECT id, title, created_at FROM user_playlists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist introuvable.' });
+  const tracks = await db.query(`
+    SELECT t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+      u.artist_name, u.first_name, u.is_verified, u.id as artist_id
+    FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id JOIN users u ON u.id = t.artist_id
+    WHERE upt.playlist_id = $1 ORDER BY upt.added_at DESC
+  `, [req.params.id]);
+  res.json({ playlist, tracks });
+}));
+
+app.post('/api/me/playlists/:id/tracks', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
+  const playlist = await db.get('SELECT id FROM user_playlists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist introuvable.' });
+  const trackId = Number(req.body && req.body.trackId);
+  const track = await db.get('SELECT id FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  // Insertion atomique — même pattern que les likes/suivis : jamais d'erreur si le morceau
+  // est déjà dans la playlist, on ignore simplement en silence.
+  await db.run(
+    'INSERT INTO user_playlist_tracks (playlist_id, track_id) VALUES ($1,$2) ON CONFLICT (playlist_id, track_id) DO NOTHING',
+    [req.params.id, trackId],
+  );
+  res.json({ added: true });
+}));
+
+app.delete('/api/me/playlists/:id/tracks/:trackId', authMiddleware, h(async (req, res) => {
+  const playlist = await db.get('SELECT id FROM user_playlists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist introuvable.' });
+  await db.run('DELETE FROM user_playlist_tracks WHERE playlist_id = $1 AND track_id = $2', [req.params.id, req.params.trackId]);
+  res.json({ removed: true });
+}));
+
 function checkAdminKey(req, res) {
   const adminKey = (req.headers['x-admin-key'] || '').trim();
   const expectedKey = (process.env.ADMIN_KEY || '').trim();
