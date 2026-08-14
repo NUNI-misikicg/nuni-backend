@@ -1706,7 +1706,12 @@ async function activateAndNotify(user, plan, durationDays, promoCode) {
   `, [user.id, plan, durationDays, amount_fcfa, (promoResult.valid && promoResult.code) ? promoResult.code : null]);
 
   if (promoResult.valid && promoResult.code) {
-    await db.run('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [promoResult.code]);
+    // Avant : "vérifier la limite" (resolvePromoDiscount) puis "incrémenter" étaient deux
+    // requêtes séparées — une fenêtre de course entre les deux pouvait, en cas d'appels
+    // simultanés, laisser le compteur dépasser max_uses. Une seule requête conditionnelle
+    // (WHERE used_count < max_uses) rend l'opération atomique : impossible de dépasser la
+    // limite quel que soit le nombre de tentatives simultanées.
+    await db.run('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1 AND used_count < max_uses', [promoResult.code]);
   }
   await addXp(user.id, 300);
 
