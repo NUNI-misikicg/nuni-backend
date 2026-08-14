@@ -596,6 +596,25 @@
 </div>
 
 <script>
+  // ---------- Échappement HTML — CORRECTIF SÉCURITÉ CRITIQUE ----------
+  // Avant : aucune donnée utilisateur (nom d'artiste, titre de morceau, bio, description de
+  // Label, raison de refus, nom de campagne publicitaire...) n'était jamais échappée avant
+  // d'être injectée directement dans le HTML du panneau admin (innerHTML). N'importe quel
+  // compte pouvait donc placer un script dans son propre nom/bio/titre de morceau — ce script
+  // s'exécutait alors dans LE NAVIGATEUR DE L'ADMIN dès qu'il consultait cette donnée
+  // (liste des utilisateurs, morceaux, Labels en attente...), avec accès à tout ce que
+  // l'admin peut faire depuis sa session, y compris voler la clé admin stockée en
+  // localStorage. Toute donnée qui vient d'un compte utilisateur doit désormais passer par
+  // esc() avant d'être insérée dans un template HTML.
+  function esc(v){
+    if(v === null || v === undefined) return '';
+    return String(v)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
   function getKey(){ const k = document.getElementById('key').value.trim(); localStorage.setItem('nuniAdminKey', k); return k; }
 
   // ============ TABLEAU DE BORD ============
@@ -667,7 +686,7 @@
     if(!items.length){
       items.push({ dot:'green', text: 'Rien n\'attend d\'action pour le moment — tout est à jour.' });
     }
-    feed.innerHTML = items.map(it => `<li><span class="dot ${it.dot}"></span><span>${it.text}${it.tab ? ' <a href="#" style="color:#c3aeff;" onclick="event.preventDefault(); document.querySelector(\'[data-tab=' + it.tab + ']\').click();">Voir →</a>' : ''}</span></li>`).join('');
+    feed.innerHTML = items.map(it => `<li><span class="dot ${it.dot}"></span><span>${esc(it.text)}${it.tab ? ' <a href="#" style="color:#c3aeff;" onclick="event.preventDefault(); document.querySelector(\'[data-tab=' + it.tab + ']\').click();">Voir →</a>' : ''}</span></li>`).join('');
 
     security.innerHTML = `<li><span class="dot green"></span><span>Clé admin acceptée par le serveur — accès aux données confirmé.</span></li>`;
   }
@@ -814,10 +833,10 @@
         row.style.cssText = 'display:flex; align-items:center; gap:12px; padding:10px;';
         const dateLabel = new Date(ev.event_date).toLocaleDateString('fr-FR', {day:'2-digit', month:'short', year:'numeric'});
         row.innerHTML = `
-          <div style="width:44px; height:56px; border-radius:6px; background:${ev.flyer_url ? `url(${ev.flyer_url})` : '#1a1410'}; background-size:cover; background-position:center; flex-shrink:0;"></div>
+          <div style="width:44px; height:56px; border-radius:6px; background:${ev.flyer_url ? `url(${esc(ev.flyer_url)})` : '#1a1410'}; background-size:cover; background-position:center; flex-shrink:0;"></div>
           <div style="flex:1; min-width:0;">
-            <div style="font-weight:700; font-size:13px;">${ev.title}</div>
-            <div class="muted">${ev.category} · ${dateLabel}${ev.venue ? ' · ' + ev.venue : ''}</div>
+            <div style="font-weight:700; font-size:13px;">${esc(ev.title)}</div>
+            <div class="muted">${esc(ev.category)} · ${dateLabel}${ev.venue ? ' · ' + esc(ev.venue) : ''}</div>
           </div>
           <button class="secondary" onclick='editNuniEvent(${ev.id}, ${JSON.stringify(ev.purchase_locations || "")}, ${JSON.stringify(ev.purchase_phone_numbers || "")})'>Modifier billetterie</button>
           <button class="secondary" onclick="deleteNuniEvent(${ev.id})">Supprimer</button>`;
@@ -870,26 +889,26 @@
         row.className = 'card';
         row.style.cssText = 'margin-bottom:10px;';
         const docsLinks = [
-          l.responsible_id_doc_url ? `<a href="${l.responsible_id_doc_url}" target="_blank" rel="noopener noreferrer">Pièce d'identité</a>` : null,
-          l.label_doc_url ? `<a href="${l.label_doc_url}" target="_blank" rel="noopener noreferrer">Justificatif du label</a>` : null,
+          l.responsible_id_doc_url ? `<a href="${esc(l.responsible_id_doc_url)}" target="_blank" rel="noopener noreferrer">Pièce d'identité</a>` : null,
+          l.label_doc_url ? `<a href="${esc(l.label_doc_url)}" target="_blank" rel="noopener noreferrer">Justificatif du label</a>` : null,
         ].filter(Boolean).join(' · ') || '<span class="muted">Aucun document fourni</span>';
         row.innerHTML = `
           <div style="display:flex; align-items:center; gap:12px;">
-            ${l.logo_url ? `<div style="width:44px; height:44px; border-radius:8px; background:url(${l.logo_url}); background-size:cover; background-position:center; flex-shrink:0;"></div>` : ''}
+            ${l.logo_url ? `<div style="width:44px; height:44px; border-radius:8px; background:url(${esc(l.logo_url)}); background-size:cover; background-position:center; flex-shrink:0;"></div>` : ''}
             <div style="flex:1; min-width:0;">
-              <div style="font-weight:700; font-size:14px;">${l.label_name} <span class="muted">— ${l.legal_name || ''}</span></div>
-              <div class="muted">${statusLabels[l.verification_status] || l.verification_status} · ${planLabels[l.plan] || l.plan}</div>
+              <div style="font-weight:700; font-size:14px;">${esc(l.label_name)} <span class="muted">— ${esc(l.legal_name || '')}</span></div>
+              <div class="muted">${esc(statusLabels[l.verification_status] || l.verification_status)} · ${esc(planLabels[l.plan] || l.plan)}</div>
             </div>
           </div>
           <div style="margin-top:10px; font-size:12.5px; line-height:1.7;">
-            <div><b>Responsable :</b> ${l.responsible_name || '—'} (${l.first_name} ${l.last_name})</div>
-            <div><b>Contact pro :</b> ${l.professional_phone || '—'} · ${l.professional_email || '—'}</div>
-            <div><b>Compte de connexion :</b> ${l.email}${l.phone ? ' · ' + l.phone : ''}</div>
-            <div><b>Localisation :</b> ${l.city || ''}, ${l.country || ''}</div>
-            ${l.website ? `<div><b>Site web :</b> <a href="${l.website}" target="_blank" rel="noopener noreferrer">${l.website}</a></div>` : ''}
+            <div><b>Responsable :</b> ${esc(l.responsible_name || '—')} (${esc(l.first_name)} ${esc(l.last_name)})</div>
+            <div><b>Contact pro :</b> ${esc(l.professional_phone || '—')} · ${esc(l.professional_email || '—')}</div>
+            <div><b>Compte de connexion :</b> ${esc(l.email)}${l.phone ? ' · ' + esc(l.phone) : ''}</div>
+            <div><b>Localisation :</b> ${esc(l.city || '')}, ${esc(l.country || '')}</div>
+            ${l.website ? `<div><b>Site web :</b> <a href="${esc(l.website)}" target="_blank" rel="noopener noreferrer">${esc(l.website)}</a></div>` : ''}
             <div><b>Documents :</b> ${docsLinks}</div>
-            ${l.description ? `<div style="margin-top:6px;">${l.description}</div>` : ''}
-            ${l.refusal_reason ? `<div style="margin-top:6px; color:#e88;"><b>Raison du refus :</b> ${l.refusal_reason}</div>` : ''}
+            ${l.description ? `<div style="margin-top:6px;">${esc(l.description)}</div>` : ''}
+            ${l.refusal_reason ? `<div style="margin-top:6px; color:#e88;"><b>Raison du refus :</b> ${esc(l.refusal_reason)}</div>` : ''}
           </div>
           <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
             ${l.verification_status !== 'validated' ? `<button class="primary" onclick="approveLabel(${l.id})">Approuver</button>` : ''}
@@ -1000,7 +1019,7 @@
       } else {
         data.artists.forEach(a=>{
           html += `<div style="display:flex; justify-content:space-between; padding:6px 4px; border-bottom:1px solid #2a2015; font-size:12.5px;">
-            <span>${a.artist_name} <span class="muted">(${a.affiliation_status})</span></span>
+            <span>${esc(a.artist_name)} <span class="muted">(${esc(a.affiliation_status)})</span></span>
             <span>${fmt(a.total_streams)} streams · ${fmt(a.total_paid_fcfa)} FCFA</span>
           </div>`;
         });
@@ -1180,7 +1199,7 @@
       data.pending.forEach(u=>{
         const card = document.createElement('div');
         card.className = 'card row';
-        card.innerHTML = '<div><b>'+(u.artist_name||u.first_name)+'</b><br><span class="muted">'+u.email+'</span></div><div><button class="approve">Certifier</button> <button class="reject">Refuser</button></div>';
+        card.innerHTML = '<div><b>'+esc(u.artist_name||u.first_name)+'</b><br><span class="muted">'+esc(u.email)+'</span></div><div><button class="approve">Certifier</button> <button class="reject">Refuser</button></div>';
         card.querySelector('.approve').onclick = ()=> decide(u.email, true);
         card.querySelector('.reject').onclick = ()=> decide(u.email, false);
         list.appendChild(card);
@@ -1221,8 +1240,8 @@
       if(!data.tracks || !data.tracks.length){ list.innerHTML = '<p class="muted">Aucun morceau publié pour le moment.</p>'; return; }
       let html = '<table><tr><th></th><th>Titre</th><th>Artiste</th><th>Type</th><th>Genre</th><th>Publié le</th></tr>';
       data.tracks.forEach(t=>{
-        const cover = t.cover_url ? '<div class="cover-thumb" style="background-image:url('+t.cover_url+')"></div>' : '<div class="cover-thumb"></div>';
-        html += '<tr><td>'+cover+'</td><td>'+t.title+'</td><td>'+(t.artist_name||'—')+(t.is_verified?' <span class="pill verified">✓</span>':'')+'</td><td>'+(t.release_type||'Single')+'</td><td>'+(t.genre||'—')+'</td><td>'+new Date(t.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
+        const cover = t.cover_url ? '<div class="cover-thumb" style="background-image:url('+esc(t.cover_url)+')"></div>' : '<div class="cover-thumb"></div>';
+        html += '<tr><td>'+cover+'</td><td>'+esc(t.title)+'</td><td>'+esc(t.artist_name||'—')+(t.is_verified?' <span class="pill verified">✓</span>':'')+'</td><td>'+esc(t.release_type||'Single')+'</td><td>'+esc(t.genre||'—')+'</td><td>'+esc(new Date(t.created_at).toLocaleDateString('fr-FR'))+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
@@ -1246,7 +1265,7 @@
           : accStatus === 'deleted' ? '<span class="pill expired">Supprimé</span>'
           : u.subscription_status === 'pending' ? '<span class="pill pending">En cours d\'activation</span>'
           : '<span class="pill active">Actif</span>';
-        html += '<tr><td>'+name+verified+'</td><td>'+u.email+'</td><td>'+typePill+'</td><td>'+(u.plan||'—')+'</td><td>'+(u.subscription_status||'—')+'</td><td>'+accPill+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+new Date(u.created_at).toLocaleDateString('fr-FR')+'</td></tr>';
+        html += '<tr><td>'+esc(name)+verified+'</td><td>'+esc(u.email)+'</td><td>'+typePill+'</td><td>'+esc(u.plan||'—')+'</td><td>'+esc(u.subscription_status||'—')+'</td><td>'+accPill+'</td><td>'+(u.track_count!=null?u.track_count:'—')+'</td><td>'+(u.follower_count!=null?u.follower_count:'—')+'</td><td>'+esc(new Date(u.created_at).toLocaleDateString('fr-FR'))+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
@@ -1292,7 +1311,7 @@
           const urgent = (d!=null && d<=3);
           echeance = '<span class="'+(urgent?'urgent':'')+'">'+(d!=null ? (d<=0 ? 'Expire aujourd\'hui' : d+' jour(s) restant(s)') : '—')+'</span>';
         }
-        html += '<tr><td>'+name+'</td><td>'+s.email+'</td><td>'+planLabel+'</td><td>'+montant+'</td><td>'+statusPill+'</td><td>'+echeance+'</td></tr>';
+        html += '<tr><td>'+esc(name)+'</td><td>'+esc(s.email)+'</td><td>'+planLabel+'</td><td>'+montant+'</td><td>'+statusPill+'</td><td>'+echeance+'</td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
@@ -1342,7 +1361,7 @@
         const planLabel = c.applies_to_plan === 'artist' ? 'Artiste' : (c.applies_to_plan === 'consumer' ? 'Consommateur' : 'Les deux');
         const statusPill = c.active ? '<span class="pill active">Actif</span>' : '<span class="pill expired">Désactivé</span>';
         const expLabel = c.expires_at ? new Date(c.expires_at).toLocaleDateString('fr-FR') : '—';
-        html += '<tr><td><b>'+c.code+'</b></td><td>-'+c.discount_pct+'%</td><td>'+planLabel+'</td><td>'+c.used_count+' / '+c.max_uses+'</td><td>'+expLabel+'</td><td>'+statusPill+'</td><td><button class="secondary" onclick="togglePromo(\''+c.code+'\')">'+(c.active?'Désactiver':'Réactiver')+'</button></td></tr>';
+        html += '<tr><td><b>'+esc(c.code)+'</b></td><td>-'+c.discount_pct+'%</td><td>'+planLabel+'</td><td>'+c.used_count+' / '+c.max_uses+'</td><td>'+expLabel+'</td><td>'+statusPill+'</td><td><button class="secondary" onclick="togglePromo(\''+esc(c.code)+'\')">'+(c.active?'Désactiver':'Réactiver')+'</button></td></tr>';
       });
       html += '</table>';
       list.innerHTML = html;
@@ -1412,9 +1431,9 @@
         const card = document.createElement('div');
         card.style.cssText = 'width:220px; background:#141414; border:1px solid #2a2a2a; border-radius:10px; overflow:hidden;';
         card.innerHTML = `
-          <div style="width:100%; height:120px; background-size:cover; background-position:center; background-image:url('${img.image_url}');"></div>
+          <div style="width:100%; height:120px; background-size:cover; background-position:center; background-image:url('${esc(img.image_url)}');"></div>
           <div style="padding:8px;">
-            <div style="font-size:12px; color:#aaa;">${img.section}</div>
+            <div style="font-size:12px; color:#aaa;">${esc(img.section)}</div>
             <button class="secondary" style="width:100%; margin-top:6px;" onclick="deleteHeroImage(${img.id})">🗑️ Supprimer</button>
           </div>`;
         wrap.appendChild(card);
@@ -1445,7 +1464,7 @@
     wrap.innerHTML = plSelectedTracks.map((t,i)=>`
       <div style="display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #2a2a2a;">
         <span style="color:#9aa; font-size:12px; width:20px;">${i+1}</span>
-        <span style="flex:1;">${t.title} <span style="color:#9aa;">— ${t.artist_name || t.first_name || 'Artiste'}</span></span>
+        <span style="flex:1;">${esc(t.title)} <span style="color:#9aa;">— ${esc(t.artist_name || t.first_name || 'Artiste')}</span></span>
         <button class="secondary" onclick="movePlTrack(${i},-1)" ${i===0?'disabled':''}>↑</button>
         <button class="secondary" onclick="movePlTrack(${i},1)" ${i===plSelectedTracks.length-1?'disabled':''}>↓</button>
         <button class="secondary" onclick="removePlTrack(${i})">🗑️</button>
@@ -1535,7 +1554,7 @@
       if(!playlists.length){ wrap.innerHTML = '<p class="muted">Aucune playlist créée pour le moment.</p>'; return; }
       let html = '<table><tr><th>Titre</th><th>Morceaux</th><th></th></tr>';
       playlists.forEach(p=>{
-        html += `<tr><td><b>${p.title}</b>${p.description ? '<br><span class="muted">'+p.description+'</span>' : ''}</td>
+        html += `<tr><td><b>${esc(p.title)}</b>${p.description ? '<br><span class="muted">'+esc(p.description)+'</span>' : ''}</td>
           <td>${p.track_ids.length}</td>
           <td>
             <button class="secondary" onclick='editPlaylist(${JSON.stringify(p).replace(/'/g,"&#39;")})'>✏️ Modifier</button>
@@ -1597,15 +1616,15 @@
       let html = '<table><tr><th>Pseudo</th><th>Streams totaux</th><th>Période en cours</th><th>Montant dû</th><th>Statut</th><th>Dernier paiement</th><th></th></tr>';
       payouts.forEach(p=>{
         html += `<tr>
-          <td><b>${p.pseudo}</b><br><span class="muted">${p.email}</span></td>
+          <td><b>${esc(p.pseudo)}</b><br><span class="muted">${esc(p.email)}</span></td>
           <td>${p.total_streams.toLocaleString('fr-FR')}</td>
           <td>${p.current_period_streams.toLocaleString('fr-FR')}</td>
           <td><b style="color:#D4AF6A;">${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA</b></td>
           <td>${statusPill(p.status)}</td>
           <td class="muted">${p.last_payment_at ? new Date(p.last_payment_at).toLocaleDateString('fr-FR') : '—'}</td>
           <td>
-            <button class="primary" ${p.amount_due_fcfa<=0?'disabled':''} onclick="payArtist(${p.id}, '${(p.pseudo||'').replace(/'/g,"&#39;")}', ${p.amount_due_fcfa})">Payer</button>
-            <button class="secondary" onclick="loadArtistPaymentHistory(${p.id}, '${(p.pseudo||'').replace(/'/g,"&#39;")}')">Historique</button>
+            <button class="primary" ${p.amount_due_fcfa<=0?'disabled':''} onclick="payArtist(${p.id}, '${esc(p.pseudo||'')}', ${p.amount_due_fcfa})">Payer</button>
+            <button class="secondary" onclick="loadArtistPaymentHistory(${p.id}, '${esc(p.pseudo||'')}')">Historique</button>
           </td>
         </tr>`;
       });
@@ -1656,7 +1675,7 @@
       const data = await res.json();
       if(!res.ok){ wrap.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
       const history = data.history || [];
-      let html = `<div class="card"><b style="color:#D4AF6A; font-size:13px;">Historique — ${pseudo}</b>`;
+      let html = `<div class="card"><b style="color:#D4AF6A; font-size:13px;">Historique — ${esc(pseudo)}</b>`;
       if(!history.length){ html += '<p class="muted" style="margin-top:8px;">Aucun paiement enregistré pour le moment.</p>'; }
       else{
         html += '<table><tr><th>Date</th><th>Montant</th><th>Streams couverts</th><th>Méthode</th></tr>';
@@ -1749,11 +1768,16 @@
       return;
     }
     countLabel.textContent = lastNotifItems.length + ' au total';
+    // FAILLE CRITIQUE CORRIGÉE : it.text est construit côté serveur en insérant directement
+    // le nom/prénom/pseudo saisis à l'inscription (donnée publique, jamais modérée) — et ce
+    // panneau se charge automatiquement au chargement de la page ET toutes les 30 secondes
+    // (voir setInterval(loadNotifications, 30000) plus bas), sans la moindre action de
+    // l'admin. N'importe qui pouvait s'inscrire avec un nom piégé et attendre.
     list.innerHTML = lastNotifItems.map(it => `
       <a href="#" class="notif-item" onclick="event.preventDefault(); goToNotif('${it.tab}')">
         <span class="dot ${it.dot}"></span>
         <span>
-          <div>${it.text}</div>
+          <div>${esc(it.text)}</div>
           <div class="notif-time">${notifTimeAgo(it.created_at)}</div>
         </span>
       </a>
@@ -1849,7 +1873,7 @@
       let html = '<table><tr><th>Date</th><th>Titre</th><th>Audience</th><th>Destinataires</th></tr>';
       rows.forEach(b => {
         const audienceLabel = AUDIENCE_LABELS[b.audience] || b.audience; // sinon c'est un email précis
-        html += `<tr><td>${new Date(b.created_at).toLocaleString('fr-FR')}</td><td><b>${b.title}</b><div class="muted" style="max-width:280px;">${b.body}</div></td><td>${audienceLabel}</td><td>${b.recipient_count.toLocaleString('fr-FR')}</td></tr>`;
+        html += `<tr><td>${esc(new Date(b.created_at).toLocaleString('fr-FR'))}</td><td><b>${esc(b.title)}</b><div class="muted" style="max-width:280px;">${esc(b.body)}</div></td><td>${esc(audienceLabel)}</td><td>${b.recipient_count.toLocaleString('fr-FR')}</td></tr>`;
       });
       html += '</table>';
       wrap.innerHTML = html;
