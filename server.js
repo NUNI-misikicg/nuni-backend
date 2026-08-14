@@ -1869,6 +1869,28 @@ function checkAdminKey(req, res) {
   return true;
 }
 
+// ---------- Diagnostic de la clé admin — attendu par showAdminKeyDiagnostic dans
+// admin.html (affiché automatiquement dès qu'une clé est rejetée), mais jamais construit
+// côté serveur : la page appelait une route inexistante et retombait systématiquement sur
+// "Diagnostic impossible à charger", cachant la vraie cause de "Clé admin invalide" (clé
+// vide côté Render, mauvais service ciblé, espace en trop copié/collé, etc.).
+// Ne révèle jamais la clé complète, ni côté tapé ni côté attendu — seulement la longueur et
+// le premier/dernier caractère de chacune, largement suffisant pour repérer un espace, un
+// guillemet ou une troncature accidentelle sans exposer le secret lui-même.
+app.get('/api/admin/debug-key-check', h(async (req, res) => {
+  const provided = (req.headers['x-admin-key'] || '').trim();
+  const expected = (process.env.ADMIN_KEY || '').trim();
+  res.json({
+    match: !!expected && provided === expected,
+    providedLength: provided.length,
+    expectedLength: expected.length,
+    providedFirstChar: provided ? provided[0] : '(vide)',
+    providedLastChar: provided ? provided[provided.length - 1] : '(vide)',
+    expectedFirstChar: expected ? expected[0] : '(vide — ADMIN_KEY absente ou vide sur Render)',
+    expectedLastChar: expected ? expected[expected.length - 1] : '(vide — ADMIN_KEY absente ou vide sur Render)',
+  });
+}));
+
 // ================= SÉCURITÉ ANTI-TRICHE (étape 6 gamification) =================
 // Limiteur de débit léger en mémoire (sans dépendance externe) — identifie la personne par
 // son compte si connectée (même via un token décodé manuellement sur les routes publiques),
@@ -2693,19 +2715,9 @@ app.get('/api/artist/badges', authMiddleware, h(async (req, res) => {
 // automatiquement chaque semaine — via un hash basé sur la semaine calendaire, pas de
 // tâche planifiée nécessaire : la même semaine donne le même ordre pour tout le monde,
 // et l'ordre change tout seul dès qu'on passe à la fenêtre suivante.
-// ---------- Artistes suivis par un artiste donné (vraie table follows) ----------
-// Utilisé sur la page album : "les artistes que [cet artiste] suit" — jamais une
-// recommandation générique, uniquement ce que l'artiste suit réellement lui-même.
-app.get('/api/artist/:id/follows', h(async (req, res) => {
-  const rows = await db.query(`
-    SELECT u.id, u.artist_name, u.avatar_url, u.is_verified
-    FROM follows f JOIN users u ON u.id = f.artist_id
-    WHERE f.follower_id = $1 AND u.account_type = 'artist'
-    ORDER BY f.created_at DESC LIMIT 10
-  `, [req.params.id]);
-  res.json({ artists: rows });
-}));
-
+// (Une route dupliquée /api/artist/:id/follows existait juste ici — identique à celle
+// définie plus haut vers la ligne 2046, jamais atteinte par Express puisque la première
+// déclaration répondait déjà systématiquement. Supprimée.)
 app.get('/api/artists/featured', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
