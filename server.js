@@ -1560,11 +1560,14 @@ app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
 // était du texte fixe). Ici, chaque badge est calculé en direct depuis les vraies données
 // (écoutes, genres, artistes suivis, classement mensuel réel).
 app.get('/api/me/following', authMiddleware, h(async (req, res) => {
+  // Avant : ni l'avatar ni la date de suivi n'étaient renvoyés — la Bibliothèque ne pouvait
+  // ni afficher les vraies photos des artistes suivis, ni trier "Ajouts récents" par date
+  // réelle (f.created_at existe en base depuis le début, juste jamais exposée ici).
   const rows = await db.query(`
-    SELECT u.id, u.artist_name, u.first_name, u.is_verified
+    SELECT u.id, u.artist_name, u.first_name, u.is_verified, u.avatar_url, f.created_at as followed_at
     FROM follows f JOIN users u ON u.id = f.artist_id
     WHERE f.follower_id = $1
-    ORDER BY f.id DESC
+    ORDER BY f.created_at DESC
   `, [req.user.id]);
   res.json({ following: rows });
 }));
@@ -2364,8 +2367,12 @@ app.post('/api/tracks/:id/report', rateLimit(10, 60000), h(async (req, res) => {
 // Liste des morceaux likés par l'utilisateur connecté — sert à resynchroniser les cœurs
 // (Favoris) après une reconnexion ou sur un autre appareil, au lieu de repartir de zéro.
 app.get('/api/me/liked-tracks', authMiddleware, h(async (req, res) => {
-  const rows = await db.query('SELECT track_id FROM track_likes WHERE user_id = $1', [req.user.id]);
-  res.json({ track_ids: rows.map((r) => r.track_id) });
+  // Avant : seul le track_id était renvoyé — impossible de savoir QUAND un morceau avait été
+  // liké, donc impossible de le faire apparaître au bon endroit dans un vrai "Ajouts récents"
+  // trié chronologiquement. created_at existe en base depuis le début (track_likes), juste
+  // jamais exposé. On garde track_ids pour compatibilité et on ajoute "likes" avec la date.
+  const rows = await db.query('SELECT track_id, created_at as liked_at FROM track_likes WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+  res.json({ track_ids: rows.map((r) => r.track_id), likes: rows });
 }));
 
 // ---------- Likes réels sur les clips ----------
