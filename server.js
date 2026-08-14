@@ -1099,7 +1099,8 @@ app.get('/api/me/recently-played', authMiddleware, h(async (req, res) => {
     ORDER BY last_played_at DESC
     LIMIT $2
   `, [req.user.id, limit]);
-  res.json({ tracks: rows });
+  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  res.json({ tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
 // ---------- "Reprendre l'écoute" — vraie position de lecture par morceau ----------
@@ -1141,7 +1142,8 @@ app.get('/api/me/resume', authMiddleware, h(async (req, res) => {
     ORDER BY pp.updated_at DESC
     LIMIT 5
   `, [req.user.id]);
-  res.json({ resumes: rows });
+  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  res.json({ resumes: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
 // ---------- "Votre sélection NUNI" — vraie sélection basée sur les genres que ce compte
@@ -1168,7 +1170,8 @@ app.get('/api/me/selection', authMiddleware, h(async (req, res) => {
     ORDER BY my_plays ASC, t.streams DESC
     LIMIT 20
   `, [req.user.id, genreNames]);
-  res.json({ genres: genreNames, tracks: rows });
+  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  res.json({ genres: genreNames, tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
 app.get('/api/stats/geo', h(async (req, res) => {
@@ -1788,7 +1791,8 @@ app.get('/api/playlists/:id', h(async (req, res) => {
     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id JOIN users u ON u.id = t.artist_id
     WHERE pt.playlist_id = $1 ORDER BY pt.position
   `, [req.params.id]);
-  res.json({ playlist, tracks });
+  const authUser = await optionalAuthUser(req);
+  res.json({ playlist, tracks: stripAudioIfNoAccess(tracks, hasStreamingAccess(authUser)) });
 }));
 
 // ---------- Playlists PERSONNELLES — créées par chaque utilisateur, jamais mélangées avec
@@ -1834,7 +1838,8 @@ app.get('/api/me/playlists/:id', authMiddleware, h(async (req, res) => {
     FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id JOIN users u ON u.id = t.artist_id
     WHERE upt.playlist_id = $1 ORDER BY upt.added_at DESC
   `, [req.params.id]);
-  res.json({ playlist, tracks });
+  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  res.json({ playlist, tracks: stripAudioIfNoAccess(tracks, hasStreamingAccess(meRow)) });
 }));
 
 app.post('/api/me/playlists/:id/tracks', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
@@ -1867,6 +1872,39 @@ function checkAdminKey(req, res) {
     return false;
   }
   return true;
+}
+
+// ---------- Accès réel au streaming (correctif sécurité) ----------
+// Avant : GET /api/tracks et GET /api/playlists/:id étaient entièrement publics et
+// renvoyaient audio_url (le vrai lien Cloudinary du morceau) à N'IMPORTE QUELLE requête —
+// même sans compte, sans connexion, sans Pass payé. N'importe qui pouvait donc récupérer la
+// liste des morceaux et écouter/télécharger toute la musique NUNI gratuitement, en
+// contournant entièrement le Pass Consommateur payant.
+// Maintenant : le catalogue (titres, pochettes, streams, likes...) reste public — la
+// découverte du catalogue ne doit jamais être bloquée, elle donne envie de s'inscrire.
+// Seul le vrai lien audio est retenu, sauf pour un compte authentifié dont l'abonnement est
+// réellement actif (Pass Consommateur/Artiste payé OU essai Pass Découverte de 24h en
+// cours — jamais un accès anonyme, jamais un compte expiré).
+async function optionalAuthUser(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return null;
+  const payload = verifyToken(token);
+  if (!payload) return null;
+  try {
+    const user = await db.get('SELECT id, account_status, subscription_status, plan FROM users WHERE id = $1', [payload.id]);
+    if (!user || user.account_status === 'suspended' || user.account_status === 'deleted') return null;
+    return user;
+  } catch (e) { return null; }
+}
+function hasStreamingAccess(user) {
+  return !!user && user.subscription_status === 'active';
+}
+// Retire audio_url des morceaux si l'accès n'est pas réellement actif — jamais de morceau
+// silencieusement modifié pour tout le monde, seulement le champ audio masqué au cas par cas.
+function stripAudioIfNoAccess(rows, canStream) {
+  if (canStream) return rows;
+  return rows.map((r) => ({ ...r, audio_url: null }));
 }
 
 // ---------- Diagnostic de la clé admin — attendu par showAdminKeyDiagnostic dans
@@ -1971,7 +2009,7 @@ app.post('/api/admin/activate-by-email', h(async (req, res) => {
   });
 }));
 
-app.post('/api/subscribe/redeem', authMiddleware, h(async (req, res) => {
+app.post('/api/subscribe/redeem', authMiddleware, rateLimit(10, 60000), h(async (req, res) => {
   const { code } = req.body;
   const user = await db.get('SELECT * FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
@@ -2258,6 +2296,16 @@ app.delete('/api/tracks/:id', authMiddleware, h(async (req, res) => {
 
 app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  // Avant : seul le TYPE de compte était vérifié — choisi librement par n'importe qui à
+  // l'inscription (voir /api/register, accountType vient du client sans validation de
+  // paiement). N'importe qui pouvait donc créer un compte "artiste" gratuit et publier de la
+  // musique sans jamais passer par le circuit Pass Artiste payant. On vérifie maintenant le
+  // vrai abonnement en base (jamais le JWT seul, qui peut dater de 30 jours et ne plus
+  // refléter la réalité si un Pass a expiré depuis).
+  const meArtist = await db.get('SELECT subscription_status, plan FROM users WHERE id = $1', [req.user.id]);
+  if (!meArtist || meArtist.subscription_status !== 'active' || meArtist.plan !== 'artist') {
+    return res.status(403).json({ error: 'Un Pass Artiste actif est requis pour publier un morceau — voir WhatsApp NUNI pour l\'activer.' });
+  }
   const {
     title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt,
     composer, featuring, studio, description, releaseDate, credits,
@@ -2297,6 +2345,10 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
 
 app.post('/api/clips', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  const meArtistClip = await db.get('SELECT subscription_status, plan FROM users WHERE id = $1', [req.user.id]);
+  if (!meArtistClip || meArtistClip.subscription_status !== 'active' || meArtistClip.plan !== 'artist') {
+    return res.status(403).json({ error: 'Un Pass Artiste actif est requis pour publier un clip — voir WhatsApp NUNI pour l\'activer.' });
+  }
   const { title, thumbUrl, videoUrl, scheduledReleaseAt } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
@@ -2334,7 +2386,8 @@ app.get('/api/tracks', h(async (req, res) => {
     WHERE t.published = 1 AND (t.scheduled_release_at IS NULL OR t.scheduled_release_at <= NOW())
     ORDER BY t.created_at DESC
   `);
-  res.json({ tracks: rows });
+  const authUser = await optionalAuthUser(req);
+  res.json({ tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(authUser)) });
 }));
 
 const NUNI_PRICE_PER_STREAM_FCFA = 2;
@@ -2414,8 +2467,13 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
 // ---------- Likes réels sur les morceaux (persistés, un seul like par personne) ----------
 app.post('/api/tracks/:id/like', authMiddleware, rateLimit(30, 60000), h(async (req, res) => {
   const trackId = Number(req.params.id);
-  const track = await db.get('SELECT id, likes FROM tracks WHERE id = $1', [trackId]);
+  const track = await db.get('SELECT id, likes, artist_id FROM tracks WHERE id = $1', [trackId]);
   if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  // Un artiste ne peut pas liker son propre morceau — évite de gonfler artificiellement
+  // son propre compteur (même logique déjà appliquée au suivi d'artiste ci-dessus).
+  if (track.artist_id === req.user.id) {
+    return res.status(400).json({ error: 'Vous ne pouvez pas aimer votre propre morceau.' });
+  }
 
   // Même faille de course que suivi/vote, corrigée pareillement : insertion atomique d'abord,
   // et si elle échoue (déjà liké), on bascule vers la suppression sans jamais planter.
@@ -2837,11 +2895,22 @@ app.post('/api/talent/vote', authMiddleware, rateLimit(15, 60000), h(async (req,
 // l'écran d'accueil" sur iPhone — restriction d'Apple, pas de NUNI). Les clés VAPID
 // identifient NUNI auprès des services de push (Apple/Google) ; PRIVATE ne doit jamais
 // être exposée côté client, seule PUBLIC_KEY l'est (via /api/push/public-key).
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BIGK6eEnQwDEt8spBzCm4XrwIpX3YPpLETv7hBrYbnPxyJA-vqNRratwo2j1vV0GPL5MVV9RNqyeLRVKWa5a9iM';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '7kcTsfLMjsrhfIyfCSkuUwMshZHWchhCDSrSvHxPPAk';
-webpush.setVapidDetails('mailto:nunimisiki@gmail.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+// Avant : une clé de repli en dur existait pour les deux variables — si jamais les vraies
+// variables d'environnement n'étaient pas définies sur Render, la vraie clé PRIVÉE se
+// retrouvait alors directement dans le code source, donc sur GitHub. Maintenant : aucun
+// repli — sans les deux variables d'environnement, les notifications push se désactivent
+// simplement proprement (avertissement au démarrage), plutôt que d'exposer un secret.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_CONFIGURED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+if (VAPID_CONFIGURED) {
+  webpush.setVapidDetails('mailto:nunimisiki@gmail.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY absentes des variables d\'environnement — notifications push désactivées.');
+}
 
 async function sendPushToUser(userId, { title, body, url }) {
+  if (!VAPID_CONFIGURED) return; // notifications désactivées proprement, voir avertissement au démarrage
   try {
     const subs = await db.query('SELECT * FROM push_subscriptions WHERE user_id = $1', [userId]);
     for (const sub of subs) {
