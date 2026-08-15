@@ -435,8 +435,9 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
 // mémoire du navigateur — remis à zéro à chaque rechargement, et rien ne bloquait jamais
 // vraiment l'accès à la fin. Ici : un vrai compte est créé, activé 24h immédiatement
 // (subscription_expires_at réel, vérifié par enforceSubscriptionExpiry comme n'importe quel
-// autre Pass). Après expiration, 2h de grâce pour valider un vrai Pass (voir
-// enforceDiscoveryDeletion plus bas) avant suppression complète et définitive du compte.
+// autre Pass). Une fois expiré, le compte reste simplement "expiré" — il n'est PLUS jamais
+// supprimé automatiquement (voir enforceDiscoveryDeletion plus bas : une suppression
+// automatique aurait libéré l'email et permis des essais gratuits en série).
 app.post('/api/register-discovery', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
@@ -3983,11 +3984,14 @@ async function sendAbsenceReminders() {
 setInterval(sendAbsenceReminders, 24 * 60 * 60 * 1000);
 sendAbsenceReminders(); // premier passage au démarrage, pas besoin d'attendre 24h
 
-// ---------- Purge des comptes Pass Découverte non validés (2h de grâce après expiration) ----------
-// Ne touche QUE les comptes plan='discovery' encore au statut 'expired' — jamais un vrai
-// Pass Consommateur/Artiste payé. Dès qu'un compte Découverte valide un vrai Pass (via
-// activateAndNotify, redeem ou activation admin), son `plan` change et il sort
-// définitivement de la portée de cette purge.
+// ---------- Purge des comptes Pass Découverte non validés — DÉSACTIVÉE (faille de sécurité) ----------
+// Avant : un compte Pass Découverte expiré était supprimé automatiquement après 2h de
+// grâce — ce qui libérait son email dans la base. N'importe qui pouvait alors se réinscrire
+// avec EXACTEMENT LE MÊME email pour obtenir un nouvel essai gratuit de 24h, indéfiniment,
+// sans jamais payer un vrai Pass. Maintenant : un compte Découverte expiré reste simplement
+// "expiré" en base, comme n'importe quel autre Pass — il est bloqué côté interface (écran
+// plein écran "Pass expiré") mais son email reste engagé, fermant la porte aux essais en
+// série. La fonction est conservée pour référence mais n'est plus jamais planifiée.
 async function enforceDiscoveryDeletion() {
   try {
     const stale = await db.query(`
@@ -4008,8 +4012,8 @@ async function start() {
 
   enforceSubscriptionExpiry();
   setInterval(enforceSubscriptionExpiry, 60 * 1000);
-  enforceDiscoveryDeletion();
-  setInterval(enforceDiscoveryDeletion, 5 * 60 * 1000);
+  // enforceDiscoveryDeletion volontairement plus jamais planifiée — voir le commentaire sur
+  // sa définition plus haut (faille de sécurité : permettait des essais Découverte en série).
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`NUNI backend en écoute sur http://localhost:${PORT}`));
