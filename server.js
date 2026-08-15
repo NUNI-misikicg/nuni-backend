@@ -3551,6 +3551,10 @@ async function fullyDeleteUser(userId) {
     // pour challenge_progress/shop_purchases (violation de clé étrangère → crash 500).
     await client.query('DELETE FROM talent_votes WHERE user_id = $1 OR artist_id = $1', [userId]);
     await client.query('DELETE FROM featured_tracks WHERE artist_id = $1', [userId]);
+    // Concerts créés par cet artiste, et cosmétiques de gamification équipés par ce compte —
+    // même souci d'absence de CASCADE, oubliés jusqu'ici.
+    await client.query('DELETE FROM concerts WHERE artist_id = $1', [userId]);
+    await client.query('DELETE FROM user_equipped_cosmetics WHERE user_id = $1', [userId]);
     // Notifications reçues (la table a bien ON DELETE CASCADE sur user_id, mais autant être
     // explicite ici plutôt que de dépendre uniquement du comportement du schéma).
     await client.query('DELETE FROM notifications WHERE user_id = $1', [userId]);
@@ -3559,6 +3563,15 @@ async function fullyDeleteUser(userId) {
     // Note : ceux REÇUS sur les morceaux de ce compte sont déjà couverts par le CASCADE de
     // track_reports.track_id quand ses morceaux sont supprimés juste après.
     await client.query('DELETE FROM track_reports WHERE reporter_id = $1', [userId]);
+    // Rattachements Label — un artiste affilié à un Label, ou un membre de l'équipe d'un
+    // Label, faisait planter la suppression faute de nettoyage de ces deux tables (aucune
+    // des deux n'a de ON DELETE CASCADE vers users, contrairement à label_id → labels).
+    await client.query('DELETE FROM label_artists WHERE artist_id = $1', [userId]);
+    await client.query('DELETE FROM label_team_members WHERE user_id = $1', [userId]);
+    // Si ce compte est lui-même un Label (labels.user_id), sa fiche Label doit être
+    // supprimée avant lui — même souci d'absence de CASCADE. label_artists/label_team_members
+    // de CE label sont déjà nettoyés par leur propre ON DELETE CASCADE vers labels.id.
+    await client.query('DELETE FROM labels WHERE user_id = $1', [userId]);
     const tracks = await client.query('SELECT id FROM tracks WHERE artist_id = $1', [userId]);
     for (const t of tracks.rows) {
       await client.query('DELETE FROM plays WHERE track_id = $1', [t.id]);
