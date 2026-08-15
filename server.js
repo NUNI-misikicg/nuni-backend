@@ -1789,7 +1789,7 @@ app.get('/api/leaderboard', h(async (req, res) => {
 
 // ================= ABONNEMENT =================
 
-app.post('/api/subscribe/request', authMiddleware, h(async (req, res) => {
+app.post('/api/subscribe/request', authMiddleware, rateLimit(15, 60000), h(async (req, res) => {
   const { plan, durationDays } = req.body;
   if (!['consumer', 'artist'].includes(plan)) return res.status(400).json({ error: 'Pass invalide.' });
   // Liste blanche stricte — jamais une valeur arbitraire envoyée par le client, uniquement
