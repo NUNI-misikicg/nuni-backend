@@ -10,7 +10,7 @@ const {
   initAuth, hashPassword, verifyPassword, needsRehash, signToken, verifyToken, generateAccessCode,
   generateResetCode, hashResetCode, authMiddleware,
 } = require('./auth');
-const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail } = require('./mailer');
+const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail } = require('./mailer');
 
 const app = express();
 // ---------- CORS restreint (durcissement sécurité) ----------
@@ -160,11 +160,33 @@ async function enforceSubscriptionExpiry() {
 }
 
 function isEmail(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v || ''); }
+// ---------- Génère et envoie un nouveau code de vérification d'email ----------
+// Réutilisé par /api/register, /api/register-discovery et /api/auth/resend-verification —
+// un seul point qui génère le code, le hache avant stockage (jamais en clair, même
+// logique que le mot de passe oublié), fixe l'expiration à 30 minutes, et remet le
+// compteur de tentatives à zéro.
+async function issueEmailVerification(user) {
+  const code = generateResetCode(); // même générateur que le mot de passe oublié (6 chiffres)
+  await db.run(
+    `UPDATE users SET email_verify_code = $1, email_verify_expires_at = NOW() + INTERVAL '30 minutes', email_verify_attempts = 0 WHERE id = $2`,
+    [hashResetCode(code), user.id],
+  );
+  return sendVerificationEmail({ user, code });
+}
 function required(obj, fields) {
   return fields.filter((f) => !obj[f] || String(obj[f]).trim() === '');
 }
 function publicUser(u) {
-  const { password_hash, ...safe } = u;
+  // Avant : seul password_hash était retiré. reset_code et email_verify_code restaient
+  // exposés dans la réponse API — ce sont des hachages de codes à 6 CHIFFRES SEULEMENT
+  // (1 million de combinaisons), donc cassables hors-ligne en une fraction de seconde une
+  // fois le hash connu, contrairement à un mot de passe. Toute donnée interne sensible est
+  // désormais retirée, pas seulement le mot de passe.
+  const {
+    password_hash, reset_code, reset_code_expires_at, reset_code_attempts,
+    email_verify_code, email_verify_expires_at, email_verify_attempts,
+    ...safe
+  } = u;
   return safe;
 }
 async function withArtistStats(u) {
@@ -412,8 +434,8 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
 
   const password_hash = await hashPassword(password);
   const inserted = await db.get(`
-    INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, age, address, city, country, artist_name, label_or_manager)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, age, address, city, country, artist_name, label_or_manager, email_verified)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE)
     RETURNING id
   `, [
     accountType, firstName, lastName, email, phone || null, password_hash, Number(age), address, city, country,
@@ -422,6 +444,7 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
   ]);
 
   const user = await db.get('SELECT * FROM users WHERE id = $1', [inserted.id]);
+  issueEmailVerification(user).catch((e) => console.error('[register] échec envoi vérification email :', e.message));
   const token = signToken(user);
   res.status(201).json({
     message: 'Compte créé. Choisissez maintenant votre Pass pour continuer sur WhatsApp.',
@@ -461,9 +484,9 @@ app.post('/api/register-discovery', rateLimit(10, 60 * 60000), h(async (req, res
   const inserted = await db.get(`
     INSERT INTO users (
       account_type, first_name, last_name, email, phone, password_hash, age, address, city, country,
-      artist_name, label_or_manager, plan, subscription_status, subscription_expires_at
+      artist_name, label_or_manager, plan, subscription_status, subscription_expires_at, email_verified
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'discovery','active',NOW() + INTERVAL '24 hours')
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'discovery','active',NOW() + INTERVAL '24 hours', FALSE)
     RETURNING id
   `, [
     accountType, firstName, lastName, email, phone || null, password_hash, Number(age), address, city, country,
@@ -472,9 +495,15 @@ app.post('/api/register-discovery', rateLimit(10, 60 * 60000), h(async (req, res
   ]);
 
   const user = await db.get('SELECT * FROM users WHERE id = $1', [inserted.id]);
+  // Le compte Découverte démarre bien immédiatement (aucune friction ajoutée à
+  // l'inscription) — mais son accès réel au streaming reste bloqué tant que l'email n'est
+  // pas confirmé (voir hasStreamingAccess plus bas). C'est cette vérification, pas un blocage
+  // à l'inscription, qui ferme la porte aux essais gratuits en série avec des adresses
+  // jetables ou variantes : il faut réellement recevoir et saisir un code pour écouter.
+  issueEmailVerification(user).catch((e) => console.error('[register-discovery] échec envoi vérification email :', e.message));
   const token = signToken(user);
   res.status(201).json({
-    message: 'Pass Découverte activé — 24h pour explorer NUNI en intégralité.',
+    message: 'Pass Découverte activé — confirmez votre email pour débloquer 24h d\'écoute NUNI en intégralité.',
     token,
     user: publicUser(await withArtistStats(user)),
   });
@@ -578,6 +607,47 @@ app.post('/api/auth/reset-password', rateLimit(10, 15 * 60000), h(async (req, re
     [password_hash, user.id],
   );
   res.json({ message: 'Mot de passe réinitialisé — vous pouvez maintenant vous connecter.' });
+}));
+
+// ---------- Vérification d'email — ferme la faille des essais Pass Découverte en série ----------
+// Confirme que l'adresse saisie à l'inscription appartient vraiment à la personne, avant de
+// débloquer son accès réel au streaming (voir hasStreamingAccess plus bas). Même protection
+// anti-brute-force qu'un mot de passe oublié : code haché, expire après 30 minutes, bloqué
+// après 5 tentatives incorrectes.
+app.post('/api/auth/verify-email', authMiddleware, rateLimit(10, 15 * 60000), h(async (req, res) => {
+  const { code } = req.body;
+  const user = await db.get('SELECT * FROM users WHERE id = $1', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+  if (user.email_verified) return res.json({ message: 'Email déjà confirmé.', already_verified: true });
+  if (!user.email_verify_code || !user.email_verify_expires_at) {
+    return res.status(400).json({ error: "Aucun code en attente — demandez-en un nouveau." });
+  }
+  if (new Date(user.email_verify_expires_at).getTime() < Date.now()) {
+    return res.status(400).json({ error: "Ce code a expiré — demandez-en un nouveau." });
+  }
+  if (user.email_verify_attempts >= 5) {
+    await db.run('UPDATE users SET email_verify_code = NULL, email_verify_expires_at = NULL WHERE id = $1', [user.id]);
+    return res.status(400).json({ error: 'Trop de tentatives incorrectes — demandez un nouveau code.' });
+  }
+  if (hashResetCode(code) !== user.email_verify_code) {
+    await db.run('UPDATE users SET email_verify_attempts = email_verify_attempts + 1 WHERE id = $1', [user.id]);
+    return res.status(400).json({ error: 'Code incorrect.' });
+  }
+  await db.run(
+    `UPDATE users SET email_verified = TRUE, email_verify_code = NULL, email_verify_expires_at = NULL, email_verify_attempts = 0 WHERE id = $1`,
+    [user.id],
+  );
+  const fresh = await db.get('SELECT * FROM users WHERE id = $1', [user.id]);
+  res.json({ message: 'Email confirmé — bienvenue sur NUNI en intégralité !', user: publicUser(await withArtistStats(fresh)) });
+}));
+
+app.post('/api/auth/resend-verification', authMiddleware, rateLimit(5, 15 * 60000), h(async (req, res) => {
+  const user = await db.get('SELECT * FROM users WHERE id = $1', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+  if (user.email_verified) return res.json({ message: 'Email déjà confirmé.', already_verified: true });
+  const result = await issueEmailVerification(user);
+  if (!result.sent) return res.status(502).json({ error: "L'envoi a échoué — réessayez dans un instant." });
+  res.json({ message: 'Nouveau code envoyé à votre adresse email.' });
 }));
 
 app.get('/api/me', authMiddleware, h(async (req, res) => {
@@ -1118,7 +1188,7 @@ app.get('/api/me/recently-played', authMiddleware, h(async (req, res) => {
     ORDER BY last_played_at DESC
     LIMIT $2
   `, [req.user.id, limit]);
-  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  const meRow = await db.get('SELECT subscription_status, plan, email_verified FROM users WHERE id = $1', [req.user.id]);
   res.json({ tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
@@ -1161,7 +1231,7 @@ app.get('/api/me/resume', authMiddleware, h(async (req, res) => {
     ORDER BY pp.updated_at DESC
     LIMIT 5
   `, [req.user.id]);
-  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  const meRow = await db.get('SELECT subscription_status, plan, email_verified FROM users WHERE id = $1', [req.user.id]);
   res.json({ resumes: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
@@ -1189,7 +1259,7 @@ app.get('/api/me/selection', authMiddleware, h(async (req, res) => {
     ORDER BY my_plays ASC, t.streams DESC
     LIMIT 20
   `, [req.user.id, genreNames]);
-  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  const meRow = await db.get('SELECT subscription_status, plan, email_verified FROM users WHERE id = $1', [req.user.id]);
   res.json({ genres: genreNames, tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(meRow)) });
 }));
 
@@ -1862,7 +1932,7 @@ app.get('/api/me/playlists/:id', authMiddleware, h(async (req, res) => {
     FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id JOIN users u ON u.id = t.artist_id
     WHERE upt.playlist_id = $1 ORDER BY upt.added_at DESC
   `, [req.params.id]);
-  const meRow = await db.get('SELECT subscription_status FROM users WHERE id = $1', [req.user.id]);
+  const meRow = await db.get('SELECT subscription_status, plan, email_verified FROM users WHERE id = $1', [req.user.id]);
   res.json({ playlist, tracks: stripAudioIfNoAccess(tracks, hasStreamingAccess(meRow)) });
 }));
 
@@ -1916,13 +1986,19 @@ async function optionalAuthUser(req) {
   const payload = verifyToken(token);
   if (!payload) return null;
   try {
-    const user = await db.get('SELECT id, account_status, subscription_status, plan FROM users WHERE id = $1', [payload.id]);
+    const user = await db.get('SELECT id, account_status, subscription_status, plan, email_verified FROM users WHERE id = $1', [payload.id]);
     if (!user || user.account_status === 'suspended' || user.account_status === 'deleted') return null;
     return user;
   } catch (e) { return null; }
 }
 function hasStreamingAccess(user) {
-  return !!user && user.subscription_status === 'active';
+  if (!user || user.subscription_status !== 'active') return false;
+  // Un essai Pass Découverte n'ouvre l'accès réel qu'une fois l'email confirmé — c'est ce
+  // qui ferme la porte aux essais gratuits en série avec une adresse jetable ou variante
+  // (voir issueEmailVerification et /api/register-discovery). Un Pass Consommateur/Artiste
+  // payé, lui, est déjà vérifié humainement via le circuit WhatsApp/admin — pas concerné.
+  if (user.plan === 'discovery' && !user.email_verified) return false;
+  return true;
 }
 // Retire audio_url des morceaux si l'accès n'est pas réellement actif — jamais de morceau
 // silencieusement modifié pour tout le monde, seulement le champ audio masqué au cas par cas.

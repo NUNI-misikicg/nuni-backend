@@ -157,4 +157,38 @@ async function sendArtistPaymentEmail({ user, amountFcfa, streamsCovered, period
   }
 }
 
-module.exports = { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail };
+// Envoie le code de vérification d'email directement au CLIENT — nécessaire pour confirmer
+// que l'adresse saisie à l'inscription lui appartient vraiment (ferme la porte aux essais
+// Pass Découverte en série avec des adresses jetables ou variantes).
+async function sendVerificationEmail({ user, code }) {
+  const t = getTransporter();
+  if (!t) return { sent: false, reason: 'email_not_configured' };
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
+      <h2 style="color:#0E3D2C;">Confirmez votre adresse email NUNI</h2>
+      <p>Bonjour ${user.first_name},</p>
+      <p>Voici votre code pour confirmer votre adresse email et activer votre compte. Il est valable 30 minutes.</p>
+      <div style="background:#0E3D2C; color:#E8C77E; font-size:28px; font-weight:bold; letter-spacing:8px; text-align:center; padding:16px; border-radius:8px; margin:16px 0;">
+        ${code}
+      </div>
+      <p style="color:#888; font-size:13px;">Si vous n'êtes pas à l'origine de cette inscription, ignorez simplement cet email.</p>
+      <p style="margin-top:20px; color:#888; font-size:12px;">NUNI — La musique congolaise mérite son envol.</p>
+    </div>
+  `;
+
+  try {
+    await t.sendMail({
+      from: `"NUNI" <${process.env.EMAIL_USER}>`,
+      to: user.email,
+      subject: `✅ Votre code de confirmation NUNI : ${code}`,
+      html,
+    });
+    return { sent: true };
+  } catch (err) {
+    console.error('[mailer] Échec envoi email de vérification :', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+module.exports = { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail };

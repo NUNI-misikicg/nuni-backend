@@ -305,6 +305,18 @@ async function initSchema() {
   await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE labels ADD COLUMN IF NOT EXISTS has_changed_plan_once BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url TEXT;`);
+  // ---------- Vérification d'email — ferme la faille des essais Pass Découverte en série
+  // (voir /api/register-discovery) : sans vérification, n'importe qui pouvait s'inscrire
+  // avec une adresse jetable ou variante (ex. jean+1@gmail.com, jean+2@gmail.com) pour
+  // relancer un essai gratuit de 24h à volonté. Le code est haché (jamais stocké en clair,
+  // même logique que hashResetCode pour le mot de passe oublié), expire après 30 minutes.
+  // email_verified par défaut à TRUE pour tous les comptes déjà existants avant cette
+  // fonctionnalité — personne ne doit se retrouver bloqué rétroactivement par un nouveau
+  // contrôle sur un compte créé avant qu'il n'existe.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_code TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_expires_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_attempts INTEGER NOT NULL DEFAULT 0;`);
   // Galerie "À propos" de l'artiste — jusqu'à 5 photos, gérées depuis son Dashboard,
   // affichées dans l'interface "À propos" façon Spotify (carrousel + biographie complète).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS about_gallery_urls TEXT;`);
