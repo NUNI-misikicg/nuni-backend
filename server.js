@@ -1,6 +1,7 @@
 // server.js — Serveur NUNI (Express + Postgres/Neon + Cloudinary)
 require('dotenv').config();
 const path = require('path');
+const dns = require('dns').promises;
 const express = require('express');
 const cors = require('cors');
 const cloudinary = require('cloudinary').v2;
@@ -160,6 +161,34 @@ async function enforceSubscriptionExpiry() {
 }
 
 function isEmail(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v || ''); }
+
+// ---------- Vérification réelle qu'un domaine email peut recevoir des messages ----------
+// Avant : seul le FORMAT de l'email était vérifié (présence d'un @, d'un point...) — une
+// adresse avec un domaine bidon ou mal orthographié (ex. "jean@gmial.com") passait sans
+// problème à l'inscription, désynchronisée de tout vrai utilisateur. Ici : une vraie requête
+// DNS vérifie que le domaine a des enregistrements MX (serveurs de messagerie) — donc qu'il
+// peut RÉELLEMENT recevoir un email, quel que soit le fournisseur (Gmail, Yahoo, Outlook...).
+// N'utilise que le module dns natif de Node, aucun service tiers payant. Un cache mémoire de
+// 10 minutes évite de refaire la même requête DNS à chaque frappe pour un domaine déjà vérifié.
+const emailDomainCache = new Map(); // domaine -> { valid, checkedAt }
+async function emailDomainCanReceiveMail(email) {
+  if (!isEmail(email)) return false;
+  const domain = email.split('@')[1].toLowerCase();
+  const cached = emailDomainCache.get(domain);
+  if (cached && Date.now() - cached.checkedAt < 10 * 60 * 1000) return cached.valid;
+  let valid;
+  try {
+    const records = await dns.resolveMx(domain);
+    valid = Array.isArray(records) && records.length > 0;
+  } catch (e) {
+    // ENOTFOUND / ENODATA = domaine sans serveur de messagerie, donc invalide. Toute autre
+    // erreur (timeout DNS ponctuel, etc.) ne doit jamais bloquer une vraie personne à tort —
+    // on laisse passer plutôt que de pénaliser un souci réseau temporaire de notre côté.
+    valid = !['ENOTFOUND', 'ENODATA'].includes(e.code);
+  }
+  emailDomainCache.set(domain, { valid, checkedAt: Date.now() });
+  return valid;
+}
 // ---------- Génère et envoie un nouveau code de vérification d'email ----------
 // Réutilisé par /api/register, /api/register-discovery et /api/auth/resend-verification —
 // un seul point qui génère le code, le hache avant stockage (jamais en clair, même
@@ -351,6 +380,17 @@ app.post('/api/me/challenges/:key/claim', authMiddleware, rateLimit(15, 60000), 
 
 // ================= AUTH =================
 
+// ---------- Vérification en direct pendant la saisie de l'email (avant soumission du
+// formulaire) — retour immédiat, la même vérification MX que celle appliquée à
+// l'inscription elle-même (défense en profondeur : ce contrôle client n'est qu'un confort,
+// jamais une garantie — la vraie vérification reste toujours refaite côté serveur ci-dessus). ----------
+app.get('/api/auth/check-email-domain', rateLimit(30, 60000), h(async (req, res) => {
+  const email = String(req.query.email || '');
+  if (!isEmail(email)) return res.json({ valid: false, reason: 'format' });
+  const valid = await emailDomainCanReceiveMail(email);
+  res.json({ valid, reason: valid ? null : 'domain' });
+}));
+
 app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
   const {
     accountType, firstName, lastName, email, phone, password,
@@ -372,6 +412,9 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
     if (missingLabel.length) return res.status(400).json({ error: `Champs manquants : ${missingLabel.join(', ')}` });
     if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
     if (!isEmail(professionalEmail)) return res.status(400).json({ error: 'Email professionnel invalide.' });
+    if (!(await emailDomainCanReceiveMail(email))) {
+      return res.status(400).json({ error: "Cette adresse email n'existe pas — vérifiez l'orthographe." });
+    }
     if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
     if (await db.get('SELECT id FROM users WHERE email = $1', [email])) {
       return res.status(409).json({ error: 'Un compte existe déjà avec cet email.' });
@@ -425,6 +468,9 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
     return res.status(400).json({ error: `Champs manquants : ${missing.join(', ')}` });
   }
   if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  if (!(await emailDomainCanReceiveMail(email))) {
+    return res.status(400).json({ error: "Cette adresse email n'existe pas — vérifiez l'orthographe." });
+  }
   if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
   if (Number(age) < 16) return res.status(400).json({ error: 'NUNI est réservé aux 16 ans et plus.' });
 
@@ -474,6 +520,9 @@ app.post('/api/register-discovery', rateLimit(10, 60 * 60000), h(async (req, res
   const missing = required(req.body, accountType === 'artist' ? [...baseRequired, 'artistName'] : baseRequired);
   if (missing.length) return res.status(400).json({ error: `Champs manquants : ${missing.join(', ')}` });
   if (!isEmail(email)) return res.status(400).json({ error: 'Adresse email invalide.' });
+  if (!(await emailDomainCanReceiveMail(email))) {
+    return res.status(400).json({ error: "Cette adresse email n'existe pas — vérifiez l'orthographe." });
+  }
   if (String(password).length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
   if (Number(age) < 16) return res.status(400).json({ error: 'NUNI est réservé aux 16 ans et plus.' });
   if (await db.get('SELECT id FROM users WHERE email = $1', [email])) {
