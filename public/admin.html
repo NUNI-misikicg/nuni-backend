@@ -258,7 +258,7 @@
       <label>Email du client (utilisé à l'inscription)</label>
       <input id="act-email" type="text" placeholder="email@exemple.com">
       <label>Pass souscrit</label>
-      <select id="act-plan"><option value="consumer">Pass Consommateur</option><option value="artist">Pass Artiste</option></select>
+      <select id="act-plan"><option value="consumer">Pass Auditeur</option><option value="artist">Pass Artiste</option></select>
       <label>Durée</label>
       <select id="act-duration">
         <option value="30">1 mois (30 jours)</option>
@@ -321,7 +321,7 @@
       <label>S'applique à</label>
       <select id="promo-plan">
         <option value="">Les deux Pass</option>
-        <option value="consumer">Pass Consommateur uniquement</option>
+        <option value="consumer">Pass Auditeur uniquement</option>
         <option value="artist">Pass Artiste uniquement</option>
       </select>
       <label>Nombre d'utilisations max</label>
@@ -1320,7 +1320,14 @@
       let html = '<table><tr><th>Client</th><th>Email</th><th>Pass</th><th>Montant</th><th>Statut</th><th>Échéance</th></tr>';
       data.subscriptions.forEach(s=>{
         const name = s.account_type === 'artist' ? (s.artist_name || s.first_name) : (s.first_name+' '+s.last_name);
-        const planLabel = s.plan === 'artist' ? 'Pass Artiste' : 'Pass Consommateur';
+        const durationLabels = { 30: '1 mois', 90: '3 mois', 365: '1 an' };
+        // Durée choisie par le client lui-même à l'inscription (voir requested_duration_days)
+        // — visible uniquement tant que le paiement n'est pas encore confirmé ; une fois actif,
+        // la vraie échéance réelle (subscription_expires_at) prend le relais, plus utile.
+        const requestedNote = (s.subscription_status === 'pending' && s.requested_duration_days)
+          ? ' <span class="muted">('+(durationLabels[s.requested_duration_days] || s.requested_duration_days+'j')+' demandé)</span>'
+          : '';
+        const planLabel = (s.plan === 'artist' ? 'Pass Artiste' : 'Pass Auditeur') + requestedNote;
         const montant = s.last_amount_fcfa!=null ? Number(s.last_amount_fcfa).toLocaleString('fr-FR')+' FCFA' : '—';
         let statusPill, echeance;
         if(s.subscription_status === 'pending'){

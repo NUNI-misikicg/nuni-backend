@@ -317,6 +317,10 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_code TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_expires_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Durée de Pass demandée par le client lui-même à l'inscription (voir renderDurationOptions
+  // côté frontend) — visible ensuite côté admin pour préremplir l'activation sans avoir à
+  // redemander l'information à l'opérateur WhatsApp, qui l'a déjà reçue dans le message.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS requested_duration_days INTEGER;`);
   // Galerie "À propos" de l'artiste — jusqu'à 5 photos, gérées depuis son Dashboard,
   // affichées dans l'interface "À propos" façon Spotify (carrousel + biographie complète).
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS about_gallery_urls TEXT;`);

@@ -1790,9 +1790,17 @@ app.get('/api/leaderboard', h(async (req, res) => {
 // ================= ABONNEMENT =================
 
 app.post('/api/subscribe/request', authMiddleware, h(async (req, res) => {
-  const { plan } = req.body;
+  const { plan, durationDays } = req.body;
   if (!['consumer', 'artist'].includes(plan)) return res.status(400).json({ error: 'Pass invalide.' });
-  await db.run(`UPDATE users SET plan = $1, subscription_status = 'pending' WHERE id = $2`, [plan, req.user.id]);
+  // Liste blanche stricte — jamais une valeur arbitraire envoyée par le client, uniquement
+  // les vraies durées proposées (voir RR_DURATION_OPTIONS côté frontend et PRICE_TABLE
+  // ci-dessus). Une valeur hors-liste est simplement ignorée (NULL), jamais une erreur qui
+  // bloquerait l'inscription pour ça.
+  const validDuration = [30, 90, 365].includes(Number(durationDays)) ? Number(durationDays) : null;
+  await db.run(
+    `UPDATE users SET plan = $1, subscription_status = 'pending', requested_duration_days = $2 WHERE id = $3`,
+    [plan, validDuration, req.user.id],
+  );
   res.json({
     message: 'Demande enregistrée. Finalisez le paiement sur WhatsApp, puis attendez votre code d\'accès.',
     whatsapp: 'https://wa.me/242068951600',
@@ -3496,6 +3504,7 @@ app.get('/api/admin/subscriptions', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.first_name, u.last_name, u.email, u.account_type, u.artist_name, u.plan,
            u.subscription_status, u.account_status, u.subscription_started_at, u.subscription_expires_at,
+           u.requested_duration_days,
            CEIL(EXTRACT(EPOCH FROM (u.subscription_expires_at - NOW())) / 86400)::int as days_remaining,
            (SELECT p.amount_fcfa FROM payments p WHERE p.user_id = u.id ORDER BY p.created_at DESC LIMIT 1) as last_amount_fcfa
     FROM users u
