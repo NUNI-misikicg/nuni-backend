@@ -10,7 +10,7 @@ const {
   initAuth, hashPassword, verifyPassword, needsRehash, signToken, verifyToken, generateAccessCode,
   generateResetCode, hashResetCode, authMiddleware,
 } = require('./auth');
-const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail } = require('./mailer');
+const { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail, sendAccessCodeToClient } = require('./mailer');
 
 const app = express();
 // ---------- CORS restreint (durcissement sécurité) ----------
@@ -2106,7 +2106,27 @@ app.post('/api/admin/activate-by-email', h(async (req, res) => {
     amount_fcfa: result.amount_fcfa,
     promoApplied: result.promoApplied,
     promoWarning: result.promoWarning,
+    userId: user.id,
   });
+}));
+
+// ---------- Envoyer le code d'accès DIRECTEMENT au client par email, depuis le panneau
+// admin — pour l'admin qui préfère envoyer lui-même le code une fois le paiement confirmé
+// par l'équipe WhatsApp, plutôt que de repasser par le circuit habituel (boîte NUNI →
+// retransmission WhatsApp). Relit toujours le vrai code ACTUEL en base (jamais un code
+// fourni par la requête) — impossible d'envoyer un code périmé, déjà changé, ou trafiqué.
+app.post('/api/admin/send-access-code-to-client', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { userId } = req.body;
+  const user = await db.get('SELECT * FROM users WHERE id = $1', [userId]);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+  if (!user.access_code) return res.status(400).json({ error: "Ce compte n'a pas encore de code d'accès généré — activez d'abord son Pass." });
+  const durationDays = user.subscription_started_at && user.subscription_expires_at
+    ? Math.round((new Date(user.subscription_expires_at) - new Date(user.subscription_started_at)) / 86400000)
+    : null;
+  const result = await sendAccessCodeToClient({ user, plan: user.plan, accessCode: user.access_code, durationDays: durationDays || '—' });
+  if (!result.sent) return res.status(502).json({ error: "L'envoi a échoué — " + (result.reason || 'réessayez.') });
+  res.json({ message: `Code envoyé directement à ${user.email}.` });
 }));
 
 app.post('/api/subscribe/redeem', authMiddleware, rateLimit(10, 60000), h(async (req, res) => {

@@ -191,4 +191,41 @@ async function sendVerificationEmail({ user, code }) {
   }
 }
 
-module.exports = { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail };
+// Envoie le code d'accès DIRECTEMENT au client, depuis le panneau admin — utilisé quand
+// l'équipe WhatsApp a déjà confirmé le paiement et que l'admin préfère envoyer le code par
+// email plutôt que de repasser par le circuit habituel (boîte NUNI → retransmission
+// WhatsApp). Contrairement à sendAccessCodeEmail (toujours vers process.env.EMAIL_USER),
+// celui-ci va toujours vers user.email — jamais l'inverse, pour ne jamais mélanger les deux.
+async function sendAccessCodeToClient({ user, plan, accessCode, durationDays }) {
+  const t = getTransporter();
+  if (!t) return { sent: false, reason: 'email_not_configured' };
+
+  const planLabel = PLAN_LABELS[plan] || plan;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
+      <h2 style="color:#0E3D2C;">Votre code d'accès NUNI</h2>
+      <p>Bonjour ${user.first_name},</p>
+      <p>Votre ${planLabel} (${durationDays} jours) est activé ! Voici votre code d'accès — entrez-le dans l'application NUNI via <b>Profil → Saisir mon code d'accès</b>.</p>
+      <div style="background:#0E3D2C; color:#E8C77E; font-size:28px; font-weight:bold; letter-spacing:4px; text-align:center; padding:16px; border-radius:8px; margin:16px 0;">
+        ${accessCode}
+      </div>
+      <p style="color:#888; font-size:13px;">Ce code est personnel — ne le partagez avec personne.</p>
+      <p style="margin-top:20px; color:#888; font-size:12px;">NUNI — La musique congolaise mérite son envol.</p>
+    </div>
+  `;
+
+  try {
+    await t.sendMail({
+      from: `"NUNI" <${process.env.EMAIL_USER}>`,
+      to: user.email,
+      subject: `🔑 Votre code d'accès NUNI : ${accessCode}`,
+      html,
+    });
+    return { sent: true };
+  } catch (err) {
+    console.error('[mailer] Échec envoi email direct au client :', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+module.exports = { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail, sendAccessCodeToClient };

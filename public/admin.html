@@ -1125,8 +1125,32 @@
       if(data.promoApplied) extra += ' (code '+data.promoApplied+' appliqué)';
       extra += '</div>';
       if(data.promoWarning) extra += '<div class="muted" style="color:#f29a9a; margin-top:4px;">⚠️ Code promo ignoré : '+data.promoWarning+'</div>';
+      // Bouton "envoyer au client" — pour le cas où l'équipe WhatsApp a déjà confirmé le
+      // paiement et où l'admin préfère envoyer le code directement par email plutôt que de
+      // repasser par le circuit habituel (boîte NUNI → retransmission WhatsApp manuelle).
+      extra += '<button class="secondary" style="width:100%; margin-top:10px;" id="act-send-client-btn" onclick="sendCodeToClient('+data.userId+', this)">📧 Envoyer ce code par email au client</button>';
+      extra += '<div id="act-send-client-msg" style="margin-top:6px; font-size:12.5px;"></div>';
       msg.innerHTML = '<div class="msg ok">✅ '+data.message+'</div><div class="card" style="text-align:center; font-size:22px; letter-spacing:4px; font-weight:700; color:#D4AF6A;">'+data.access_code+'</div>'+extra;
     }catch(e){ msg.innerHTML = '<div class="msg err">❌ Impossible de contacter le serveur.</div>'; }
+  }
+
+  // Envoie le code déjà activé directement à l'adresse email du client — relit toujours le
+  // vrai code actuel côté serveur (jamais celui affiché à l'écran), donc fiable même si
+  // l'admin revient sur ce bouton plus tard.
+  async function sendCodeToClient(userId, btn){
+    const feedback = document.getElementById('act-send-client-msg');
+    btn.disabled = true;
+    feedback.innerHTML = '<span class="muted">Envoi en cours…</span>';
+    try{
+      const res = await fetch('/api/admin/send-access-code-to-client', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ userId }),
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      if(!res.ok){ feedback.innerHTML = '<span style="color:#f29a9a;">❌ '+(data.error||'Erreur')+'</span>'; return; }
+      feedback.innerHTML = '<span style="color:#7ee6a8;">✅ '+data.message+'</span>';
+    }catch(e){ btn.disabled = false; feedback.innerHTML = '<span style="color:#f29a9a;">❌ Impossible de contacter le serveur.</span>'; }
   }
 
   async function deactivateSubscription(){
