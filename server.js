@@ -2193,7 +2193,12 @@ app.post('/api/subscribe/redeem', authMiddleware, rateLimit(10, 60000), h(async 
   if (user.subscription_status !== 'active') {
     return res.status(400).json({ error: "Aucun paiement confirmé pour ce compte pour l'instant." });
   }
-  if (String(code).toUpperCase() !== user.access_code) {
+  // Avant : le code n'était jamais nettoyé des espaces avant comparaison côté serveur — ça
+  // ne fonctionnait que parce que le frontend le faisait déjà (trim + majuscules). Le
+  // serveur ne doit jamais dépendre uniquement du client pour ça : un espace collé par
+  // erreur (copier-coller depuis un email, appel direct à l'API...) ferait échouer un vrai
+  // code correct.
+  if (String(code || '').trim().toUpperCase() !== user.access_code) {
     return res.status(400).json({ error: 'Code invalide.' });
   }
   const fresh = await db.get('SELECT * FROM users WHERE id = $1', [user.id]);
