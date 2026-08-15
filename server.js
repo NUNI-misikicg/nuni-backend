@@ -2996,6 +2996,33 @@ app.get('/api/artists/top100', h(async (req, res) => {
 // ---------- Top artistes par streams — pour la pyramide Top Congo ----------
 // Vrais streams cumulés (SUM sur tracks.streams), même filtre Pass Artiste actif
 // que /top100 et /talent/top100. Pas de votes ici : uniquement l'écoute réelle.
+// ---------- Tendance régionale — vraies écoutes de vrais auditeurs du même pays ----------
+// Avant : "Top Congo" était la seule tendance disponible, toujours calculée sur TOUTES les
+// écoutes de la plateforme sans distinction de pays — ce qui n'a d'importance que le jour où
+// NUNI aura de vrais auditeurs hors Congo. Cette route prépare cette évolution : les 30
+// derniers jours d'écoutes (plays.created_at), filtrées sur les VRAIS auditeurs (listener_id
+// → users.country) du même pays que la personne qui consulte l'accueil — jamais un contenu
+// générique ou inventé, juste un vrai classement scopé sur de vraies données déjà en base.
+app.get('/api/tracks/trending-region', h(async (req, res) => {
+  const country = (req.query.country || '').trim();
+  if (!country) return res.json({ tracks: [], scoped: false });
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type,
+      u.artist_name, u.first_name, u.is_verified, u.id as artist_id,
+      COUNT(p.id)::int as region_plays
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    JOIN users u ON u.id = t.artist_id
+    JOIN users listener ON listener.id = p.listener_id
+    WHERE listener.country = $1 AND p.created_at > NOW() - INTERVAL '30 days' AND t.published = 1
+    GROUP BY t.id, t.title, t.cover_url, t.audio_url, t.genre, t.streams, t.likes, t.release_type, u.artist_name, u.first_name, u.is_verified, u.id
+    ORDER BY region_plays DESC
+    LIMIT 12
+  `, [country]);
+  const authUser = await optionalAuthUser(req);
+  res.json({ tracks: stripAudioIfNoAccess(rows, hasStreamingAccess(authUser)), scoped: true, country });
+}));
+
 app.get('/api/artists/top-streams', h(async (req, res) => {
   const genre = (req.query.genre || '').trim();
   const rows = genre
