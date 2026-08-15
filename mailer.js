@@ -17,8 +17,34 @@ function getTransporter() {
       user: process.env.EMAIL_USER,
       pass: process.env.EMAIL_APP_PASSWORD,
     },
+    // Délais explicites plus généreux que les valeurs par défaut de nodemailer — un serveur
+    // Render tout juste réveillé (cold start du plan gratuit) peut mettre un peu de temps à
+    // établir une connexion sortante vers Gmail, sans que ce soit un vrai problème.
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 30000,
   });
   return transporter;
+}
+
+// Avant : un seul essai suffisait à faire échouer tout l'envoi ("Connection timeout"),
+// même pour un simple aléa réseau ponctuel vers Gmail qui se résout souvent tout seul
+// quelques secondes après. Une tentative automatique supplémentaire est faite avant
+// d'abandonner pour de bon — jamais plus de 2 essais, pour ne pas faire attendre
+// indéfiniment la personne qui a cliqué sur "Envoyer".
+async function sendMailWithRetry(t, mailOptions, maxAttempts = 2) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await t.sendMail(mailOptions);
+      return { sent: true };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  console.error('[mailer] Échec envoi email après ' + maxAttempts + ' tentative(s) :', lastErr.message);
+  return { sent: false, reason: lastErr.message };
 }
 
 const PLAN_LABELS = {
@@ -54,18 +80,12 @@ async function sendAccessCodeEmail({ user, plan, accessCode, durationDays }) {
     </div>
   `;
 
-  try {
-    await t.sendMail({
-      from: `"NUNI" <${process.env.EMAIL_USER}>`,
-      to,
-      subject: `🔑 Code d'accès NUNI pour ${user.first_name} ${user.last_name} : ${accessCode}`,
-      html,
-    });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, {
+    from: `"NUNI" <${process.env.EMAIL_USER}>`,
+    to,
+    subject: `🔑 Code d'accès NUNI pour ${user.first_name} ${user.last_name} : ${accessCode}`,
+    html,
+  });
 }
 
 // Envoie le code de réinitialisation directement au CLIENT (contrairement à
@@ -88,18 +108,12 @@ async function sendPasswordResetEmail({ user, resetCode }) {
     </div>
   `;
 
-  try {
-    await t.sendMail({
-      from: `"NUNI" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: `🔑 Votre code de réinitialisation NUNI : ${resetCode}`,
-      html,
-    });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email de réinitialisation :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, {
+    from: `"NUNI" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: `🔑 Votre code de réinitialisation NUNI : ${resetCode}`,
+    html,
+  });
 }
 
 async function sendAdRequestEmail({ name, desc, link, contact, duration }) {
@@ -118,13 +132,7 @@ async function sendAdRequestEmail({ name, desc, link, contact, duration }) {
       <p style="margin-top:20px; color:#888; font-size:12px;">NUNI — La musique congolaise mérite son envol.</p>
     </div>
   `;
-  try {
-    await t.sendMail({ from: `"NUNI" <${process.env.EMAIL_USER}>`, to: process.env.EMAIL_USER, subject: `Nouvelle demande de publicité : ${name}`, html });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email de demande de publicité :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, { from: `"NUNI" <${process.env.EMAIL_USER}>`, to: process.env.EMAIL_USER, subject: `Nouvelle demande de publicité : ${name}`, html });
 }
 
 // Notifie l'artiste par email quand un paiement lui est versé — trace écrite en dehors de
@@ -148,13 +156,7 @@ async function sendArtistPaymentEmail({ user, amountFcfa, streamsCovered, period
       <p style="margin-top:20px; color:#888; font-size:12px;">NUNI — La musique congolaise mérite son envol.</p>
     </div>
   `;
-  try {
-    await t.sendMail({ from: `"NUNI" <${process.env.EMAIL_USER}>`, to: user.email, subject: `Versement NUNI : ${amountFcfa.toLocaleString('fr-FR')} FCFA`, html });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email de versement :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, { from: `"NUNI" <${process.env.EMAIL_USER}>`, to: user.email, subject: `Versement NUNI : ${amountFcfa.toLocaleString('fr-FR')} FCFA`, html });
 }
 
 // Envoie le code de vérification d'email directement au CLIENT — nécessaire pour confirmer
@@ -177,18 +179,12 @@ async function sendVerificationEmail({ user, code }) {
     </div>
   `;
 
-  try {
-    await t.sendMail({
-      from: `"NUNI" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: `✅ Votre code de confirmation NUNI : ${code}`,
-      html,
-    });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email de vérification :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, {
+    from: `"NUNI" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: `✅ Votre code de confirmation NUNI : ${code}`,
+    html,
+  });
 }
 
 // Envoie le code d'accès DIRECTEMENT au client, depuis le panneau admin — utilisé quand
@@ -214,18 +210,12 @@ async function sendAccessCodeToClient({ user, plan, accessCode, durationDays }) 
     </div>
   `;
 
-  try {
-    await t.sendMail({
-      from: `"NUNI" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: `🔑 Votre code d'accès NUNI : ${accessCode}`,
-      html,
-    });
-    return { sent: true };
-  } catch (err) {
-    console.error('[mailer] Échec envoi email direct au client :', err.message);
-    return { sent: false, reason: err.message };
-  }
+  return sendMailWithRetry(t, {
+    from: `"NUNI" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: `🔑 Votre code d'accès NUNI : ${accessCode}`,
+    html,
+  });
 }
 
 module.exports = { sendAccessCodeEmail, sendPasswordResetEmail, sendAdRequestEmail, sendArtistPaymentEmail, sendVerificationEmail, sendAccessCodeToClient };
