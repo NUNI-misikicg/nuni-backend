@@ -121,7 +121,7 @@ app.get('/api/hero-images/:section', h(async (req, res) => {
 }));
 
 const PRICE_TABLE = {
-  consumer: { 30: 650, 90: 650, 365: 1500 },
+  consumer: { 30: 750, 90: 650, 365: 1250 },
   artist: { 90: 5000, 365: 10000 },
 };
 function basePriceFor(plan, durationDays) {
