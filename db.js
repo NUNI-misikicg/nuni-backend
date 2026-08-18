@@ -796,6 +796,10 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_payouts_collaborator ON collaborator_payouts(collaborator_id);
     CREATE INDEX IF NOT EXISTS idx_payouts_terms ON collaborator_payouts(collaboration_terms_id);
+    -- Idempotence financière : une même part (via collaboration_terms) d'une même période de
+    -- revenus ne peut physiquement pas être insérée deux fois, même en cas de double clic ou
+    -- de deux requêtes admin simultanées.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_unique_period_terms ON collaborator_payouts(revenue_period_id, collaboration_terms_id);
 
     -- 7. Ajustements/corrections — jamais de modification directe d'un payout déjà payé
     CREATE TABLE IF NOT EXISTS payout_adjustments (

@@ -3759,6 +3759,114 @@ app.put('/api/admin/royalty-settings', h(async (req, res) => {
   res.json({ message: 'Taux de reversement mis à jour.', settings: await getRoyaltySettings() });
 }));
 
+// ============================================================
+// MOTEUR DE COLLABORATIONS — couche strictement additive au-dessus du paiement
+// existant. N'appelle JAMAIS computeArtistPayout() en interne et n'en modifie
+// jamais le résultat — elle se contente de calculer une déduction à appliquer
+// à côté, dans la même transaction que le paiement de l'artiste principal.
+// ============================================================
+class CollaborationValidationError extends Error {}
+
+async function applyCollaborationSplits(client, artistId, settings) {
+  const tracksWithCollab = await client.query(`
+    SELECT DISTINCT t.id AS track_id
+    FROM tracks t
+    JOIN track_collaborators tc ON tc.track_id = t.id
+    JOIN collaboration_terms ct ON ct.collaborator_id = tc.id AND ct.effective_until IS NULL
+    WHERE t.artist_id = $1 AND tc.role != 'primary'
+      AND ct.rights_type IN ('master','both')
+  `, [artistId]);
+
+  let totalDeductionFcfa = 0;
+  const createdPayoutIds = [];
+
+  for (const row of tracksWithCollab.rows) {
+    const trackId = row.track_id;
+
+    const terms = (await client.query(`
+      SELECT ct.*, tc.id AS collaborator_id
+      FROM collaboration_terms ct
+      JOIN track_collaborators tc ON tc.id = ct.collaborator_id
+      WHERE tc.track_id = $1 AND ct.effective_until IS NULL
+        AND tc.role != 'primary' AND ct.rights_type IN ('master','both')
+    `, [trackId])).rows;
+    if (!terms.length) continue;
+
+    // Garde-fou absolu : jamais plus de 100% de parts acceptées sur un même morceau.
+    const acceptedPctSum = terms
+      .filter(t => t.status === 'accepted')
+      .reduce((sum, t) => sum + Number(t.share_pct || 0), 0);
+    if (acceptedPctSum > 100) {
+      throw new CollaborationValidationError(
+        `Morceau #${trackId} : parts acceptées totalisant ${acceptedPctSum}% (> 100%). Paiement bloqué — à corriger avant tout versement.`,
+      );
+    }
+
+    const lastPeriod = await client.query(
+      `SELECT period_end FROM track_revenue_periods WHERE track_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [trackId],
+    );
+    const lastPeriodEnd = lastPeriod.rows[0] ? lastPeriod.rows[0].period_end : null;
+
+    for (const term of terms) {
+      const windowStart = (lastPeriodEnd && lastPeriodEnd > term.effective_from) ? lastPeriodEnd : term.effective_from;
+
+      const streamsRow = await client.query(
+        `SELECT COUNT(*)::int AS c FROM plays WHERE track_id = $1 AND created_at >= $2 AND created_at < NOW()`,
+        [trackId, windowStart],
+      );
+      const streamsInWindow = streamsRow.rows[0].c;
+      if (streamsInWindow <= 0) continue;
+
+      const revenuePeriodFcfa = Math.round(streamsInWindow * settings.price_per_stream_fcfa);
+
+      const periodRow = await client.query(
+        `INSERT INTO track_revenue_periods (track_id, period_start, period_end, streams_in_period, revenue_fcfa_total)
+         VALUES ($1, $2, NOW(), $3, $4) RETURNING id`,
+        [trackId, windowStart, streamsInWindow, revenuePeriodFcfa],
+      );
+      const revenuePeriodId = periodRow.rows[0].id;
+
+      if (term.status === 'rejected') continue;
+      if (term.payment_type === 'forfait' || term.payment_type === 'aucun_paiement') continue;
+
+      const grossShareFcfa = Math.round(revenuePeriodFcfa * Number(term.share_pct || 0) / 100);
+      if (grossShareFcfa <= 0) continue;
+
+      let recoupmentAppliedFcfa = 0;
+      let netPayableFcfa = grossShareFcfa;
+      if (term.payment_type === 'avance_recoupable') {
+        const recoupedSoFar = await client.query(
+          `SELECT COALESCE(SUM(recoupment_applied_fcfa),0)::numeric AS s FROM collaborator_payouts WHERE collaboration_terms_id = $1`,
+          [term.id],
+        );
+        const remainingBalance = Math.max(0, Number(term.upfront_amount_fcfa || 0) - Number(recoupedSoFar.rows[0].s));
+        recoupmentAppliedFcfa = Math.min(grossShareFcfa, remainingBalance);
+        netPayableFcfa = grossShareFcfa - recoupmentAppliedFcfa;
+      }
+
+      totalDeductionFcfa += grossShareFcfa;
+
+      let payoutStatus = 'payable';
+      let heldReason = null;
+      if (term.status === 'disputed') { payoutStatus = 'held_dispute'; heldReason = 'Accord contesté par le collaborateur.'; }
+      else if (term.status === 'pending') { payoutStatus = 'held_pending'; heldReason = 'En attente de confirmation du collaborateur.'; }
+
+      const payoutRow = await client.query(
+        `INSERT INTO collaborator_payouts
+           (revenue_period_id, collaborator_id, collaboration_terms_id, gross_share_fcfa, recoupment_applied_fcfa, net_payable_fcfa, status, held_reason)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (revenue_period_id, collaboration_terms_id) DO NOTHING
+         RETURNING id`,
+        [revenuePeriodId, term.collaborator_id, term.id, grossShareFcfa, recoupmentAppliedFcfa, netPayableFcfa, payoutStatus, heldReason],
+      );
+      if (payoutRow.rows[0]) createdPayoutIds.push(payoutRow.rows[0].id);
+    }
+  }
+
+  return { totalDeductionFcfa, createdPayoutIds };
+}
+
 // Calcule pour un artiste : streams déjà payés (somme de l'historique), streams de la
 // période en cours (dérivé, jamais stocké), montant dû, date du dernier paiement.
 async function computeArtistPayout(artistId, settings) {
@@ -3814,6 +3922,12 @@ app.get('/api/admin/artist-payouts/:artistId/history', h(async (req, res) => {
 
 // Enregistre un vrai versement — ne touche jamais tracks.streams. Envoie un email à
 // l'artiste pour trace écrite, jamais bloquant si l'email échoue.
+//
+// Depuis l'ajout du système de collaborations : toute la logique de paiement (principal
+// + collaborateurs) tourne dans UNE SEULE transaction avec verrou — soit tout est
+// enregistré ensemble, soit rien ne l'est. computeArtistPayout() reste appelée telle
+// quelle et n'est jamais modifiée ; la déduction des parts collaborateurs est appliquée
+// séparément, juste avant l'écriture de payment_history.
 app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const artistId = Number(req.params.artistId);
@@ -3821,34 +3935,75 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
   if (!artist) return res.status(404).json({ error: 'Artiste introuvable.' });
 
   const settings = await getRoyaltySettings();
-  const p = await computeArtistPayout(artistId, settings);
-  if (p.current_period_streams <= 0) {
-    return res.status(400).json({ error: "Aucun stream en attente de paiement pour cet artiste." });
-  }
   const { method, reference, note } = req.body || {};
-  const lastPayment = await db.get(
-    'SELECT period_end FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 1', [artistId],
-  );
-  const inserted = await db.get(
-    `INSERT INTO payment_history (artist_id, amount_fcfa, streams_covered, period_start, period_end, method, reference, note)
-     VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7) RETURNING id`,
-    [artistId, p.amount_due_fcfa, p.current_period_streams, lastPayment ? lastPayment.period_end : artist.created_at,
-      method || 'Manuel', reference || null, note || null],
-  );
-  sendArtistPaymentEmail({
-    user: artist, amountFcfa: p.amount_due_fcfa, streamsCovered: p.current_period_streams,
-    periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
-  }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
 
-  // Notification "paiement reçu" pour le Label, si cet artiste lui est affilié.
-  db.get(
-    "SELECT l.user_id, l.label_name FROM label_artists la JOIN labels l ON l.id = la.label_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
-    [artistId],
-  ).then((row) => {
-    if (row) createNotification(row.user_id, 'label_payment_received', 'Paiement reçu', `${artist.artist_name || artist.first_name} a reçu un versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA.`, null).catch(() => {});
-  }).catch(() => {});
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Verrou : empêche deux admins (ou un double clic) de payer cet artiste en même temps.
+    await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [artistId]);
 
-  res.json({ message: `Versement de ${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA enregistré pour ${artist.artist_name || artist.first_name}.`, payment_id: inserted.id });
+    const p = await computeArtistPayout(artistId, settings); // INCHANGÉE, appelée telle quelle
+    if (p.current_period_streams <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "Aucun stream en attente de paiement pour cet artiste." });
+    }
+
+    let collabResult;
+    try {
+      collabResult = await applyCollaborationSplits(client, artistId, settings);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      if (e instanceof CollaborationValidationError) {
+        return res.status(409).json({ error: e.message });
+      }
+      throw e;
+    }
+
+    const netAmountFcfa = Math.max(0, p.amount_due_fcfa - collabResult.totalDeductionFcfa);
+
+    const lastPaymentRow = await client.query(
+      'SELECT period_end FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 1', [artistId],
+    );
+    const lastPayment = lastPaymentRow.rows[0];
+    const insertedRow = await client.query(
+      `INSERT INTO payment_history (artist_id, amount_fcfa, streams_covered, period_start, period_end, method, reference, note)
+       VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7) RETURNING id`,
+      [artistId, netAmountFcfa, p.current_period_streams, lastPayment ? lastPayment.period_end : artist.created_at,
+        method || 'Manuel', reference || null, note || null],
+    );
+    const inserted = insertedRow.rows[0];
+
+    await client.query('COMMIT');
+
+    sendArtistPaymentEmail({
+      user: artist, amountFcfa: netAmountFcfa, streamsCovered: p.current_period_streams,
+      periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
+    }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
+
+    // Notification "paiement reçu" pour le Label, si cet artiste lui est affilié.
+    db.get(
+      "SELECT l.user_id, l.label_name FROM label_artists la JOIN labels l ON l.id = la.label_id WHERE la.artist_id = $1 AND la.status = 'active' LIMIT 1",
+      [artistId],
+    ).then((row) => {
+      if (row) createNotification(row.user_id, 'label_payment_received', 'Paiement reçu', `${artist.artist_name || artist.first_name} a reçu un versement de ${netAmountFcfa.toLocaleString('fr-FR')} FCFA.`, null).catch(() => {});
+    }).catch(() => {});
+
+    res.json({
+      message: `Versement de ${netAmountFcfa.toLocaleString('fr-FR')} FCFA enregistré pour ${artist.artist_name || artist.first_name}.`,
+      payment_id: inserted.id,
+      gross_amount_fcfa: p.amount_due_fcfa,
+      collaborators_deduction_fcfa: collabResult.totalDeductionFcfa,
+      net_amount_fcfa: netAmountFcfa,
+      collaborator_payouts_created: collabResult.createdPayoutIds.length,
+    });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) { /* déjà annulée ou connexion perdue */ }
+    console.error('[artist-payouts/pay] erreur, transaction annulée :', e.message);
+    res.status(500).json({ error: "Erreur lors de l'enregistrement du paiement — aucune donnée n'a été modifiée." });
+  } finally {
+    client.release(); // toujours libérer la connexion, succès comme échec
+  }
 }));
 
 // ---------- Côté artiste : son propre statut de paiement et son propre historique ----------
