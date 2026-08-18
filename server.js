@@ -3030,6 +3030,31 @@ app.get('/api/artists/emerging', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
+// ---------- "Les titres qui montent" — vraie progression semaine sur semaine, calculée en
+// direct sur les vraies écoutes horodatées (table plays), jamais un pourcentage inventé ou
+// un historique de rang fictif. Seuil minimum de 5 écoutes la semaine précédente pour éviter
+// qu'un morceau passé de 1 à 2 écoutes affiche une fausse "progression de 100%".
+app.get('/api/tracks/rising', h(async (req, res) => {
+  const rows = await db.query(`
+    WITH weekly AS (
+      SELECT track_id,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') AS this_week,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days') AS last_week
+      FROM plays
+      GROUP BY track_id
+    )
+    SELECT t.id, t.title, u.artist_name, u.first_name, w.this_week, w.last_week,
+      ROUND(((w.this_week - w.last_week)::numeric / NULLIF(w.last_week,0)) * 100) AS growth_pct
+    FROM weekly w
+    JOIN tracks t ON t.id = w.track_id AND t.published = 1
+    JOIN users u ON u.id = t.artist_id
+    WHERE w.last_week >= 5 AND w.this_week > w.last_week
+    ORDER BY growth_pct DESC
+    LIMIT 5
+  `);
+  res.json({ tracks: rows });
+}));
+
 // ---------- Top artistes par streams — pour la pyramide Top Congo ----------
 // Vrais streams cumulés (SUM sur tracks.streams), même filtre Pass Artiste actif
 // que /top100 et /talent/top100. Pas de votes ici : uniquement l'écoute réelle.
