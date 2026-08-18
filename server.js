@@ -3013,6 +3013,23 @@ app.get('/api/artists/top100', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
+// ---------- "À surveiller" — vrais artistes récemment inscrits ayant déjà au moins un vrai
+// morceau publié. Jamais un statut "émergent"/"à surveiller" affiché sans activité réelle
+// derrière — le filtre sur un vrai morceau publié écarte les comptes créés mais inactifs. ----------
+app.get('/api/artists/emerging', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified, u.city, u.created_at,
+      (SELECT genre FROM tracks WHERE artist_id = u.id AND genre IS NOT NULL ORDER BY created_at DESC LIMIT 1) as top_genre,
+      (SELECT COUNT(*)::int FROM tracks WHERE artist_id = u.id AND published = 1) as track_count
+    FROM users u
+    WHERE u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
+      AND EXISTS (SELECT 1 FROM tracks t WHERE t.artist_id = u.id AND t.published = 1)
+    ORDER BY u.created_at DESC
+    LIMIT 4
+  `);
+  res.json({ artists: rows });
+}));
+
 // ---------- Top artistes par streams — pour la pyramide Top Congo ----------
 // Vrais streams cumulés (SUM sur tracks.streams), même filtre Pass Artiste actif
 // que /top100 et /talent/top100. Pas de votes ici : uniquement l'écoute réelle.
