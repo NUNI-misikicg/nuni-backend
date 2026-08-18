@@ -2516,9 +2516,14 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   }
   const {
     title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt,
-    composer, featuring, studio, description, releaseDate, credits,
+    composer, featuring, studio, description, releaseDate, credits, moodKeys,
   } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
+  // Limite de 3 ambiances maximum — vérifiée ici, jamais seulement côté client (qui peut
+  // être contourné par n'importe quel appel direct à l'API).
+  if (Array.isArray(moodKeys) && moodKeys.length > 3) {
+    return res.status(400).json({ error: 'Maximum 3 ambiances par morceau.' });
+  }
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
 
   const [finalCoverUrl, finalAudioUrl] = await Promise.all([
@@ -2539,6 +2544,18 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
     scheduledReleaseAt || null, isFuture ? 0 : 1,
     composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
   ]);
+  // Ambiances — entièrement optionnel, ne bloque jamais la publication si absent ou si une
+  // clé envoyée ne correspond à aucune ambiance réelle du vocabulaire NUNI.
+  if (Array.isArray(moodKeys) && moodKeys.length) {
+    try {
+      await db.run(
+        `INSERT INTO track_moods (track_id, mood_id)
+         SELECT $1, m.id FROM moods m WHERE m.key = ANY($2)
+         ON CONFLICT DO NOTHING`,
+        [inserted.id, moodKeys],
+      );
+    } catch (e) { console.error('Erreur enregistrement ambiances:', e); }
+  }
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
   if (!isFuture) {
     // Notification "nouvelle sortie" pour le Label — jamais bloquante pour la réponse déjà envoyée.
@@ -3073,6 +3090,48 @@ app.get('/api/activity/today', h(async (req, res) => {
     LIMIT 5
   `);
   res.json({ activity: rows });
+}));
+
+// ---------- Ambiances NUNI — vraies ambiances taguées par les artistes (jamais de mood
+// déduit automatiquement). Une ambiance n'est renvoyée que si elle a réellement au moins 3
+// morceaux publiés — sinon, mieux vaut ne pas l'afficher plutôt que de remplir la section
+// artificiellement avec 1 ou 2 morceaux.
+// Vocabulaire complet des ambiances — pour le sélecteur du formulaire de publication
+// artiste. Distinct de GET /api/moods (qui ne renvoie que les ambiances déjà assez
+// peuplées pour l'accueil) : un artiste doit pouvoir taguer une ambiance même si elle n'a
+// encore aucun morceau.
+app.get('/api/moods/available', h(async (req, res) => {
+  const rows = await db.query('SELECT key, label FROM moods ORDER BY sort_order');
+  res.json({ moods: rows });
+}));
+
+app.get('/api/moods', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT m.key, m.label,
+      json_agg(json_build_object('id', t.id, 'title', t.title, 'cover_url', t.cover_url, 'artist_name', u.artist_name, 'first_name', u.first_name) ORDER BY t.created_at DESC) AS tracks
+    FROM moods m
+    JOIN track_moods tm ON tm.mood_id = m.id
+    JOIN tracks t ON t.id = tm.track_id AND t.published = 1
+    JOIN users u ON u.id = t.artist_id
+    GROUP BY m.id, m.key, m.label, m.sort_order
+    HAVING COUNT(t.id) >= 3
+    ORDER BY m.sort_order
+  `);
+  // On ne garde que les 8 morceaux les plus récents par ambiance côté réponse — la requête
+  // ci-dessus les a déjà triés du plus récent au plus ancien.
+  rows.forEach(r => { r.tracks = r.tracks.slice(0, 8); });
+  res.json({ moods: rows });
+}));
+
+// Ambiances d'un morceau précis — prévu pour être affiché sur sa page, dans l'album, la
+// recherche et les futures recommandations. Tableau vide si aucune ambiance taguée, jamais
+// une valeur par défaut inventée.
+app.get('/api/tracks/:id/moods', h(async (req, res) => {
+  const rows = await db.query(
+    `SELECT m.key, m.label FROM track_moods tm JOIN moods m ON m.id = tm.mood_id WHERE tm.track_id = $1 ORDER BY m.sort_order`,
+    [Number(req.params.id)],
+  );
+  res.json({ moods: rows });
 }));
 
 // ---------- "En ce moment" — vrais nouveaux auditeurs uniques du jour, par morceau. NUNI ne

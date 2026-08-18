@@ -667,6 +667,37 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_release_notify_track ON release_notify_requests(track_id) WHERE notified_at IS NULL;
   `);
+
+  // ---------- Ambiances NUNI — vocabulaire contrôlé (jamais du texte libre saisi par
+  // l'artiste) + relation multi-valeurs optionnelle vers les morceaux. Voir le document de
+  // migration validé avec Elyon : aucune modification de la table tracks existante,
+  // entièrement réversible en supprimant ces deux tables. ----------
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS moods (
+      id SERIAL PRIMARY KEY,
+      key TEXT UNIQUE NOT NULL,
+      label TEXT NOT NULL,
+      sort_order INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS track_moods (
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      mood_id INTEGER NOT NULL REFERENCES moods(id) ON DELETE CASCADE,
+      PRIMARY KEY (track_id, mood_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_track_moods_mood ON track_moods(mood_id);
+  `);
+  // Vocabulaire de départ — idempotent (ON CONFLICT DO NOTHING), donc sûr à exécuter à
+  // chaque démarrage même si la table est déjà peuplée.
+  await pool.query(`
+    INSERT INTO moods (key, label, sort_order) VALUES
+      ('chill', 'Chill', 1),
+      ('love', 'Love', 2),
+      ('nuit', 'Nuit', 3),
+      ('motivation', 'Motivation', 4),
+      ('party', 'Party', 5),
+      ('focus', 'Focus', 6)
+    ON CONFLICT (key) DO NOTHING;
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };
