@@ -3055,6 +3055,66 @@ app.get('/api/tracks/rising', h(async (req, res) => {
   res.json({ tracks: rows });
 }));
 
+// ---------- "En ce moment" — vrais nouveaux auditeurs des dernières 24h, par artiste.
+// NUNI ne garde aucune notion de lecture "en cours" (plays.created_at correspond à la
+// PREMIÈRE écoute d'un morceau par un auditeur, jamais réécrit ensuite) — donc jamais de
+// faux compteur "en direct" affiché. Un artiste n'apparaît que s'il a réellement de
+// nouveaux auditeurs aujourd'hui.
+app.get('/api/activity/today', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.avatar_url,
+      COUNT(DISTINCT p.listener_id)::int AS new_listeners_today
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    JOIN users u ON u.id = t.artist_id
+    WHERE p.created_at >= NOW() - INTERVAL '24 hours' AND p.listener_id IS NOT NULL
+    GROUP BY u.id, u.artist_name, u.first_name, u.avatar_url
+    ORDER BY new_listeners_today DESC
+    LIMIT 5
+  `);
+  res.json({ activity: rows });
+}));
+
+// ---------- "En ce moment" — vrais nouveaux auditeurs uniques du jour, par morceau. NUNI ne
+// garde qu'une ligne par (morceau, auditeur) au tout premier passage (plays), donc aucune
+// notion réelle d'écoute "en direct" n'existe — ceci reste honnête : "X personnes ont
+// découvert ce morceau aujourd'hui", jamais un faux compteur de lecteurs simultanés.
+// Seuil minimum de 2 pour éviter d'afficher un chiffre dérisoire comme s'il était notable.
+app.get('/api/tracks/discovered-today', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT t.id, t.title, u.artist_name, u.first_name, COUNT(*)::int AS listener_count
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id AND t.published = 1
+    JOIN users u ON u.id = t.artist_id
+    WHERE p.created_at >= CURRENT_DATE
+    GROUP BY t.id, t.title, u.artist_name, u.first_name
+    HAVING COUNT(*) >= 2
+    ORDER BY listener_count DESC
+    LIMIT 4
+  `);
+  res.json({ tracks: rows });
+}));
+
+// ---------- "En ce moment" — vrais NOUVEAUX auditeurs uniques aujourd'hui, par artiste.
+// NUNI ne garde aucune notion d'écoute "en direct" (plays = une ligne par auditeur/morceau,
+// jamais mise à jour ensuite) : jamais de compteur "X personnes écoutent maintenant" simulé
+// à la place. Version honnête : "X personnes ont découvert cet artiste aujourd'hui".
+app.get('/api/artists/discovered-today', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT u.id, u.artist_name, u.first_name, u.avatar_url,
+      COUNT(DISTINCT p.listener_id)::int AS new_listeners_today
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    JOIN users u ON u.id = t.artist_id
+    WHERE p.created_at >= CURRENT_DATE AND p.listener_id IS NOT NULL
+    GROUP BY u.id, u.artist_name, u.first_name, u.avatar_url
+    HAVING COUNT(DISTINCT p.listener_id) > 0
+    ORDER BY new_listeners_today DESC
+    LIMIT 4
+  `);
+  res.json({ artists: rows });
+}));
+
 // ---------- Top artistes par streams — pour la pyramide Top Congo ----------
 // Vrais streams cumulés (SUM sur tracks.streams), même filtre Pass Artiste actif
 // que /top100 et /talent/top100. Pas de votes ici : uniquement l'écoute réelle.
