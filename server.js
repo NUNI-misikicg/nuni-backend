@@ -2404,16 +2404,36 @@ app.get('/api/artist/:id/featured-tracks', h(async (req, res) => {
 // dates figées pour toujours. Ici : vraies sorties programmées de tous les artistes
 // (Pass Artiste actif), triées par date réelle la plus proche.
 app.get('/api/releases/upcoming', h(async (req, res) => {
+  const authUser = await optionalAuthUser(req);
   const rows = await db.query(`
-    SELECT t.title, t.release_type, t.scheduled_release_at, u.artist_name, u.first_name
+    SELECT t.id, t.title, t.release_type, t.scheduled_release_at, u.artist_name, u.first_name,
+      EXISTS(SELECT 1 FROM release_notify_requests rnr WHERE rnr.track_id = t.id AND rnr.user_id = $1) AS notify_requested
     FROM tracks t
     JOIN users u ON u.id = t.artist_id
     WHERE t.published = 0 AND t.scheduled_release_at IS NOT NULL AND t.scheduled_release_at > NOW()
       AND u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
     ORDER BY t.scheduled_release_at ASC
     LIMIT 8
-  `);
+  `, [authUser ? authUser.id : null]);
   res.json({ releases: rows });
+}));
+
+// "Me prévenir" sur une sortie à venir — inscrit une vraie demande, jamais une confirmation
+// simulée. L'envoi réel de la notification push a lieu séparément (job qui vérifie les
+// sorties arrivées à échéance), pas au moment de l'inscription.
+app.post('/api/releases/:trackId/notify-me', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.params.trackId);
+  const track = await db.get('SELECT id FROM tracks WHERE id = $1 AND published = 0', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Sortie introuvable ou déjà publiée.' });
+  await db.run(
+    'INSERT INTO release_notify_requests (user_id, track_id) VALUES ($1, $2) ON CONFLICT (user_id, track_id) DO NOTHING',
+    [req.user.id, trackId],
+  );
+  res.json({ ok: true });
+}));
+app.delete('/api/releases/:trackId/notify-me', authMiddleware, h(async (req, res) => {
+  await db.run('DELETE FROM release_notify_requests WHERE user_id = $1 AND track_id = $2', [req.user.id, Number(req.params.trackId)]);
+  res.json({ ok: true });
 }));
 
 app.get('/api/artist/:id/scheduled-releases', h(async (req, res) => {
@@ -4182,6 +4202,32 @@ async function sendAbsenceReminders() {
 }
 setInterval(sendAbsenceReminders, 24 * 60 * 60 * 1000);
 sendAbsenceReminders(); // premier passage au démarrage, pas besoin d'attendre 24h
+
+// ---------- "Me prévenir" — envoi réel des notifications quand une sortie suivie devient
+// disponible. Ne marque jamais notified_at avant un vrai envoi (ou une vraie tentative si
+// VAPID n'est pas configuré, pour ne pas re-tenter indéfiniment un envoi impossible). ----------
+async function sendReleaseNotifications() {
+  try {
+    const due = await db.query(`
+      SELECT rnr.id AS req_id, rnr.user_id, t.id AS track_id, t.title, u.artist_name, u.first_name
+      FROM release_notify_requests rnr
+      JOIN tracks t ON t.id = rnr.track_id
+      JOIN users u ON u.id = t.artist_id
+      WHERE rnr.notified_at IS NULL AND t.published = 1
+    `);
+    for (const r of due) {
+      const artist = r.artist_name || r.first_name || 'Un artiste NUNI';
+      await sendPushToUser(r.user_id, {
+        title: '🎵 Nouvelle sortie disponible',
+        body: `« ${r.title} » de ${artist} est maintenant sur NUNI.`,
+        url: '/',
+      });
+      await db.run('UPDATE release_notify_requests SET notified_at = NOW() WHERE id = $1', [r.req_id]);
+    }
+  } catch (e) { console.error('Erreur job notifications de sortie:', e); }
+}
+setInterval(sendReleaseNotifications, 10 * 60 * 1000); // toutes les 10 minutes, pas besoin de plus réactif pour une sortie
+sendReleaseNotifications();
 
 // ---------- Purge des comptes Pass Découverte non validés — DÉSACTIVÉE (faille de sécurité) ----------
 // Avant : un compte Pass Découverte expiré était supprimé automatiquement après 2h de

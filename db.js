@@ -648,6 +648,25 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // ---------- "Me prévenir" sur une sortie à venir ----------
+  // Une ligne = un utilisateur qui a demandé à être notifié pour un morceau/album précis pas
+  // encore sorti. `notified_at` reste NULL tant que la vraie notification push n'a pas
+  // réellement été envoyée (déclenché par le job qui vérifie les sorties arrivées à échéance
+  // — voir POST /api/releases/:id/notify-me et le cron associé). Jamais une notification
+  // simulée : si VAPID n'est pas configuré côté serveur, l'inscription reste enregistrée mais
+  // aucun envoi n'a lieu tant que ce n'est pas réellement possible.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS release_notify_requests (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      notified_at TIMESTAMPTZ,
+      UNIQUE(user_id, track_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_release_notify_track ON release_notify_requests(track_id) WHERE notified_at IS NULL;
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };
