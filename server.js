@@ -2556,6 +2556,21 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
       );
     } catch (e) { console.error('Erreur enregistrement ambiances:', e); }
   }
+  // Collaboration "primary" — créée automatiquement pour tout nouveau morceau, miroir
+  // exact de artist_id (jamais une modification de tracks elle-même). Garantit que le
+  // rétro-remplissage fait au démarrage du serveur (pour les morceaux déjà existants) et
+  // le comportement des morceaux publiés APRÈS ce démarrage restent cohérents entre eux.
+  try {
+    const primaryCollab = await db.get(
+      `INSERT INTO track_collaborators (track_id, artist_id, role, added_by) VALUES ($1,$2,'primary',$2) RETURNING id`,
+      [inserted.id, req.user.id],
+    );
+    await db.run(
+      `INSERT INTO collaboration_terms (collaborator_id, rights_type, payment_type, share_pct, status, created_by)
+       VALUES ($1,'both','aucun_paiement',100,'accepted',$2)`,
+      [primaryCollab.id, req.user.id],
+    );
+  } catch (e) { console.error('Erreur création collaboration primary:', e); }
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
   if (!isFuture) {
     // Notification "nouvelle sortie" pour le Label — jamais bloquante pour la réponse déjà envoyée.
@@ -3766,6 +3781,128 @@ app.put('/api/admin/royalty-settings', h(async (req, res) => {
 // à côté, dans la même transaction que le paiement de l'artiste principal.
 // ============================================================
 class CollaborationValidationError extends Error {}
+
+// Petit helper d'audit — utilisé par tous les endpoints sensibles de ce système.
+async function logCollabAudit(entityType, entityId, action, actorId, beforeObj, afterObj) {
+  try {
+    await db.run(
+      `INSERT INTO collab_audit_log (entity_type, entity_id, action, actor_id, before_json, after_json)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [entityType, entityId, action, actorId || null, beforeObj ? JSON.stringify(beforeObj) : null, afterObj ? JSON.stringify(afterObj) : null],
+    );
+  } catch (e) { console.error('[collab_audit_log] échec (non bloquant) :', e.message); }
+}
+
+// ---------- Ajouter un collaborateur sur un morceau — réservé à l'artiste principal
+// (tracks.artist_id) uniquement. Crée toujours un accord en 'pending' : aucune part
+// n'est jamais considérée acceptée sur simple déclaration. ----------
+app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const track = await db.get('SELECT id, artist_id, title FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  if (track.artist_id !== req.user.id) {
+    return res.status(403).json({ error: "Seul l'artiste principal de ce morceau peut y ajouter un collaborateur." });
+  }
+  const {
+    collaboratorArtistId, externalName, externalContact, role,
+    rightsType, paymentType, upfrontAmountFcfa, sharePct, agreementNotes,
+  } = req.body || {};
+  if (!collaboratorArtistId && !externalName) {
+    return res.status(400).json({ error: 'Indiquez soit un compte NUNI existant, soit un nom externe.' });
+  }
+  if (!['featured', 'co-artist', 'producer', 'composer', 'label'].includes(role)) {
+    return res.status(400).json({ error: 'Rôle invalide.' });
+  }
+  if (!['master', 'publishing', 'both'].includes(rightsType)) {
+    return res.status(400).json({ error: 'Type de droits invalide.' });
+  }
+  if (!['forfait', 'avance_recoupable', 'royalties', 'forfait_et_royalties', 'aucun_paiement', 'autre'].includes(paymentType)) {
+    return res.status(400).json({ error: "Type d'accord invalide." });
+  }
+  if (collaboratorArtistId) {
+    const exists = await db.get('SELECT id FROM users WHERE id = $1', [Number(collaboratorArtistId)]);
+    if (!exists) return res.status(404).json({ error: 'Compte artiste introuvable.' });
+  }
+
+  const collab = await db.get(
+    `INSERT INTO track_collaborators (track_id, artist_id, external_name, external_contact, role, added_by)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [trackId, collaboratorArtistId || null, externalName || null, externalContact || null, role, req.user.id],
+  );
+  const terms = await db.get(
+    `INSERT INTO collaboration_terms
+       (collaborator_id, rights_type, payment_type, upfront_amount_fcfa, share_pct, agreement_notes, status, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING id`,
+    [collab.id, rightsType, paymentType, upfrontAmountFcfa || null, sharePct || null, agreementNotes || null, req.user.id],
+  );
+  await logCollabAudit('collaboration_terms', terms.id, 'created', req.user.id, null, {
+    trackId, role, rightsType, paymentType, upfrontAmountFcfa, sharePct,
+  });
+
+  if (collaboratorArtistId) {
+    const requester = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [req.user.id]);
+    createNotification(
+      Number(collaboratorArtistId), 'collaboration_request', 'Demande de collaboration',
+      `${requester.artist_name || requester.first_name || 'Un artiste'} vous propose une collaboration sur "${track.title}".`,
+      null,
+    ).catch(() => {});
+  }
+  res.status(201).json({ collaboratorId: collab.id, termsId: terms.id });
+}));
+
+// ---------- Le collaborateur répond à une proposition — accepted / disputed / rejected.
+// Seul le vrai compte concerné (track_collaborators.artist_id) peut répondre, jamais
+// l'artiste principal à sa place. ----------
+app.post('/api/collaboration-terms/:id/respond', authMiddleware, h(async (req, res) => {
+  const termsId = Number(req.params.id);
+  const { status, disputeReason } = req.body || {};
+  if (!['accepted', 'disputed', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Statut invalide.' });
+  }
+  if (status === 'disputed' && !disputeReason) {
+    return res.status(400).json({ error: 'Un motif est requis pour contester un accord.' });
+  }
+  const row = await db.get(
+    `SELECT ct.*, tc.artist_id AS collaborator_artist_id
+     FROM collaboration_terms ct JOIN track_collaborators tc ON tc.id = ct.collaborator_id
+     WHERE ct.id = $1`,
+    [termsId],
+  );
+  if (!row) return res.status(404).json({ error: 'Accord introuvable.' });
+  if (row.collaborator_artist_id !== req.user.id) {
+    return res.status(403).json({ error: "Vous n'êtes pas le collaborateur concerné par cet accord." });
+  }
+  if (row.effective_until) {
+    return res.status(409).json({ error: 'Cette version de l\'accord n\'est plus active.' });
+  }
+  const before = { status: row.status };
+  await db.run('UPDATE collaboration_terms SET status = $1 WHERE id = $2', [status, termsId]);
+  await logCollabAudit('collaboration_terms', termsId, 'status_changed', req.user.id, before, { status });
+
+  if (status === 'disputed') {
+    await db.run(
+      `INSERT INTO collaboration_disputes (collaboration_terms_id, raised_by, reason) VALUES ($1,$2,$3)`,
+      [termsId, req.user.id, disputeReason],
+    );
+  }
+  res.json({ ok: true, status });
+}));
+
+// ---------- Liste des collaborateurs d'un morceau — pour affichage crédits/catalogue.
+// Renvoie les vraies données, jamais une part supposée pour un accord non confirmé. ----------
+app.get('/api/tracks/:id/collaborators', h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT tc.id AS collaborator_id, tc.role, tc.external_name,
+      u.id AS artist_id, u.artist_name, u.first_name,
+      ct.id AS terms_id, ct.rights_type, ct.payment_type, ct.share_pct, ct.status
+    FROM track_collaborators tc
+    LEFT JOIN users u ON u.id = tc.artist_id
+    LEFT JOIN collaboration_terms ct ON ct.collaborator_id = tc.id AND ct.effective_until IS NULL
+    WHERE tc.track_id = $1
+    ORDER BY (tc.role = 'primary') DESC, tc.created_at ASC
+  `, [Number(req.params.id)]);
+  res.json({ collaborators: rows });
+}));
 
 async function applyCollaborationSplits(client, artistId, settings) {
   const tracksWithCollab = await client.query(`
