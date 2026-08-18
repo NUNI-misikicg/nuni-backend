@@ -698,6 +698,152 @@ async function initSchema() {
       ('focus', 'Focus', 6)
     ON CONFLICT (key) DO NOTHING;
   `);
+
+  // ============================================================
+  // SYSTÈME DE COLLABORATIONS & ROYALTIES — architecture validée le
+  // (voir document de conception). STRICTEMENT ADDITIF :
+  //   - tracks.artist_id n'est jamais modifié
+  //   - tracks.streams et son incrémentation restent inchangés
+  //   - plays et sa contrainte d'unicité restent inchangés
+  //   - payment_history reste inchangée
+  //   - computeArtistPayout() n'est pas touchée par cette migration
+  // Réversible : DROP des 8 tables ci-dessous, en cascade, sans laisser
+  // aucune trace sur l'existant.
+  // ============================================================
+  await pool.query(`
+    -- 1. Qui est impliqué sur un morceau
+    CREATE TABLE IF NOT EXISTS track_collaborators (
+      id SERIAL PRIMARY KEY,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      artist_id INTEGER REFERENCES users(id),
+      external_name TEXT,
+      external_contact TEXT,
+      role TEXT NOT NULL CHECK(role IN ('primary','featured','co-artist','producer','composer','label')),
+      added_by INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_track_collaborators_track ON track_collaborators(track_id);
+    CREATE INDEX IF NOT EXISTS idx_track_collaborators_artist ON track_collaborators(artist_id);
+
+    -- 2. Termes de l'accord — versionné, append-only, jamais modifié en place
+    CREATE TABLE IF NOT EXISTS collaboration_terms (
+      id SERIAL PRIMARY KEY,
+      collaborator_id INTEGER NOT NULL REFERENCES track_collaborators(id) ON DELETE CASCADE,
+      rights_type TEXT NOT NULL CHECK(rights_type IN ('master','publishing','both')),
+      payment_type TEXT NOT NULL CHECK(payment_type IN ('forfait','avance_recoupable','royalties','forfait_et_royalties','aucun_paiement','autre')),
+      upfront_amount_fcfa NUMERIC(12,2),
+      share_pct NUMERIC(5,2),
+      agreement_notes TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','disputed','rejected')),
+      effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      effective_until TIMESTAMPTZ,
+      superseded_by INTEGER REFERENCES collaboration_terms(id),
+      created_by INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_collab_terms_active ON collaboration_terms(collaborator_id) WHERE effective_until IS NULL;
+
+    -- 3. Pièces jointes — jamais une validation juridique automatique
+    CREATE TABLE IF NOT EXISTS collaboration_documents (
+      id SERIAL PRIMARY KEY,
+      collaborator_id INTEGER NOT NULL REFERENCES track_collaborators(id) ON DELETE CASCADE,
+      file_url TEXT NOT NULL,
+      uploaded_by INTEGER NOT NULL REFERENCES users(id),
+      note TEXT,
+      is_legally_binding BOOLEAN NOT NULL DEFAULT false,
+      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- 4. Litiges
+    CREATE TABLE IF NOT EXISTS collaboration_disputes (
+      id SERIAL PRIMARY KEY,
+      collaboration_terms_id INTEGER NOT NULL REFERENCES collaboration_terms(id),
+      raised_by INTEGER NOT NULL REFERENCES users(id),
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved')),
+      resolution_note TEXT,
+      resolved_by INTEGER REFERENCES users(id),
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at TIMESTAMPTZ
+    );
+
+    -- 5. Snapshot périodique des streams/revenus d'un morceau — jamais recalculé a posteriori
+    CREATE TABLE IF NOT EXISTS track_revenue_periods (
+      id SERIAL PRIMARY KEY,
+      track_id INTEGER NOT NULL REFERENCES tracks(id),
+      period_start TIMESTAMPTZ NOT NULL,
+      period_end TIMESTAMPTZ NOT NULL,
+      streams_in_period INTEGER NOT NULL,
+      revenue_fcfa_total NUMERIC(12,2) NOT NULL,
+      computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_revenue_periods_track ON track_revenue_periods(track_id);
+
+    -- 6. Part réelle de chaque ayant droit sur une période, avec suivi du recoupment
+    CREATE TABLE IF NOT EXISTS collaborator_payouts (
+      id SERIAL PRIMARY KEY,
+      revenue_period_id INTEGER NOT NULL REFERENCES track_revenue_periods(id),
+      collaborator_id INTEGER NOT NULL REFERENCES track_collaborators(id),
+      collaboration_terms_id INTEGER NOT NULL REFERENCES collaboration_terms(id),
+      gross_share_fcfa NUMERIC(12,2) NOT NULL,
+      recoupment_applied_fcfa NUMERIC(12,2) NOT NULL DEFAULT 0,
+      net_payable_fcfa NUMERIC(12,2) NOT NULL,
+      status TEXT NOT NULL DEFAULT 'payable' CHECK(status IN ('payable','held_dispute','held_pending','paid')),
+      held_reason TEXT,
+      paid_at TIMESTAMPTZ,
+      payment_reference TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_payouts_collaborator ON collaborator_payouts(collaborator_id);
+    CREATE INDEX IF NOT EXISTS idx_payouts_terms ON collaborator_payouts(collaboration_terms_id);
+
+    -- 7. Ajustements/corrections — jamais de modification directe d'un payout déjà payé
+    CREATE TABLE IF NOT EXISTS payout_adjustments (
+      id SERIAL PRIMARY KEY,
+      original_payout_id INTEGER NOT NULL REFERENCES collaborator_payouts(id),
+      amount_fcfa NUMERIC(12,2) NOT NULL,
+      reason TEXT NOT NULL,
+      applied_on_payout_id INTEGER REFERENCES collaborator_payouts(id),
+      created_by INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- 8. Journal d'audit générique — chaque changement d'état, sans exception
+    CREATE TABLE IF NOT EXISTS collab_audit_log (
+      id SERIAL PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      actor_id INTEGER REFERENCES users(id),
+      before_json JSONB,
+      after_json JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_collab_audit_entity ON collab_audit_log(entity_type, entity_id);
+  `);
+
+  // ---------- Rétro-remplissage des morceaux existants ----------
+  // Chaque morceau déjà publié reçoit un collaborateur "primary" miroir exact de son
+  // tracks.artist_id actuel, avec un accord 100% déjà accepté à la date de création du
+  // morceau. Idempotent (WHERE NOT EXISTS) — sûr à exécuter à chaque démarrage. Ne modifie
+  // JAMAIS tracks.artist_id ni aucune autre colonne de la table tracks elle-même : cette
+  // opération ne fait qu'AJOUTER des lignes dans les nouvelles tables, en lecture seule sur
+  // tracks pour connaître artist_id et created_at.
+  await pool.query(`
+    INSERT INTO track_collaborators (track_id, artist_id, role, added_by, created_at)
+    SELECT t.id, t.artist_id, 'primary', t.artist_id, t.created_at
+    FROM tracks t
+    WHERE NOT EXISTS (
+      SELECT 1 FROM track_collaborators tc WHERE tc.track_id = t.id AND tc.role = 'primary'
+    );
+  `);
+  await pool.query(`
+    INSERT INTO collaboration_terms (collaborator_id, rights_type, payment_type, share_pct, status, effective_from, created_by)
+    SELECT tc.id, 'both', 'aucun_paiement', 100, 'accepted', tc.created_at, tc.artist_id
+    FROM track_collaborators tc
+    WHERE tc.role = 'primary'
+      AND NOT EXISTS (SELECT 1 FROM collaboration_terms ct WHERE ct.collaborator_id = tc.id);
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };
