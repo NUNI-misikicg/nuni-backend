@@ -3080,6 +3080,30 @@ app.get('/api/me/collaborations-given', authMiddleware, h(async (req, res) => {
   res.json({ items: rows });
 }));
 
+// ---------- C4 — "Mes collaborations" côté collaborateur : accords où JE suis le
+// collaborateur (jamais l'artiste principal), sur des morceaux d'autres artistes. ----------
+app.get('/api/me/collaborations-received', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT t.id AS track_id, t.title AS track_title, t.cover_url,
+      tc.id AS collaborator_id, tc.role,
+      pu.artist_name AS primary_artist_name, pu.first_name AS primary_first_name,
+      ct.id AS terms_id, ct.rights_type, ct.share_pct, ct.status, ct.payment_type,
+      cd.reason AS dispute_reason,
+      COALESCE((SELECT SUM(cp.gross_share_fcfa) FROM collaborator_payouts cp
+                WHERE cp.collaboration_terms_id = ct.id AND cp.status IN ('held_dispute','held_pending')), 0) AS frozen_amount_fcfa
+    FROM track_collaborators tc
+    JOIN tracks t ON t.id = tc.track_id
+    JOIN users pu ON pu.id = t.artist_id
+    JOIN collaboration_terms ct ON ct.collaborator_id = tc.id AND ct.effective_until IS NULL
+    LEFT JOIN collaboration_disputes cd ON cd.collaboration_terms_id = ct.id AND cd.status = 'open'
+    WHERE tc.artist_id = $1
+    ORDER BY tc.created_at DESC
+  `, [req.user.id]);
+  // Normaliser le nom d'affichage de l'artiste principal, jamais recalculé côté client.
+  rows.forEach(r => { r.primary_artist_name = r.primary_artist_name || r.primary_first_name || 'Artiste NUNI'; });
+  res.json({ items: rows });
+}));
+
 app.get('/api/artists/top100', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
@@ -3926,10 +3950,11 @@ async function addCollaboratorToTrack(track, requesterId, body) {
 
   if (collaboratorArtistId) {
     const requester = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [requesterId]);
+    const requesterName = requester.artist_name || requester.first_name || 'Un artiste';
     createNotification(
       Number(collaboratorArtistId), 'collaboration_request', 'Demande de collaboration',
-      `${requester.artist_name || requester.first_name || 'Un artiste'} vous propose une collaboration sur "${track.title}".`,
-      null,
+      `${requesterName} vous propose une collaboration (${role}) sur "${track.title}" — votre confirmation est requise.`,
+      `/collab:${collab.id}`,
     ).catch(() => {});
   }
   return { collaboratorId: collab.id, termsIds: createdTermsIds, status: 201 };
@@ -3972,6 +3997,15 @@ app.post('/api/collaboration-terms/:id/respond', authMiddleware, h(async (req, r
   if (row.effective_until) {
     return res.status(409).json({ error: 'Cette version de l\'accord n\'est plus active.' });
   }
+  // Une fois accepté ou refusé, la décision est définitive via cet endpoint — jamais une
+  // deuxième acceptation, jamais un refus retourné en acceptation. Seule une contestation
+  // reste modifiable (peut être levée après discussion, voir le workflow C3).
+  if (row.status === 'accepted') {
+    return res.status(409).json({ error: 'Vous avez déjà accepté cet accord.' });
+  }
+  if (row.status === 'rejected') {
+    return res.status(409).json({ error: 'Cet accord a déjà été refusé — impossible de revenir en arrière ici.' });
+  }
   const before = { status: row.status };
   await db.run('UPDATE collaboration_terms SET status = $1 WHERE id = $2', [status, termsId]);
   await logCollabAudit('collaboration_terms', termsId, 'status_changed', req.user.id, before, { status });
@@ -3999,6 +4033,47 @@ app.get('/api/tracks/:id/collaborators', h(async (req, res) => {
     ORDER BY (tc.role = 'primary') DESC, tc.created_at ASC
   `, [Number(req.params.id)]);
   res.json({ collaborators: rows });
+}));
+
+// ---------- C2 — détail complet d'une proposition de collaboration. Réservé au vrai
+// collaborateur concerné (jamais un tiers, jamais l'artiste principal qui pourrait vouloir
+// vérifier). Regroupe master + publishing pour la même personne, jamais deux écrans
+// séparés pour un même accord. ----------
+app.get('/api/track-collaborators/:id/detail', authMiddleware, h(async (req, res) => {
+  const collaboratorId = Number(req.params.id);
+  const tc = await db.get(
+    `SELECT tc.*, t.title AS track_title, t.cover_url, t.artist_id AS primary_artist_id,
+       pu.artist_name AS primary_artist_name, pu.first_name AS primary_first_name
+     FROM track_collaborators tc
+     JOIN tracks t ON t.id = tc.track_id
+     JOIN users pu ON pu.id = t.artist_id
+     WHERE tc.id = $1`,
+    [collaboratorId],
+  );
+  if (!tc) return res.status(404).json({ error: 'Proposition introuvable.' });
+  if (tc.artist_id !== req.user.id) {
+    return res.status(403).json({ error: "Cette proposition ne vous est pas destinée." });
+  }
+  const terms = await db.query(
+    `SELECT id, rights_type, payment_type, upfront_amount_fcfa, share_pct, agreement_notes, status, effective_from
+     FROM collaboration_terms WHERE collaborator_id = $1 AND effective_until IS NULL`,
+    [collaboratorId],
+  );
+  const documents = await db.query(
+    `SELECT id, file_url, note, is_legally_binding, uploaded_at FROM collaboration_documents WHERE collaborator_id = $1`,
+    [collaboratorId],
+  );
+  const disputes = await db.query(
+    `SELECT cd.reason, cd.status, cd.opened_at FROM collaboration_disputes cd
+     WHERE cd.collaboration_terms_id = ANY($1::int[]) ORDER BY cd.opened_at DESC`,
+    [terms.map(t => t.id)],
+  );
+  res.json({
+    collaboratorId, role: tc.role,
+    track: { id: tc.track_id, title: tc.track_title, coverUrl: tc.cover_url },
+    primaryArtist: { id: tc.primary_artist_id, name: tc.primary_artist_name || tc.primary_first_name },
+    terms, documents, disputes,
+  });
 }));
 
 // ============================================================
@@ -4100,6 +4175,42 @@ app.post('/api/admin/collaboration-terms/:id/final-reject', h(async (req, res) =
   );
   await logCollabAudit('collaboration_terms', termsId, 'final_rejected', null, { status: terms.status }, { status: 'rejected', reason: reason.trim() });
   res.json({ ok: true });
+}));
+
+// ---- N2d — Résoudre le litige : distinct de "release" (qui ne débloque qu'une période
+// précise sans jamais rien dire sur le litige lui-même) et de "final-reject" (qui tranche en
+// défaveur du collaborateur). Ici, le litige est tranché EN FAVEUR de l'accord original :
+// l'accord redevient accepted, le litige est officiellement refermé, et — pour éviter d'avoir
+// à libérer chaque période une par une après coup — toutes les périodes déjà gelées par CE
+// litige précis (held_dispute) sont libérées en une fois. gross_share_fcfa n'est jamais
+// modifié, seul le statut change, exactement comme le fait "release" pour une période isolée.
+app.post('/api/admin/collaboration-terms/:id/resolve-dispute', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const termsId = Number(req.params.id);
+  const { resolutionNote } = req.body || {};
+  if (!resolutionNote || !resolutionNote.trim()) return res.status(400).json({ error: 'Un motif de résolution est obligatoire.' });
+  const terms = await db.get('SELECT * FROM collaboration_terms WHERE id = $1', [termsId]);
+  if (!terms) return res.status(404).json({ error: 'Accord introuvable.' });
+  // Bloque nativement une double résolution : une fois status='accepted', un deuxième appel
+  // échoue ici — jamais besoin d'un verrou supplémentaire pour ce cas précis.
+  if (terms.status !== 'disputed') {
+    return res.status(409).json({ error: "Cet accord n'est pas actuellement en litige." });
+  }
+  await db.run(`UPDATE collaboration_terms SET status = 'accepted' WHERE id = $1`, [termsId]);
+  const releasedRows = await db.query(
+    `UPDATE collaborator_payouts SET status = 'payable', held_reason = NULL
+     WHERE collaboration_terms_id = $1 AND status = 'held_dispute' RETURNING id, gross_share_fcfa`,
+    [termsId],
+  );
+  await db.run(
+    `UPDATE collaboration_disputes SET status = 'resolved', resolution_note = $1, resolved_at = NOW()
+     WHERE collaboration_terms_id = $2 AND status = 'open'`,
+    [resolutionNote.trim(), termsId],
+  );
+  await logCollabAudit('collaboration_terms', termsId, 'dispute_resolved', null, { status: 'disputed' }, {
+    status: 'accepted', resolutionNote: resolutionNote.trim(), releasedPayoutIds: releasedRows.map(r => r.id),
+  });
+  res.json({ ok: true, releasedPayoutsCount: releasedRows.length });
 }));
 
 async function applyCollaborationSplits(client, artistId, settings) {
