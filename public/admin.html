@@ -452,7 +452,8 @@
       <div id="collab-resolve-body"></div>
       <div style="display:flex; gap:8px; margin-top:16px; flex-wrap:wrap;">
         <button class="secondary" onclick="closeCollabResolveModal()">Fermer</button>
-        <button class="secondary" id="collab-release-btn" onclick="resolveRelease()">Libérer</button>
+        <button class="secondary" id="collab-release-btn" onclick="resolveRelease()">Libérer cette période</button>
+        <button class="secondary" id="collab-resolve-dispute-btn" style="color:#7ee6a8; border-color:rgba(61,220,151,.3); display:none;" onclick="promptResolveDispute()">Résoudre le litige</button>
         <button class="secondary" id="collab-adjust-btn" onclick="promptResolveAdjust()">Ajuster</button>
         <button class="secondary" id="collab-reject-btn" style="color:#ff9a9d; border-color:rgba(242,85,90,.3);" onclick="promptResolveFinalReject()">Rejeter définitivement</button>
       </div>
@@ -1746,6 +1747,7 @@
         ${item.dispute_reason ? `<div><b>Motif du litige :</b> ${esc(item.dispute_reason)}</div>` : '<div class="muted">Aucun motif enregistré (proposition simplement en attente de confirmation).</div>'}
       </div>`;
     document.getElementById('collab-resolve-msg').innerHTML = '';
+    document.getElementById('collab-resolve-dispute-btn').style.display = (item.terms_status === 'disputed') ? 'inline-block' : 'none';
     document.getElementById('collab-resolve-modal').style.display = 'flex';
   }
   function closeCollabResolveModal(){
@@ -1755,7 +1757,7 @@
 
   async function resolveRelease(){
     if(!collabResolveTarget) return;
-    if(!confirm(`Libérer le montant gelé de ${Number(collabResolveTarget.gross_share_fcfa).toLocaleString('fr-FR')} FCFA ?\n\nLe statut passera à "payable". Le montant lui-même n'est jamais modifié par cette action.`)) return;
+    if(!confirm(`Libérer le montant gelé de ${Number(collabResolveTarget.gross_share_fcfa).toLocaleString('fr-FR')} FCFA pour CETTE PÉRIODE UNIQUEMENT ?\n\nLe statut passera à "payable". Le litige sous-jacent reste ouvert — utilisez "Résoudre le litige" pour le refermer complètement.`)) return;
     const msg = document.getElementById('collab-resolve-msg');
     try{
       const res = await fetch('/api/admin/collaborator-payouts/' + collabResolveTarget.payout_id + '/release', {
@@ -1763,8 +1765,28 @@
       });
       const data = await res.json();
       if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
-      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Montant libéré (payable).</span>';
-      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 900);
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Cette période est libérée (payable). Le litige reste ouvert.</span>';
+      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 1200);
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  function promptResolveDispute(){
+    if(!collabResolveTarget) return;
+    const note = prompt('Motif de la résolution (obligatoire) — le litige sera tranché EN FAVEUR de l\'accord original :');
+    if(!note || !note.trim()){ alert('Un motif de résolution est obligatoire.'); return; }
+    if(!confirm(`Confirmer la résolution complète de ce litige ?\n\nMotif : ${note.trim()}\n\n- L'accord repasse à "accepted"\n- Le litige est officiellement refermé\n- TOUTES les périodes encore gelées pour cet accord (held_dispute) seront libérées automatiquement\n- Les périodes futures redeviendront normalement payable`)) return;
+    resolveDispute(note.trim());
+  }
+  async function resolveDispute(resolutionNote){
+    const msg = document.getElementById('collab-resolve-msg');
+    try{
+      const res = await fetch('/api/admin/collaboration-terms/' + collabResolveTarget.terms_id + '/resolve-dispute', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()}, body: JSON.stringify({ resolutionNote }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = `<span style="color:#7ee6a8;">✅ Litige résolu. ${data.releasedPayoutsCount} période(s) libérée(s) au passage.</span>`;
+      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 1400);
     }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
   }
 
