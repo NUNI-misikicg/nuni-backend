@@ -809,7 +809,7 @@ async function initSchema() {
       reason TEXT NOT NULL,
       document_url TEXT,
       applied_on_payout_id INTEGER REFERENCES collaborator_payouts(id),
-      created_by INTEGER NOT NULL REFERENCES users(id),
+      created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -830,6 +830,11 @@ async function initSchema() {
   // cette colonne (CREATE TABLE IF NOT EXISTS n'ajoute jamais de colonne à une table
   // déjà existante lors d'un déploiement précédent).
   await pool.query(`ALTER TABLE payout_adjustments ADD COLUMN IF NOT EXISTS document_url TEXT;`);
+  // Corrige un vrai bug : created_by était NOT NULL, mais les endpoints admin de résolution
+  // de litige n'utilisent pas authMiddleware (NUNI fonctionne avec une clé admin partagée,
+  // sans comptes admin individuels) — created_by ne peut donc jamais être fourni. Sans cette
+  // migration, tout ajustement réel échouerait en production sur une base déjà déployée.
+  await pool.query(`ALTER TABLE payout_adjustments ALTER COLUMN created_by DROP NOT NULL;`);
 
   // ---------- Rétro-remplissage des morceaux existants ----------
   // Chaque morceau déjà publié reçoit un collaborateur "primary" miroir exact de son
