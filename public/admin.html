@@ -188,6 +188,7 @@
     <div class="nav-group">
       <div class="nav-group-label">Paiements artistes</div>
       <button class="tab-btn" data-tab="payouts"><span class="tab-icon">💸</span> Reversements</button>
+      <button class="tab-btn" data-tab="collab-disputes"><span class="tab-icon">🤝</span> Litiges collaborations</button>
     </div>
 
     <div class="nav-group">
@@ -431,6 +432,32 @@
     <div id="payouts-summary" style="margin-top:14px;"></div>
     <div id="payouts-list" style="margin-top:14px;"></div>
     <div id="payouts-history-wrap" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="pane" id="pane-collab-disputes">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🤝 Litiges et paiements en attente — collaborations</b>
+      <div class="muted" style="margin-top:4px;">
+        Parts de collaborateurs gelées (contestées ou en attente de leur confirmation). Les montants affichés sont
+        exactement ceux enregistrés — jamais recalculés ici.
+      </div>
+      <button class="primary" style="margin-top:12px;" onclick="loadCollabDisputes()">Charger la file</button>
+    </div>
+    <div id="collab-disputes-list" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- ===== N2 — modal de résolution d'un dossier ===== -->
+  <div id="collab-resolve-modal" style="display:none; position:fixed; inset:0; z-index:200; background:rgba(0,0,0,.6); align-items:center; justify-content:center;" onclick="if(event.target===this) closeCollabResolveModal()">
+    <div class="card" style="max-width:560px; width:92%; max-height:88vh; overflow-y:auto;">
+      <div id="collab-resolve-body"></div>
+      <div style="display:flex; gap:8px; margin-top:16px; flex-wrap:wrap;">
+        <button class="secondary" onclick="closeCollabResolveModal()">Fermer</button>
+        <button class="secondary" id="collab-release-btn" onclick="resolveRelease()">Libérer</button>
+        <button class="secondary" id="collab-adjust-btn" onclick="promptResolveAdjust()">Ajuster</button>
+        <button class="secondary" id="collab-reject-btn" style="color:#ff9a9d; border-color:rgba(242,85,90,.3);" onclick="promptResolveFinalReject()">Rejeter définitivement</button>
+      </div>
+      <div id="collab-resolve-msg" style="margin-top:10px;"></div>
+    </div>
   </div>
 
   <div class="pane" id="pane-events">
@@ -1662,6 +1689,130 @@
       html += '</table>';
       wrap.innerHTML = html;
     }catch(e){ wrap.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  // ============================================================
+  // N1/N2 — File des litiges/en attente de collaborations + résolution.
+  // Les montants (gross_share_fcfa) affichés proviennent TOUJOURS directement de la
+  // réponse serveur — aucun recalcul ici, conformément à l'architecture validée.
+  // ============================================================
+  const collabStatusLabels = {
+    held_dispute: '<span class="pill" style="background:rgba(242,85,90,.16); color:#ff9a9d;">🔴 Contesté</span>',
+    held_pending: '<span class="pill pending">🟡 En attente</span>',
+  };
+  let collabResolveTarget = null; // { payoutId, termsId, grossShareFcfa, ... } du dossier actuellement ouvert
+
+  async function loadCollabDisputes(){
+    const wrap = document.getElementById('collab-disputes-list');
+    wrap.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/collaboration-disputes', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ wrap.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      const items = data.items || [];
+      if(!items.length){ wrap.innerHTML = '<p class="muted">Aucun litige ou paiement en attente pour le moment.</p>'; return; }
+      let html = '<table><tr><th>Morceau</th><th>Collaborateur</th><th>Droits</th><th>Part</th><th>Montant gelé</th><th>Statut</th><th>Motif</th><th></th></tr>';
+      items.forEach(it=>{
+        const collabName = it.collaborator_artist_name || it.collaborator_first_name || it.external_name || 'Collaborateur';
+        html += `<tr>
+          <td><b>${esc(it.track_title)}</b><br><span class="muted">Terms #${it.terms_id}</span></td>
+          <td>${esc(collabName)}</td>
+          <td>${esc(it.rights_type)}</td>
+          <td>${it.share_pct}%</td>
+          <td><b style="color:#D4AF6A;">${Number(it.gross_share_fcfa).toLocaleString('fr-FR')} FCFA</b></td>
+          <td>${collabStatusLabels[it.status] || esc(it.status)}</td>
+          <td class="muted">${it.dispute_reason ? esc(it.dispute_reason) : '—'}</td>
+          <td><button class="secondary" onclick='openCollabResolveModal(${JSON.stringify(it).replace(/'/g, "&#39;")})'>Ouvrir le dossier</button></td>
+        </tr>`;
+      });
+      html += '</table>';
+      wrap.innerHTML = html;
+    }catch(e){ wrap.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  function openCollabResolveModal(item){
+    collabResolveTarget = item;
+    const collabName = item.collaborator_artist_name || item.collaborator_first_name || item.external_name || 'Collaborateur';
+    const body = document.getElementById('collab-resolve-body');
+    body.innerHTML = `
+      <b style="color:#D4AF6A; font-size:14px;">🤝 ${esc(item.track_title)}</b>
+      <div class="muted" style="margin-top:4px;">Terms #${item.terms_id} · Payout #${item.payout_id} · Collaborateur : ${esc(collabName)}</div>
+      <div style="margin-top:14px; display:flex; flex-direction:column; gap:6px; font-size:13px;">
+        <div><b>Droits :</b> ${esc(item.rights_type)} — ${item.share_pct}%</div>
+        <div><b>Statut actuel :</b> ${collabStatusLabels[item.status] || esc(item.status)}</div>
+        <div><b>Montant gelé (gross_share_fcfa) :</b> <span style="color:#D4AF6A; font-weight:700;">${Number(item.gross_share_fcfa).toLocaleString('fr-FR')} FCFA</span></div>
+        ${item.recoupment_applied_fcfa > 0 ? `<div><b>Dont recoupment appliqué :</b> ${Number(item.recoupment_applied_fcfa).toLocaleString('fr-FR')} FCFA</div>` : ''}
+        <div><b>Net payable :</b> ${Number(item.net_payable_fcfa).toLocaleString('fr-FR')} FCFA</div>
+        ${item.dispute_reason ? `<div><b>Motif du litige :</b> ${esc(item.dispute_reason)}</div>` : '<div class="muted">Aucun motif enregistré (proposition simplement en attente de confirmation).</div>'}
+      </div>`;
+    document.getElementById('collab-resolve-msg').innerHTML = '';
+    document.getElementById('collab-resolve-modal').style.display = 'flex';
+  }
+  function closeCollabResolveModal(){
+    document.getElementById('collab-resolve-modal').style.display = 'none';
+    collabResolveTarget = null;
+  }
+
+  async function resolveRelease(){
+    if(!collabResolveTarget) return;
+    if(!confirm(`Libérer le montant gelé de ${Number(collabResolveTarget.gross_share_fcfa).toLocaleString('fr-FR')} FCFA ?\n\nLe statut passera à "payable". Le montant lui-même n'est jamais modifié par cette action.`)) return;
+    const msg = document.getElementById('collab-resolve-msg');
+    try{
+      const res = await fetch('/api/admin/collaborator-payouts/' + collabResolveTarget.payout_id + '/release', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()}, body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Montant libéré (payable).</span>';
+      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 900);
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  function promptResolveAdjust(){
+    if(!collabResolveTarget) return;
+    const amountStr = prompt(`Montant de l'ajustement (FCFA)\n\nMontant original (net_payable_fcfa) : ${Number(collabResolveTarget.net_payable_fcfa).toLocaleString('fr-FR')} FCFA\n\nUtilisez un nombre négatif pour retirer (ex : -5000), positif pour ajouter.`, '0');
+    if(amountStr === null) return;
+    const amount = Number(amountStr);
+    if(Number.isNaN(amount)){ alert('Montant invalide.'); return; }
+    const reason = prompt('Motif de cet ajustement (obligatoire) :');
+    if(!reason || !reason.trim()){ alert('Un motif est obligatoire pour tout ajustement.'); return; }
+    const documentUrl = prompt('Lien vers une pièce justificative (optionnel, laissez vide si aucune) :', '') || null;
+    const newAmount = Number(collabResolveTarget.net_payable_fcfa) + amount;
+    if(!confirm(`Confirmer cet ajustement ?\n\nMontant original : ${Number(collabResolveTarget.net_payable_fcfa).toLocaleString('fr-FR')} FCFA\nAjustement : ${amount >= 0 ? '+' : ''}${amount.toLocaleString('fr-FR')} FCFA\nNouveau montant : ${newAmount.toLocaleString('fr-FR')} FCFA\nMotif : ${reason.trim()}\n\nCeci crée une nouvelle ligne d'ajustement — le montant original enregistré n'est jamais modifié.`)) return;
+    resolveAdjust(amount, reason.trim(), documentUrl);
+  }
+  async function resolveAdjust(amountFcfa, reason, documentUrl){
+    const msg = document.getElementById('collab-resolve-msg');
+    try{
+      const res = await fetch('/api/admin/collaborator-payouts/' + collabResolveTarget.payout_id + '/adjust', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ amountFcfa, reason, documentUrl }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = `<span style="color:#7ee6a8;">✅ Ajustement enregistré. Nouveau montant : ${Number(data.newAmountFcfa).toLocaleString('fr-FR')} FCFA.</span>`;
+      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 1200);
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  function promptResolveFinalReject(){
+    if(!collabResolveTarget) return;
+    const reason = prompt('Motif du rejet définitif (obligatoire) — la contestation sera tranchée en défaveur du collaborateur :');
+    if(!reason || !reason.trim()){ alert('Un motif est obligatoire pour un rejet définitif.'); return; }
+    if(!confirm(`Confirmer le rejet DÉFINITIF de cet accord ?\n\nMotif : ${reason.trim()}\n\nLe collaborateur ne recevra plus aucun droit sur ce morceau. L'historique reste conservé — rien n'est supprimé.`)) return;
+    resolveFinalReject(reason.trim());
+  }
+  async function resolveFinalReject(reason){
+    const msg = document.getElementById('collab-resolve-msg');
+    try{
+      const res = await fetch('/api/admin/collaboration-terms/' + collabResolveTarget.terms_id + '/final-reject', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()}, body: JSON.stringify({ reason }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Accord définitivement rejeté.</span>';
+      setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 900);
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
   }
 
   async function saveRoyaltySettings(){
