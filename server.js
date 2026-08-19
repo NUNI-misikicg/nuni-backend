@@ -2516,7 +2516,7 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   }
   const {
     title, album, genre, releaseType, coverUrl, audioUrl, lyrics, scheduledReleaseAt,
-    composer, featuring, studio, description, releaseDate, credits, moodKeys,
+    composer, featuring, studio, description, releaseDate, credits, moodKeys, collaborators,
   } = req.body;
   if (!title) return res.status(400).json({ error: 'Titre requis.' });
   // Limite de 3 ambiances maximum — vérifiée ici, jamais seulement côté client (qui peut
@@ -2571,6 +2571,18 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
       [primaryCollab.id, req.user.id],
     );
   } catch (e) { console.error('Erreur création collaboration primary:', e); }
+
+  // Collaborateurs déclarés dans le formulaire de publication (avant que le morceau
+  // n'existe) — réutilise exactement la même validation que l'endpoint dédié, jamais
+  // dupliquée. Une déclaration invalide n'empêche jamais la publication elle-même.
+  if (Array.isArray(collaborators) && collaborators.length) {
+    for (const c of collaborators) {
+      try {
+        const result = await addCollaboratorToTrack({ id: inserted.id, title }, req.user.id, c);
+        if (result.status >= 400) console.error('Collaborateur déclaré ignoré (validation) :', result.error);
+      } catch (e) { console.error('Erreur ajout collaborateur à la publication:', e); }
+    }
+  }
   res.status(201).json({ id: inserted.id, scheduled: isFuture });
   if (!isFuture) {
     // Notification "nouvelle sortie" pour le Label — jamais bloquante pour la réponse déjà envoyée.
@@ -3031,6 +3043,43 @@ app.get('/api/artists/featured', h(async (req, res) => {
 // ---------- Top 100 artistes — vrai classement par abonnés ----------
 // Réservé aux comptes ayant réellement un Pass Artiste actif (même filtre que /featured),
 // classés par leur vrai nombre d'abonnés (table follows), pas par XP ni popularité inventée.
+// ---------- Recherche d'artiste — pour le sélecteur de collaborateur (A2). Vraie recherche
+// en base, jamais limitée aux morceaux déjà chargés côté client. ----------
+app.get('/api/artists/search', authMiddleware, h(async (req, res) => {
+  const query = ((req.query.q || '') + '').trim();
+  if (query.length < 2) return res.json({ artists: [] });
+  const rows = await db.query(
+    `SELECT id, artist_name, first_name, avatar_url FROM users
+     WHERE account_type = 'artist' AND id != $1
+       AND (LOWER(artist_name) LIKE LOWER($2) OR LOWER(first_name) LIKE LOWER($2))
+     LIMIT 8`,
+    [req.user.id, `%${query}%`],
+  );
+  res.json({ artists: rows });
+}));
+
+// ---------- A3 — "Mes collaborations" : toutes les collaborations où je suis l'artiste
+// principal (celui qui publie), groupées par morceau, avec le vrai statut de chacune. ----------
+app.get('/api/me/collaborations-given', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT t.id AS track_id, t.title AS track_title,
+      tc.id AS collaborator_id, tc.role, tc.external_name,
+      u.id AS collaborator_artist_id, u.artist_name, u.first_name,
+      ct.id AS terms_id, ct.rights_type, ct.share_pct, ct.status, ct.payment_type,
+      cd.reason AS dispute_reason,
+      COALESCE((SELECT SUM(cp.gross_share_fcfa) FROM collaborator_payouts cp
+                WHERE cp.collaboration_terms_id = ct.id AND cp.status IN ('held_dispute','held_pending')), 0) AS frozen_amount_fcfa
+    FROM tracks t
+    JOIN track_collaborators tc ON tc.track_id = t.id AND tc.role != 'primary'
+    JOIN collaboration_terms ct ON ct.collaborator_id = tc.id AND ct.effective_until IS NULL
+    LEFT JOIN users u ON u.id = tc.artist_id
+    LEFT JOIN collaboration_disputes cd ON cd.collaboration_terms_id = ct.id AND cd.status = 'open'
+    WHERE t.artist_id = $1
+    ORDER BY t.created_at DESC
+  `, [req.user.id]);
+  res.json({ items: rows });
+}));
+
 app.get('/api/artists/top100', h(async (req, res) => {
   const rows = await db.query(`
     SELECT u.id, u.artist_name, u.first_name, u.avatar_url, u.is_verified,
@@ -3796,56 +3845,49 @@ async function logCollabAudit(entityType, entityId, action, actorId, beforeObj, 
 // ---------- Ajouter un collaborateur sur un morceau — réservé à l'artiste principal
 // (tracks.artist_id) uniquement. Crée toujours un accord en 'pending' : aucune part
 // n'est jamais considérée acceptée sur simple déclaration. ----------
-app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => {
-  const trackId = Number(req.params.id);
-  const track = await db.get('SELECT id, artist_id, title FROM tracks WHERE id = $1', [trackId]);
-  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
-  if (track.artist_id !== req.user.id) {
-    return res.status(403).json({ error: "Seul l'artiste principal de ce morceau peut y ajouter un collaborateur." });
-  }
+// Fonction partagée — réutilisée par POST /api/tracks/:id/collaborators ET par la
+// publication elle-même (POST /api/tracks, qui accepte un tableau `collaborators`).
+// Ne jamais dupliquer cette logique de validation à deux endroits différents.
+async function addCollaboratorToTrack(track, requesterId, body) {
   const {
     collaboratorArtistId, externalName, externalContact, role,
     paymentType, upfrontAmountFcfa, masterPct, publishingPct, agreementNotes,
-  } = req.body || {};
+  } = body || {};
 
-  // ---- Validations obligatoires — uniquement les incohérences indispensables, jamais plus.
   if (!collaboratorArtistId && !externalName) {
-    return res.status(400).json({ error: 'Indiquez soit un compte NUNI existant, soit un nom externe.' });
+    return { error: 'Indiquez soit un compte NUNI existant, soit un nom externe.', status: 400 };
   }
   if (!['featured', 'co-artist', 'producer', 'composer', 'label'].includes(role)) {
-    return res.status(400).json({ error: 'Rôle invalide.' });
+    return { error: 'Rôle invalide.', status: 400 };
   }
   if (!['forfait', 'avance_recoupable', 'royalties', 'forfait_et_royalties', 'aucun_paiement', 'autre'].includes(paymentType)) {
-    return res.status(400).json({ error: "Type d'accord invalide." });
+    return { error: "Type d'accord invalide.", status: 400 };
   }
   const hasMaster = masterPct !== null && masterPct !== undefined && masterPct !== '';
   const hasPublishing = publishingPct !== null && publishingPct !== undefined && publishingPct !== '';
   if (!hasMaster && !hasPublishing) {
-    return res.status(400).json({ error: 'Indiquez au moins une part (master ou publishing), même 0%.' });
+    return { error: 'Indiquez au moins une part (master ou publishing), même 0%.', status: 400 };
   }
   for (const [label, val] of [['master', masterPct], ['publishing', publishingPct]]) {
     if (val === null || val === undefined || val === '') continue;
     const n = Number(val);
-    if (Number.isNaN(n) || n < 0) return res.status(400).json({ error: `Le pourcentage ${label} ne peut pas être négatif.` });
-    if (n > 100) return res.status(400).json({ error: `Le pourcentage ${label} ne peut pas dépasser 100%.` });
+    if (Number.isNaN(n) || n < 0) return { error: `Le pourcentage ${label} ne peut pas être négatif.`, status: 400 };
+    if (n > 100) return { error: `Le pourcentage ${label} ne peut pas dépasser 100%.`, status: 400 };
   }
   if (upfrontAmountFcfa !== null && upfrontAmountFcfa !== undefined && upfrontAmountFcfa !== '' && Number(upfrontAmountFcfa) < 0) {
-    return res.status(400).json({ error: 'Le montant ne peut pas être négatif.' });
+    return { error: 'Le montant ne peut pas être négatif.', status: 400 };
   }
   if ((paymentType === 'avance_recoupable') && (!upfrontAmountFcfa || Number(upfrontAmountFcfa) <= 0)) {
-    return res.status(400).json({ error: 'Une avance recoupable exige un montant supérieur à 0.' });
+    return { error: 'Une avance recoupable exige un montant supérieur à 0.', status: 400 };
   }
   if ((paymentType === 'royalties' || paymentType === 'forfait_et_royalties')
     && (!hasMaster || Number(masterPct) <= 0) && (!hasPublishing || Number(publishingPct) <= 0)) {
-    return res.status(400).json({ error: 'Un accord en royalties exige au moins une part (master ou publishing) supérieure à 0%.' });
+    return { error: 'Un accord en royalties exige au moins une part (master ou publishing) supérieure à 0%.', status: 400 };
   }
   if (collaboratorArtistId) {
     const exists = await db.get('SELECT id FROM users WHERE id = $1', [Number(collaboratorArtistId)]);
-    if (!exists) return res.status(404).json({ error: 'Compte artiste introuvable.' });
+    if (!exists) return { error: 'Compte artiste introuvable.', status: 404 };
   }
-  // Total des parts déjà ACCEPTÉES sur ce morceau, par type de droits — jamais plus de 100%
-  // au total, même en cumulant avec cette nouvelle proposition (encore non confirmée, mais on
-  // prévient l'artiste avant même l'envoi plutôt que de le laisser découvrir le blocage plus tard).
   for (const [rightsType, pct] of [['master', masterPct], ['publishing', publishingPct]]) {
     if (pct === null || pct === undefined || pct === '') continue;
     const existingRow = await db.get(
@@ -3854,23 +3896,19 @@ app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => 
        JOIN track_collaborators tc ON tc.id = ct.collaborator_id
        WHERE tc.track_id = $1 AND tc.role != 'primary' AND ct.rights_type = $2
          AND ct.status = 'accepted' AND ct.effective_until IS NULL`,
-      [trackId, rightsType],
+      [track.id, rightsType],
     );
     const projectedTotal = Number(existingRow.total) + Number(pct);
     if (projectedTotal > 100) {
-      return res.status(409).json({
-        error: `Total des parts ${rightsType} incohérent : ${existingRow.total}% déjà accepté(s) + ${pct}% proposé(s) = ${projectedTotal}% (> 100%).`,
-      });
+      return { error: `Total des parts ${rightsType} incohérent : ${existingRow.total}% déjà accepté(s) + ${pct}% proposé(s) = ${projectedTotal}% (> 100%).`, status: 409 };
     }
   }
 
   const collab = await db.get(
     `INSERT INTO track_collaborators (track_id, artist_id, external_name, external_contact, role, added_by)
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-    [trackId, collaboratorArtistId || null, externalName || null, externalContact || null, role, req.user.id],
+    [track.id, collaboratorArtistId || null, externalName || null, externalContact || null, role, requesterId],
   );
-  // Une ligne par type de droits réellement renseigné — jamais une part "both" fusionnée qui
-  // masquerait la séparation stricte entre master et publishing.
   const createdTermsIds = [];
   for (const [rightsType, pct] of [['master', masterPct], ['publishing', publishingPct]]) {
     if (pct === null || pct === undefined || pct === '') continue;
@@ -3878,23 +3916,35 @@ app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => 
       `INSERT INTO collaboration_terms
          (collaborator_id, rights_type, payment_type, upfront_amount_fcfa, share_pct, agreement_notes, status, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING id`,
-      [collab.id, rightsType, paymentType, upfrontAmountFcfa || null, Number(pct), agreementNotes || null, req.user.id],
+      [collab.id, rightsType, paymentType, upfrontAmountFcfa || null, Number(pct), agreementNotes || null, requesterId],
     );
     createdTermsIds.push(terms.id);
-    await logCollabAudit('collaboration_terms', terms.id, 'created', req.user.id, null, {
-      trackId, role, rightsType, paymentType, upfrontAmountFcfa, sharePct: Number(pct),
+    await logCollabAudit('collaboration_terms', terms.id, 'created', requesterId, null, {
+      trackId: track.id, role, rightsType, paymentType, upfrontAmountFcfa, sharePct: Number(pct),
     });
   }
 
   if (collaboratorArtistId) {
-    const requester = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [req.user.id]);
+    const requester = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [requesterId]);
     createNotification(
       Number(collaboratorArtistId), 'collaboration_request', 'Demande de collaboration',
       `${requester.artist_name || requester.first_name || 'Un artiste'} vous propose une collaboration sur "${track.title}".`,
       null,
     ).catch(() => {});
   }
-  res.status(201).json({ collaboratorId: collab.id, termsIds: createdTermsIds });
+  return { collaboratorId: collab.id, termsIds: createdTermsIds, status: 201 };
+}
+
+app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const track = await db.get('SELECT id, artist_id, title FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  if (track.artist_id !== req.user.id) {
+    return res.status(403).json({ error: "Seul l'artiste principal de ce morceau peut y ajouter un collaborateur." });
+  }
+  const result = await addCollaboratorToTrack(track, req.user.id, req.body);
+  const { status, ...body } = result;
+  res.status(status).json(body);
 }));
 
 // ---------- Le collaborateur répond à une proposition — accepted / disputed / rejected.
