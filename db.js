@@ -807,6 +807,7 @@ async function initSchema() {
       original_payout_id INTEGER NOT NULL REFERENCES collaborator_payouts(id),
       amount_fcfa NUMERIC(12,2) NOT NULL,
       reason TEXT NOT NULL,
+      document_url TEXT,
       applied_on_payout_id INTEGER REFERENCES collaborator_payouts(id),
       created_by INTEGER NOT NULL REFERENCES users(id),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -825,6 +826,10 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_collab_audit_entity ON collab_audit_log(entity_type, entity_id);
   `);
+  // Compatibilité pour les bases où payout_adjustments a déjà été créée avant l'ajout de
+  // cette colonne (CREATE TABLE IF NOT EXISTS n'ajoute jamais de colonne à une table
+  // déjà existante lors d'un déploiement précédent).
+  await pool.query(`ALTER TABLE payout_adjustments ADD COLUMN IF NOT EXISTS document_url TEXT;`);
 
   // ---------- Rétro-remplissage des morceaux existants ----------
   // Chaque morceau déjà publié reçoit un collaborateur "primary" miroir exact de son

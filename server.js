@@ -3805,23 +3805,63 @@ app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => 
   }
   const {
     collaboratorArtistId, externalName, externalContact, role,
-    rightsType, paymentType, upfrontAmountFcfa, sharePct, agreementNotes,
+    paymentType, upfrontAmountFcfa, masterPct, publishingPct, agreementNotes,
   } = req.body || {};
+
+  // ---- Validations obligatoires — uniquement les incohérences indispensables, jamais plus.
   if (!collaboratorArtistId && !externalName) {
     return res.status(400).json({ error: 'Indiquez soit un compte NUNI existant, soit un nom externe.' });
   }
   if (!['featured', 'co-artist', 'producer', 'composer', 'label'].includes(role)) {
     return res.status(400).json({ error: 'Rôle invalide.' });
   }
-  if (!['master', 'publishing', 'both'].includes(rightsType)) {
-    return res.status(400).json({ error: 'Type de droits invalide.' });
-  }
   if (!['forfait', 'avance_recoupable', 'royalties', 'forfait_et_royalties', 'aucun_paiement', 'autre'].includes(paymentType)) {
     return res.status(400).json({ error: "Type d'accord invalide." });
+  }
+  const hasMaster = masterPct !== null && masterPct !== undefined && masterPct !== '';
+  const hasPublishing = publishingPct !== null && publishingPct !== undefined && publishingPct !== '';
+  if (!hasMaster && !hasPublishing) {
+    return res.status(400).json({ error: 'Indiquez au moins une part (master ou publishing), même 0%.' });
+  }
+  for (const [label, val] of [['master', masterPct], ['publishing', publishingPct]]) {
+    if (val === null || val === undefined || val === '') continue;
+    const n = Number(val);
+    if (Number.isNaN(n) || n < 0) return res.status(400).json({ error: `Le pourcentage ${label} ne peut pas être négatif.` });
+    if (n > 100) return res.status(400).json({ error: `Le pourcentage ${label} ne peut pas dépasser 100%.` });
+  }
+  if (upfrontAmountFcfa !== null && upfrontAmountFcfa !== undefined && upfrontAmountFcfa !== '' && Number(upfrontAmountFcfa) < 0) {
+    return res.status(400).json({ error: 'Le montant ne peut pas être négatif.' });
+  }
+  if ((paymentType === 'avance_recoupable') && (!upfrontAmountFcfa || Number(upfrontAmountFcfa) <= 0)) {
+    return res.status(400).json({ error: 'Une avance recoupable exige un montant supérieur à 0.' });
+  }
+  if ((paymentType === 'royalties' || paymentType === 'forfait_et_royalties')
+    && (!hasMaster || Number(masterPct) <= 0) && (!hasPublishing || Number(publishingPct) <= 0)) {
+    return res.status(400).json({ error: 'Un accord en royalties exige au moins une part (master ou publishing) supérieure à 0%.' });
   }
   if (collaboratorArtistId) {
     const exists = await db.get('SELECT id FROM users WHERE id = $1', [Number(collaboratorArtistId)]);
     if (!exists) return res.status(404).json({ error: 'Compte artiste introuvable.' });
+  }
+  // Total des parts déjà ACCEPTÉES sur ce morceau, par type de droits — jamais plus de 100%
+  // au total, même en cumulant avec cette nouvelle proposition (encore non confirmée, mais on
+  // prévient l'artiste avant même l'envoi plutôt que de le laisser découvrir le blocage plus tard).
+  for (const [rightsType, pct] of [['master', masterPct], ['publishing', publishingPct]]) {
+    if (pct === null || pct === undefined || pct === '') continue;
+    const existingRow = await db.get(
+      `SELECT COALESCE(SUM(ct.share_pct),0) AS total
+       FROM collaboration_terms ct
+       JOIN track_collaborators tc ON tc.id = ct.collaborator_id
+       WHERE tc.track_id = $1 AND tc.role != 'primary' AND ct.rights_type = $2
+         AND ct.status = 'accepted' AND ct.effective_until IS NULL`,
+      [trackId, rightsType],
+    );
+    const projectedTotal = Number(existingRow.total) + Number(pct);
+    if (projectedTotal > 100) {
+      return res.status(409).json({
+        error: `Total des parts ${rightsType} incohérent : ${existingRow.total}% déjà accepté(s) + ${pct}% proposé(s) = ${projectedTotal}% (> 100%).`,
+      });
+    }
   }
 
   const collab = await db.get(
@@ -3829,15 +3869,22 @@ app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => 
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
     [trackId, collaboratorArtistId || null, externalName || null, externalContact || null, role, req.user.id],
   );
-  const terms = await db.get(
-    `INSERT INTO collaboration_terms
-       (collaborator_id, rights_type, payment_type, upfront_amount_fcfa, share_pct, agreement_notes, status, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING id`,
-    [collab.id, rightsType, paymentType, upfrontAmountFcfa || null, sharePct || null, agreementNotes || null, req.user.id],
-  );
-  await logCollabAudit('collaboration_terms', terms.id, 'created', req.user.id, null, {
-    trackId, role, rightsType, paymentType, upfrontAmountFcfa, sharePct,
-  });
+  // Une ligne par type de droits réellement renseigné — jamais une part "both" fusionnée qui
+  // masquerait la séparation stricte entre master et publishing.
+  const createdTermsIds = [];
+  for (const [rightsType, pct] of [['master', masterPct], ['publishing', publishingPct]]) {
+    if (pct === null || pct === undefined || pct === '') continue;
+    const terms = await db.get(
+      `INSERT INTO collaboration_terms
+         (collaborator_id, rights_type, payment_type, upfront_amount_fcfa, share_pct, agreement_notes, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING id`,
+      [collab.id, rightsType, paymentType, upfrontAmountFcfa || null, Number(pct), agreementNotes || null, req.user.id],
+    );
+    createdTermsIds.push(terms.id);
+    await logCollabAudit('collaboration_terms', terms.id, 'created', req.user.id, null, {
+      trackId, role, rightsType, paymentType, upfrontAmountFcfa, sharePct: Number(pct),
+    });
+  }
 
   if (collaboratorArtistId) {
     const requester = await db.get('SELECT artist_name, first_name FROM users WHERE id = $1', [req.user.id]);
@@ -3847,7 +3894,7 @@ app.post('/api/tracks/:id/collaborators', authMiddleware, h(async (req, res) => 
       null,
     ).catch(() => {});
   }
-  res.status(201).json({ collaboratorId: collab.id, termsId: terms.id });
+  res.status(201).json({ collaboratorId: collab.id, termsIds: createdTermsIds });
 }));
 
 // ---------- Le collaborateur répond à une proposition — accepted / disputed / rejected.
@@ -3902,6 +3949,107 @@ app.get('/api/tracks/:id/collaborators', h(async (req, res) => {
     ORDER BY (tc.role = 'primary') DESC, tc.created_at ASC
   `, [Number(req.params.id)]);
   res.json({ collaborators: rows });
+}));
+
+// ============================================================
+// ADMIN — écrans N1 (file d'attente) / N2 (résolution) du système de
+// collaborations. Réservés à l'équipe NUNI (checkAdminKey, comme le
+// reste de l'admin existant). NUNI utilise une clé admin partagée (pas
+// de comptes admin individuels) — actor_id reste donc NULL dans l'audit
+// pour ces actions, jamais une valeur inventée dans une colonne qui
+// référence de vrais utilisateurs.
+// ============================================================
+
+// ---- N1 — file des payouts en attente/litige, avec tout le contexte nécessaire pour
+// décider (gross_share_fcfa, période, morceau, motif) sans jamais recalculer quoi que ce soit.
+app.get('/api/admin/collaboration-disputes', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rows = await db.query(`
+    SELECT cp.id AS payout_id, cp.status, cp.gross_share_fcfa, cp.recoupment_applied_fcfa, cp.net_payable_fcfa, cp.held_reason,
+      trp.track_id, trp.period_start, trp.period_end,
+      ct.id AS terms_id, ct.rights_type, ct.payment_type, ct.share_pct, ct.status AS terms_status,
+      t.title AS track_title,
+      collabU.id AS collaborator_artist_id, collabU.artist_name AS collaborator_artist_name, collabU.first_name AS collaborator_first_name,
+      tc.external_name,
+      cd.reason AS dispute_reason, cd.opened_at AS dispute_opened_at
+    FROM collaborator_payouts cp
+    JOIN track_revenue_periods trp ON trp.id = cp.revenue_period_id
+    JOIN collaboration_terms ct ON ct.id = cp.collaboration_terms_id
+    JOIN track_collaborators tc ON tc.id = cp.collaborator_id
+    JOIN tracks t ON t.id = trp.track_id
+    LEFT JOIN users collabU ON collabU.id = tc.artist_id
+    LEFT JOIN collaboration_disputes cd ON cd.collaboration_terms_id = ct.id AND cd.status = 'open'
+    WHERE cp.status IN ('held_dispute', 'held_pending')
+    ORDER BY cp.created_at ASC
+  `);
+  res.json({ items: rows });
+}));
+
+// ---- N2a — Libérer : le montant gross_share_fcfa déjà enregistré n'est jamais recalculé,
+// seul le statut change (-> payable).
+app.post('/api/admin/collaborator-payouts/:id/release', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const payoutId = Number(req.params.id);
+  const { note } = req.body || {};
+  const payout = await db.get('SELECT * FROM collaborator_payouts WHERE id = $1', [payoutId]);
+  if (!payout) return res.status(404).json({ error: 'Payout introuvable.' });
+  if (payout.status === 'paid') return res.status(409).json({ error: 'Ce payout a déjà été payé — irréversible.' });
+  await db.run(`UPDATE collaborator_payouts SET status = 'payable', held_reason = NULL WHERE id = $1`, [payoutId]);
+  await logCollabAudit('collaborator_payouts', payoutId, 'released', null, { status: payout.status }, { status: 'payable', note: note || null });
+  res.json({ ok: true });
+}));
+
+// ---- N2b — Ajuster : ne modifie JAMAIS le montant original. Crée une ligne
+// payout_adjustments append-only, motif obligatoire, document optionnel.
+app.post('/api/admin/collaborator-payouts/:id/adjust', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const payoutId = Number(req.params.id);
+  const { amountFcfa, reason, documentUrl } = req.body || {};
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif est obligatoire pour tout ajustement.' });
+  if (amountFcfa === undefined || amountFcfa === null || Number.isNaN(Number(amountFcfa))) {
+    return res.status(400).json({ error: 'Montant d\'ajustement invalide.' });
+  }
+  const payout = await db.get('SELECT * FROM collaborator_payouts WHERE id = $1', [payoutId]);
+  if (!payout) return res.status(404).json({ error: 'Payout introuvable.' });
+
+  const adjustment = await db.get(
+    `INSERT INTO payout_adjustments (original_payout_id, amount_fcfa, reason, document_url, created_by)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [payoutId, Number(amountFcfa), reason.trim(), documentUrl || null, req.user ? req.user.id : null],
+  );
+  await logCollabAudit('payout_adjustments', adjustment.id, 'created', null, null, {
+    originalPayoutId: payoutId,
+    originalAmountFcfa: Number(payout.net_payable_fcfa),
+    adjustmentAmountFcfa: Number(amountFcfa),
+    newAmountFcfa: Number(payout.net_payable_fcfa) + Number(amountFcfa),
+    reason: reason.trim(),
+  });
+  res.json({
+    ok: true,
+    adjustmentId: adjustment.id,
+    originalAmountFcfa: Number(payout.net_payable_fcfa),
+    adjustmentAmountFcfa: Number(amountFcfa),
+    newAmountFcfa: Number(payout.net_payable_fcfa) + Number(amountFcfa),
+  });
+}));
+
+// ---- N2c — Rejet définitif : la contestation est tranchée en défaveur du collaborateur,
+// son accord passe à rejected — plus aucun droit actif, jamais de suppression de l'historique.
+app.post('/api/admin/collaboration-terms/:id/final-reject', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const termsId = Number(req.params.id);
+  const { reason } = req.body || {};
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif est obligatoire pour un rejet définitif.' });
+  const terms = await db.get('SELECT * FROM collaboration_terms WHERE id = $1', [termsId]);
+  if (!terms) return res.status(404).json({ error: 'Accord introuvable.' });
+  await db.run(`UPDATE collaboration_terms SET status = 'rejected' WHERE id = $1`, [termsId]);
+  await db.run(
+    `UPDATE collaboration_disputes SET status = 'resolved', resolution_note = $1, resolved_at = NOW()
+     WHERE collaboration_terms_id = $2 AND status = 'open'`,
+    [reason.trim(), termsId],
+  );
+  await logCollabAudit('collaboration_terms', termsId, 'final_rejected', null, { status: terms.status }, { status: 'rejected', reason: reason.trim() });
+  res.json({ ok: true });
 }));
 
 async function applyCollaborationSplits(client, artistId, settings) {
