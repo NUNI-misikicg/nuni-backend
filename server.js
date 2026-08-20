@@ -918,6 +918,56 @@ async function notifyLabelArtistAdded(label, artistName, newCount) {
   }
 }
 
+// ---------- Activation atomique d'une affiliation Label <-> artiste — réutilisée par
+// /accept ET /reactivate, jamais dupliquée. Corrige le contournement de maxArtists trouvé
+// en audit : la vérification se faisait uniquement à l'invitation (/invite), jamais au
+// moment réel où le statut passe à 'active'. Verrouille la ligne du Label (SELECT ... FOR
+// UPDATE) pour la durée de la transaction : deux acceptations simultanées pour le MÊME
+// Label se sérialisent — la deuxième ne voit la vraie limite qu'une fois la première
+// entièrement validée et committée, jamais un compte simultané obsolète.
+async function tryActivateLabelArtist(affiliationId, expectedArtistId) {
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const aff = await client.query(
+      `SELECT la.id, la.label_id, la.artist_id, la.status
+       FROM label_artists la WHERE la.id = $1 FOR UPDATE`,
+      [affiliationId],
+    );
+    const row = aff.rows[0];
+    if (!row || (expectedArtistId != null && row.artist_id !== expectedArtistId)) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 404, error: 'Affiliation introuvable.' };
+    }
+    if (row.status === 'active') {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 409, error: 'Cette affiliation est déjà active.' };
+    }
+    // Verrou sur la ligne labels elle-même — c'est CE verrou, pas celui de l'affiliation,
+    // qui sérialise réellement les tentatives concurrentes visant le même Label.
+    const labelRow = await client.query('SELECT id, plan FROM labels WHERE id = $1 FOR UPDATE', [row.label_id]);
+    const label = labelRow.rows[0];
+    if (!label) { await client.query('ROLLBACK'); return { ok: false, status: 404, error: 'Label introuvable.' }; }
+    const planSettings = await getLabelPlanSettings();
+    const max = planSettings.maxArtists[label.plan];
+    const currentActive = await client.query(
+      "SELECT COUNT(*)::int AS c FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+    );
+    if (max !== null && currentActive.rows[0].c >= max) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 403, error: `Palier (${label.plan}) déjà à sa limite de ${max} artiste(s) — impossible d'activer cette affiliation.` };
+    }
+    await client.query("UPDATE label_artists SET status = 'active' WHERE id = $1", [row.id]);
+    await client.query('COMMIT');
+    return { ok: true, labelId: label.id };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 async function requireValidatedLabel(req, res, minRole = 'assistant') {
   // Le compte est-il le compte de connexion du Label lui-même (toujours owner) ?
   const ownLabel = await db.get('SELECT * FROM labels WHERE user_id = $1', [req.user.id]);
@@ -1058,7 +1108,8 @@ app.post('/api/label/artists/:id/reactivate', authMiddleware, h(async (req, res)
   if (!label) return;
   const aff = await db.get('SELECT id FROM label_artists WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
   if (!aff) return res.status(404).json({ error: 'Affiliation introuvable.' });
-  await db.run("UPDATE label_artists SET status = 'active' WHERE id = $1", [aff.id]);
+  const result = await tryActivateLabelArtist(aff.id, null);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
   res.json({ message: 'Affiliation réactivée.' });
 }));
 
@@ -1663,7 +1714,8 @@ app.post('/api/me/label-invites/:id/accept', authMiddleware, h(async (req, res) 
     [Number(req.params.id), req.user.id],
   );
   if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
-  await db.run("UPDATE label_artists SET status = 'active' WHERE id = $1", [invite.id]);
+  const result = await tryActivateLabelArtist(invite.id, req.user.id);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
   const label = await db.get('SELECT * FROM labels WHERE id = $1', [invite.label_id]);
   const artist = await db.get('SELECT artist_name FROM users WHERE id = $1', [req.user.id]);
   if (label && artist) {
