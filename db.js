@@ -825,6 +825,20 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_collab_audit_entity ON collab_audit_log(entity_type, entity_id);
+
+    -- Historique réel des streams — un instantané quotidien par morceau. Base de tout calcul
+    -- de tendance/progression (NUNI Tendance, Artistes à surveiller) : sans point de
+    -- comparaison dans le temps, aucune "progression" ne peut être calculée honnêtement à
+    -- partir du seul total cumulé actuel.
+    CREATE TABLE IF NOT EXISTS track_streams_history (
+      id SERIAL PRIMARY KEY,
+      track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      streams_snapshot INTEGER NOT NULL,
+      recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      recorded_date DATE NOT NULL DEFAULT CURRENT_DATE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_history_track_day ON track_streams_history(track_id, recorded_date);
+    CREATE INDEX IF NOT EXISTS idx_streams_history_date ON track_streams_history(recorded_date);
   `);
   // Compatibilité pour les bases où payout_adjustments a déjà été créée avant l'ajout de
   // cette colonne (CREATE TABLE IF NOT EXISTS n'ajoute jamais de colonne à une table

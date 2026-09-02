@@ -2458,7 +2458,7 @@ app.get('/api/artist/:id/featured-tracks', h(async (req, res) => {
 app.get('/api/releases/upcoming', h(async (req, res) => {
   const authUser = await optionalAuthUser(req);
   const rows = await db.query(`
-    SELECT t.id, t.title, t.release_type, t.scheduled_release_at, u.artist_name, u.first_name,
+    SELECT t.id, t.title, t.release_type, t.scheduled_release_at, t.cover_url, u.artist_name, u.first_name,
       EXISTS(SELECT 1 FROM release_notify_requests rnr WHERE rnr.track_id = t.id AND rnr.user_id = $1) AS notify_requested
     FROM tracks t
     JOIN users u ON u.id = t.artist_id
@@ -4940,6 +4940,20 @@ app.get('/api/admin/notifications', h(async (req, res) => {
   res.json({ notifications: items.slice(0, 40) });
 }));
 
+async function snapshotTrackStreams() {
+  try {
+    // Un seul instantané par vrai morceau et par jour (contrainte unique en base) —
+    // idempotent même si cette tâche se relance plusieurs fois le même jour après un
+    // redémarrage à froid (plan gratuit Render).
+    await db.query(`
+      INSERT INTO track_streams_history (track_id, streams_snapshot, recorded_date)
+      SELECT id, streams, CURRENT_DATE FROM tracks
+      ON CONFLICT (track_id, recorded_date) DO UPDATE SET streams_snapshot = EXCLUDED.streams_snapshot, recorded_at = NOW()
+    `);
+  } catch (e) { console.error('[streams-history snapshot]', e.message); }
+}
+setInterval(snapshotTrackStreams, 60 * 60 * 1000); // vérifié toutes les heures ; premier vrai instantané déclenché dans start(), une fois le schéma prêt
+
 app.get('/admin-verify.html', (req, res) => {
   res.redirect('/admin.html');
 });
@@ -5068,6 +5082,7 @@ async function enforceDiscoveryDeletion() {
 async function start() {
   await db.initSchema();
   await initAuth();
+  snapshotTrackStreams(); // premier vrai instantané, schéma désormais garanti prêt
 
   enforceSubscriptionExpiry();
   setInterval(enforceSubscriptionExpiry, 60 * 1000);
