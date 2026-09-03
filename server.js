@@ -3374,6 +3374,35 @@ app.get('/api/artists/top-streams', h(async (req, res) => {
 // disponible datant d'un jour précédent. Si aucun instantané d'un jour antérieur n'existe
 // encore (plateforme trop récente), retourne une liste vide — jamais une progression
 // inventée à partir du seul total cumulé. ----------
+// ---------- "Classement de la semaine" — vraie progression depuis le lundi de cette
+// semaine (même définition que weeklyPeriodKey, déjà utilisée pour les votes Talent),
+// jamais le total cumulé (c'est déjà Top Congo). Si aucun instantané datant d'avant ce
+// lundi n'existe encore, retourne une liste vide — jamais un classement inventé. ----------
+app.get('/api/tracks/weekly-ranking', h(async (req, res) => {
+  const d = new Date();
+  const dayIdx = (d.getUTCDay() + 6) % 7;
+  const monday = new Date(d);
+  monday.setUTCDate(d.getUTCDate() - dayIdx);
+  const mondayStr = monday.toISOString().slice(0, 10);
+
+  const baselineRows = await db.query(`
+    SELECT DISTINCT ON (track_id) track_id, streams_snapshot
+    FROM track_streams_history
+    WHERE recorded_date <= $1
+    ORDER BY track_id, recorded_date DESC
+  `, [mondayStr]);
+  if (!baselineRows.length) { return res.json({ tracks: [], reason: 'Historique insuffisant (pas encore de donnée avant ce lundi).' }); }
+  const baselineByTrack = new Map(baselineRows.map(r => [r.track_id, r.streams_snapshot]));
+
+  const allTracks = await db.query(`SELECT id, streams FROM tracks`);
+  const ranked = allTracks
+    .map(t => ({ id: t.id, weeklyStreams: t.streams - (baselineByTrack.get(t.id) ?? t.streams) }))
+    .filter(t => t.weeklyStreams > 0)
+    .sort((a, b) => b.weeklyStreams - a.weeklyStreams)
+    .slice(0, 100);
+  res.json({ tracks: ranked });
+}));
+
 app.get('/api/tracks/trending', h(async (req, res) => {
   const oldestRow = await db.get(`SELECT MIN(recorded_date) as d FROM track_streams_history WHERE recorded_date < CURRENT_DATE`);
   if (!oldestRow || !oldestRow.d) { return res.json({ tracks: [], reason: 'Historique insuffisant (moins de 2 jours de données réelles).' }); }
