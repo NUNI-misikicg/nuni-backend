@@ -1981,6 +1981,14 @@ app.get('/api/playlists', h(async (req, res) => {
       `, [p.id]);
       p.cover_url = firstCover ? firstCover.cover_url : null;
     }
+    // Genre dominant réel — le genre le plus fréquent parmi les vrais morceaux de cette
+    // playlist. Sert uniquement à personnaliser l'ordre d'affichage côté client, jamais
+    // affiché comme une catégorisation officielle inventée pour la playlist elle-même.
+    const genreRow = await db.get(`
+      SELECT t.genre, COUNT(*)::int as c FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+      WHERE pt.playlist_id = $1 AND t.genre IS NOT NULL GROUP BY t.genre ORDER BY c DESC LIMIT 1
+    `, [p.id]);
+    p.dominant_genre = genreRow ? genreRow.genre : null;
   }
   res.json({ playlists });
 }));
