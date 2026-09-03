@@ -1971,24 +1971,38 @@ app.delete('/api/admin/playlists/:id', h(async (req, res) => {
 // aucune pochette dédiée n'a été choisie, et nombre réel de titres).
 app.get('/api/playlists', h(async (req, res) => {
   const playlists = await db.query('SELECT id, title, description, cover_url FROM playlists ORDER BY created_at DESC');
+  if(!playlists.length){ return res.json({ playlists }); }
+  const ids = playlists.map(p=>p.id);
+
+  // ---- Optimisation réelle — avant : jusqu'à 3 requêtes SQL par playlist (comptage,
+  // pochette de repli, genre dominant), donc jusqu'à 3N allers-retours base pour N
+  // playlists. Remplacé par 3 vraies requêtes groupées au total, peu importe le nombre de
+  // playlists — même résultat, juste calculé une seule fois pour tout le monde. ----
+  const countRows = await db.query(`SELECT playlist_id, COUNT(*)::int as c FROM playlist_tracks WHERE playlist_id = ANY($1) GROUP BY playlist_id`, [ids]);
+  const countByPlaylist = new Map(countRows.map(r=>[r.playlist_id, r.c]));
+
+  const coverRows = await db.query(`
+    SELECT DISTINCT ON (pt.playlist_id) pt.playlist_id, t.cover_url
+    FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+    WHERE pt.playlist_id = ANY($1) ORDER BY pt.playlist_id, pt.position
+  `, [ids]);
+  const coverByPlaylist = new Map(coverRows.map(r=>[r.playlist_id, r.cover_url]));
+
+  const genreRows = await db.query(`
+    SELECT DISTINCT ON (pt.playlist_id) pt.playlist_id, t.genre, COUNT(*) as c
+    FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+    WHERE pt.playlist_id = ANY($1) AND t.genre IS NOT NULL
+    GROUP BY pt.playlist_id, t.genre ORDER BY pt.playlist_id, c DESC
+  `, [ids]);
+  const genreByPlaylist = new Map(genreRows.map(r=>[r.playlist_id, r.genre]));
+
   for (const p of playlists) {
-    const countRow = await db.get('SELECT COUNT(*)::int as c FROM playlist_tracks WHERE playlist_id = $1', [p.id]);
-    p.track_count = countRow.c;
-    if (!p.cover_url) {
-      const firstCover = await db.get(`
-        SELECT t.cover_url FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-        WHERE pt.playlist_id = $1 ORDER BY pt.position LIMIT 1
-      `, [p.id]);
-      p.cover_url = firstCover ? firstCover.cover_url : null;
-    }
+    p.track_count = countByPlaylist.get(p.id) || 0;
+    if (!p.cover_url) p.cover_url = coverByPlaylist.get(p.id) || null;
     // Genre dominant réel — le genre le plus fréquent parmi les vrais morceaux de cette
     // playlist. Sert uniquement à personnaliser l'ordre d'affichage côté client, jamais
     // affiché comme une catégorisation officielle inventée pour la playlist elle-même.
-    const genreRow = await db.get(`
-      SELECT t.genre, COUNT(*)::int as c FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-      WHERE pt.playlist_id = $1 AND t.genre IS NOT NULL GROUP BY t.genre ORDER BY c DESC LIMIT 1
-    `, [p.id]);
-    p.dominant_genre = genreRow ? genreRow.genre : null;
+    p.dominant_genre = genreByPlaylist.get(p.id) || null;
   }
   res.json({ playlists });
 }));
