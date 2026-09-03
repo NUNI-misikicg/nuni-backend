@@ -3369,6 +3369,43 @@ app.get('/api/artists/top-streams', h(async (req, res) => {
   res.json({ artists: rows });
 }));
 
+// ---------- NUNI Tendance — vraie vitesse de progression des streams, basée sur
+// track_streams_history. Compare le vrai total actuel au vrai instantané le plus ancien
+// disponible datant d'un jour précédent. Si aucun instantané d'un jour antérieur n'existe
+// encore (plateforme trop récente), retourne une liste vide — jamais une progression
+// inventée à partir du seul total cumulé. ----------
+app.get('/api/tracks/trending', h(async (req, res) => {
+  const oldestRow = await db.get(`SELECT MIN(recorded_date) as d FROM track_streams_history WHERE recorded_date < CURRENT_DATE`);
+  if (!oldestRow || !oldestRow.d) { return res.json({ tracks: [], reason: 'Historique insuffisant (moins de 2 jours de données réelles).' }); }
+  const rows = await db.query(`
+    SELECT t.id, (t.streams - COALESCE(h.streams_snapshot, 0)) as velocity
+    FROM tracks t
+    JOIN track_streams_history h ON h.track_id = t.id AND h.recorded_date = $1
+    WHERE t.streams > COALESCE(h.streams_snapshot, 0)
+    ORDER BY velocity DESC
+    LIMIT 15
+  `, [oldestRow.d]);
+  res.json({ tracks: rows.map(r => ({ id: r.id, velocity: r.velocity })) });
+}));
+
+// ---------- Artistes à surveiller — même principe que NUNI Tendance, agrégé par artiste
+// (vraie somme de la progression de tous ses morceaux). Même garde-fou : liste vide tant
+// qu'il n'y a pas au moins un jour d'historique réel antérieur. ----------
+app.get('/api/artists/rising', h(async (req, res) => {
+  const oldestRow = await db.get(`SELECT MIN(recorded_date) as d FROM track_streams_history WHERE recorded_date < CURRENT_DATE`);
+  if (!oldestRow || !oldestRow.d) { return res.json({ artists: [], reason: 'Historique insuffisant (moins de 2 jours de données réelles).' }); }
+  const rows = await db.query(`
+    SELECT t.artist_id, SUM(t.streams - COALESCE(h.streams_snapshot, 0)) as velocity
+    FROM tracks t
+    JOIN track_streams_history h ON h.track_id = t.id AND h.recorded_date = $1
+    GROUP BY t.artist_id
+    HAVING SUM(t.streams - COALESCE(h.streams_snapshot, 0)) > 0
+    ORDER BY velocity DESC
+    LIMIT 15
+  `, [oldestRow.d]);
+  res.json({ artists: rows.map(r => ({ artistId: r.artist_id, velocity: r.velocity })) });
+}));
+
 // ---------- NUNI Talent — vrai classement (écoutes réelles + votes de la semaine) ----------
 // Avant : noms fictifs, streams aléatoires générés côté client, votes jamais enregistrés.
 // Score = vraies écoutes cumulées de l'artiste + un vrai poids par vote reçu cette semaine —
