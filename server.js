@@ -2492,17 +2492,22 @@ app.get('/api/artist/:id/featured-tracks', h(async (req, res) => {
 // (Pass Artiste actif), triées par date réelle la plus proche.
 app.get('/api/releases/upcoming', h(async (req, res) => {
   const authUser = await optionalAuthUser(req);
+  // Un album fait un tout avec ses morceaux — même principe déjà appliqué côté client
+  // (dedupeAlbums). DISTINCT ON par artiste + album (les vrais singles gardent leur propre
+  // titre comme clé, donc restent individuels) : un seul morceau représente l'ensemble,
+  // jamais chaque titre d'un même album affiché séparément parmi les 8 places disponibles.
   const rows = await db.query(`
-    SELECT t.id, t.title, t.release_type, t.scheduled_release_at, t.cover_url, u.artist_name, u.first_name,
+    SELECT DISTINCT ON (t.artist_id, COALESCE(t.album, t.title))
+      t.id, t.title, t.release_type, t.scheduled_release_at, t.cover_url, u.artist_name, u.first_name,
       EXISTS(SELECT 1 FROM release_notify_requests rnr WHERE rnr.track_id = t.id AND rnr.user_id = $1) AS notify_requested
     FROM tracks t
     JOIN users u ON u.id = t.artist_id
     WHERE t.published = 0 AND t.scheduled_release_at IS NOT NULL AND t.scheduled_release_at > NOW()
       AND u.account_type = 'artist' AND u.subscription_status = 'active' AND u.plan = 'artist'
-    ORDER BY t.scheduled_release_at ASC
-    LIMIT 8
+    ORDER BY t.artist_id, COALESCE(t.album, t.title), t.scheduled_release_at ASC
   `, [authUser ? authUser.id : null]);
-  res.json({ releases: rows });
+  rows.sort((a,b)=> new Date(a.scheduled_release_at) - new Date(b.scheduled_release_at));
+  res.json({ releases: rows.slice(0, 8) });
 }));
 
 // "Me prévenir" sur une sortie à venir — inscrit une vraie demande, jamais une confirmation
