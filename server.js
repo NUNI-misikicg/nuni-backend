@@ -3378,14 +3378,19 @@ app.get('/api/tracks/trending', h(async (req, res) => {
   const oldestRow = await db.get(`SELECT MIN(recorded_date) as d FROM track_streams_history WHERE recorded_date < CURRENT_DATE`);
   if (!oldestRow || !oldestRow.d) { return res.json({ tracks: [], reason: 'Historique insuffisant (moins de 2 jours de données réelles).' }); }
   const rows = await db.query(`
-    SELECT t.id, (t.streams - COALESCE(h.streams_snapshot, 0)) as velocity
+    SELECT t.id, (t.streams - COALESCE(h.streams_snapshot, 0)) as velocity, h.streams_snapshot as old_streams
     FROM tracks t
     JOIN track_streams_history h ON h.track_id = t.id AND h.recorded_date = $1
     WHERE t.streams > COALESCE(h.streams_snapshot, 0)
     ORDER BY velocity DESC
     LIMIT 15
   `, [oldestRow.d]);
-  res.json({ tracks: rows.map(r => ({ id: r.id, velocity: r.velocity })) });
+  res.json({ tracks: rows.map(r => ({
+    id: r.id, velocity: r.velocity,
+    // Vrai pourcentage — si le point de départ était à 0, la progression est "nouvelle"
+    // (jamais un pourcentage divisé par zéro, jamais un chiffre absurde ou inventé).
+    percent: r.old_streams > 0 ? Math.round((r.velocity / r.old_streams) * 100) : null,
+  })) });
 }));
 
 // ---------- Artistes à surveiller — même principe que NUNI Tendance, agrégé par artiste
