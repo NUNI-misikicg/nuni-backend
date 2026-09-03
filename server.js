@@ -1913,8 +1913,15 @@ async function activateAndNotify(user, plan, durationDays, promoCode) {
 app.get('/api/admin/playlists', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const playlists = await db.query('SELECT id, title, description, cover_url, created_at FROM playlists ORDER BY created_at DESC');
-  for (const p of playlists) {
-    p.track_ids = (await db.query('SELECT track_id FROM playlist_tracks WHERE playlist_id = $1 ORDER BY position', [p.id])).map((r) => r.track_id);
+  if(playlists.length){
+    const ids = playlists.map(p=>p.id);
+    const trackRows = await db.query('SELECT playlist_id, track_id FROM playlist_tracks WHERE playlist_id = ANY($1) ORDER BY playlist_id, position', [ids]);
+    const idsByPlaylist = new Map();
+    trackRows.forEach(r=>{
+      if(!idsByPlaylist.has(r.playlist_id)) idsByPlaylist.set(r.playlist_id, []);
+      idsByPlaylist.get(r.playlist_id).push(r.track_id);
+    });
+    for (const p of playlists) p.track_ids = idsByPlaylist.get(p.id) || [];
   }
   res.json({ playlists });
 }));
@@ -2025,14 +2032,20 @@ app.get('/api/playlists/:id', h(async (req, res) => {
 // via user_id, avec vérification systématique du propriétaire avant toute modification). ----------
 app.get('/api/me/playlists', authMiddleware, h(async (req, res) => {
   const playlists = await db.query('SELECT id, title, created_at FROM user_playlists WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
-  for (const p of playlists) {
-    const countRow = await db.get('SELECT COUNT(*)::int as c FROM user_playlist_tracks WHERE playlist_id = $1', [p.id]);
-    p.track_count = countRow.c;
-    const firstCover = await db.get(`
-      SELECT t.cover_url FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id
-      WHERE upt.playlist_id = $1 ORDER BY upt.added_at LIMIT 1
-    `, [p.id]);
-    p.cover_url = firstCover ? firstCover.cover_url : null;
+  if(playlists.length){
+    const ids = playlists.map(p=>p.id);
+    const countRows = await db.query('SELECT playlist_id, COUNT(*)::int as c FROM user_playlist_tracks WHERE playlist_id = ANY($1) GROUP BY playlist_id', [ids]);
+    const countByPlaylist = new Map(countRows.map(r=>[r.playlist_id, r.c]));
+    const coverRows = await db.query(`
+      SELECT DISTINCT ON (upt.playlist_id) upt.playlist_id, t.cover_url
+      FROM user_playlist_tracks upt JOIN tracks t ON t.id = upt.track_id
+      WHERE upt.playlist_id = ANY($1) ORDER BY upt.playlist_id, upt.added_at
+    `, [ids]);
+    const coverByPlaylist = new Map(coverRows.map(r=>[r.playlist_id, r.cover_url]));
+    for (const p of playlists) {
+      p.track_count = countByPlaylist.get(p.id) || 0;
+      p.cover_url = coverByPlaylist.get(p.id) || null;
+    }
   }
   res.json({ playlists });
 }));
