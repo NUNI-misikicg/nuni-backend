@@ -872,6 +872,33 @@ async function initSchema() {
     WHERE tc.role = 'primary'
       AND NOT EXISTS (SELECT 1 FROM collaboration_terms ct WHERE ct.collaborator_id = tc.id);
   `);
+
+  // ---------- Pochettes déjà publiées — passage au cadrage "sans rognage" ----------
+  // Avant (voir publishRelease dans app.js) : chaque pochette de morceau était envoyée à
+  // Cloudinary avec c_fill,g_auto,w_1000,h_1000 — un recadrage qui DEVINE le sujet principal
+  // et coupe le reste pour remplir le carré. Résultat réel observé : une partie de la vraie
+  // pochette de l'artiste disparaissait (bords rognés), au lieu d'être entièrement visible.
+  // Remplacé par c_pad,b_auto : redimensionne la pochette ENTIÈRE pour qu'elle tienne dans le
+  // carré sans rien couper, complète l'espace restant avec un fond généré depuis l'image
+  // elle-même. Cloudinary interprète les transformations directement dans l'URL — inutile de
+  // ré-uploader quoi que ce soit, un simple remplacement de texte dans l'URL déjà stockée
+  // suffit à appliquer le nouveau cadrage à toutes les pochettes déjà publiées, rétroactivement.
+  // Idempotent (le WHERE ne matche plus une fois déjà remplacé) — sûr à exécuter à chaque démarrage.
+  await pool.query(`
+    UPDATE tracks
+    SET cover_url = replace(cover_url, '/upload/c_fill,g_auto,w_1000,h_1000,q_auto/', '/upload/c_pad,b_auto,w_1000,h_1000,q_auto/')
+    WHERE cover_url LIKE '%/upload/c_fill,g_auto,w_1000,h_1000,q_auto/%';
+  `);
+  // Pochettes de playlists NUNI (admin.html) : avant, aucun cadrage n'était appliqué du tout
+  // (URL Cloudinary brute) — entièrement dépendantes du CSS pour rogner. On applique le même
+  // cadrage sans rognage, uniquement aux URLs qui n'ont encore AUCUNE transformation
+  // (jamais touché à une URL qui en porte déjà une, pour ne rien appliquer deux fois).
+  await pool.query(`
+    UPDATE playlists
+    SET cover_url = replace(cover_url, '/upload/', '/upload/c_pad,b_auto,w_1000,h_1000,q_auto/')
+    WHERE cover_url LIKE 'https://res.cloudinary.com/%/upload/%'
+      AND cover_url NOT LIKE '%/upload/c\\_%' ESCAPE '\\';
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };

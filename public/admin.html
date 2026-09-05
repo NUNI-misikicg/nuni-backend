@@ -83,7 +83,7 @@
   .pill.pending{background:var(--gold-soft); color:var(--gold);}
   .pill.expired{background:var(--red-soft); color:#f29a9a;}
   .urgent{color:#ff9a9d; font-weight:700;}
-  .cover-thumb{width:44px; height:44px; border-radius:0; background-size:cover; background-position:center; background-color:#1b1f33;} /* pochette = carré, 0 arrondi (2026-09-05) */
+  .cover-thumb{width:44px; height:44px; border-radius:8px; background-size:cover; background-position:center; background-color:#1b1f33;}
 
   /* ---------- Dashboard ---------- */
   .stat-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:14px; margin-bottom:16px;}
@@ -1574,7 +1574,11 @@
         const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${sig.cloudName}/image/upload`, { method:'POST', body: form });
         const cloudData = await cloudRes.json();
         if(!cloudRes.ok){ status.innerHTML = '<span class="urgent">❌ Envoi de la pochette refusé.</span>'; return; }
-        coverUrl = cloudData.secure_url;
+        // Cadrage carré sans rognage (2026-09-05, même règle que les pochettes de morceaux
+        // côté site) : c_pad recentre et redimensionne la pochette ENTIÈRE dans 1000×1000
+        // sans en couper aucune partie, b_auto complète l'espace restant avec un fond généré
+        // à partir de l'image elle-même.
+        coverUrl = cloudData.secure_url.replace('/upload/', '/upload/c_pad,b_auto,w_1000,h_1000,q_auto/');
       }
 
       const body = JSON.stringify({ title, description: desc || null, coverUrl, trackIds: plSelectedTracks.map(t=>t.id) });
