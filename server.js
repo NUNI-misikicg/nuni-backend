@@ -2324,6 +2324,10 @@ app.put('/api/artist/momo', authMiddleware, h(async (req, res) => {
 // Maintenant : uniquement une vraie URL Cloudinary (isCloudinaryUrl, définie plus haut avec
 // uploadIfDataUri), cohérente avec le seul vrai chemin d'upload de l'app.
 
+// ---------- Photo de profil — malgré le nom de la route (historique), utilisée par TOUS
+// les types de compte (artiste ET auditeur) pour changer leur propre photo. Volontairement
+// aucune restriction de type de compte ici, contrairement à /api/artist/banner juste en
+// dessous — ne jamais en ajouter une sans vérifier d'abord les vrais appelants côté client. ----------
 app.put('/api/artist/avatar', authMiddleware, h(async (req, res) => {
   const { avatarUrl } = req.body;
   if (!isCloudinaryUrl(avatarUrl)) return res.status(400).json({ error: 'URL de photo invalide.' });
