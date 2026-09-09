@@ -899,6 +899,60 @@ async function initSchema() {
     WHERE cover_url LIKE 'https://res.cloudinary.com/%/upload/%'
       AND cover_url NOT LIKE '%/upload/c\\_%' ESCAPE '\\';
   `);
+
+  // ============================================================
+  // SYSTÈME ANTI-FRAUDE — fondation (score de confiance + signalements)
+  // STRICTEMENT ADDITIF, même logique que le système de collaborations
+  // plus haut :
+  //   - plays et sa contrainte d'unicité restent inchangés
+  //   - tracks.streams et son incrémentation restent inchangés
+  //   - computeArtistPayout() n'est pas touchée par cette migration
+  // Réversible : DROP de fraud_flags + les 2 colonnes ajoutées, sans
+  // laisser aucune trace sur l'existant.
+  // ============================================================
+
+  // ip_address / device_fingerprint : capturés au moment du stream réel
+  // (voir POST /api/tracks/:id/play). Avant cette migration, plays ne
+  // gardait aucune trace de l'origine technique d'une écoute — impossible
+  // de distinguer un vrai auditeur d'un ensemble de faux comptes créés
+  // depuis le même appareil pour gonfler artificiellement des streams.
+  await pool.query(`ALTER TABLE plays ADD COLUMN IF NOT EXISTS ip_address TEXT;`);
+  await pool.query(`ALTER TABLE plays ADD COLUMN IF NOT EXISTS device_fingerprint TEXT;`);
+
+  // Score de confiance du compte — descend automatiquement quand des
+  // signalements s'accumulent (voir flagSuspiciousPlayPatterns dans
+  // server.js), remonte manuellement seulement par une revue admin.
+  // 100 = confiance maximale par défaut, jamais négatif.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trust_score NUMERIC(5,2) NOT NULL DEFAULT 100;`);
+
+  // Signalements — jamais un blocage automatique du compte lui-même :
+  // seul le score descend, et une file d'attente 'open' est constituée
+  // pour une revue humaine (voir GET/POST /api/admin/fraud/flags dans
+  // server.js). Un signalement ne supprime ni ne corrige aucun stream
+  // déjà compté — il documente un doute, à trancher par une personne.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS fraud_flags (
+      id SERIAL PRIMARY KEY,
+      subject_type TEXT NOT NULL CHECK(subject_type IN ('user','track')),
+      subject_id INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'medium' CHECK(severity IN ('low','medium','high')),
+      detail_json JSONB,
+      status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','reviewed','dismissed')),
+      reviewed_by INTEGER REFERENCES users(id),
+      review_note TEXT,
+      detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_fraud_flags_subject ON fraud_flags(subject_type, subject_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_fraud_flags_open ON fraud_flags(status) WHERE status = 'open';`);
+  // Un même motif ne doit pas créer 50 signalements identiques par jour pour le même compte —
+  // un signalement 'open' pour un (subject, reason) donné suffit tant qu'il n'a pas été traité.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_fraud_flags_unique_open
+    ON fraud_flags(subject_type, subject_id, reason) WHERE status = 'open';
+  `);
 }
 
 module.exports = { pool, query, get, run, initSchema };

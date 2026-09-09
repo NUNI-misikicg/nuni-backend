@@ -2112,6 +2112,107 @@ function checkAdminKey(req, res) {
   return true;
 }
 
+// ============================================================
+// ANTI-FRAUDE — détection de patterns suspects (voir fraud_flags dans db.js).
+// Volontairement SIMPLE et LISIBLE plutôt qu'un vrai moteur de scoring
+// complexe : deux règles concrètes, chacune vérifiable à la main par
+// l'équipe NUNI dans fraud_flags.detail_json. À enrichir avec de vraies
+// règles supplémentaires une fois ces deux-là observées en production.
+// Ne bloque jamais un compte automatiquement — descend seulement
+// trust_score et ouvre un signalement pour revue humaine (voir les
+// endpoints /api/admin/fraud/* plus bas).
+// ============================================================
+const FRAUD_DEVICE_ACCOUNTS_THRESHOLD = 5;   // comptes distincts depuis un même appareil, sur 24h
+const FRAUD_IP_ACCOUNTS_THRESHOLD = 8;       // comptes distincts depuis une même IP, sur 24h
+const FRAUD_TRUST_SCORE_PENALTY = 15;
+
+async function openFraudFlag(subjectType, subjectId, reason, severity, detail) {
+  const inserted = await db.run(
+    `INSERT INTO fraud_flags (subject_type, subject_id, reason, severity, detail_json)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (subject_type, subject_id, reason) WHERE status = 'open' DO NOTHING
+     RETURNING id`,
+    [subjectType, subjectId, reason, severity, JSON.stringify(detail || {})],
+  );
+  if (inserted.rowCount && subjectType === 'user') {
+    await db.run(
+      `UPDATE users SET trust_score = GREATEST(0, trust_score - $2) WHERE id = $1`,
+      [subjectId, FRAUD_TRUST_SCORE_PENALTY],
+    );
+  }
+}
+
+async function flagSuspiciousPlayPatterns(deviceFingerprint, ipAddress, listenerId) {
+  if (deviceFingerprint) {
+    const row = await db.get(
+      `SELECT COUNT(DISTINCT listener_id)::int AS n, array_agg(DISTINCT listener_id) AS ids
+       FROM plays WHERE device_fingerprint = $1 AND created_at >= NOW() - INTERVAL '24 hours'
+         AND listener_id IS NOT NULL`,
+      [deviceFingerprint],
+    );
+    if (row && row.n >= FRAUD_DEVICE_ACCOUNTS_THRESHOLD) {
+      await openFraudFlag('user', listenerId, 'multi_account_same_device', 'high', {
+        device_fingerprint: deviceFingerprint, distinct_accounts_24h: row.n,
+      });
+    }
+  }
+  if (ipAddress) {
+    const row = await db.get(
+      `SELECT COUNT(DISTINCT listener_id)::int AS n
+       FROM plays WHERE ip_address = $1 AND created_at >= NOW() - INTERVAL '24 hours'
+         AND listener_id IS NOT NULL`,
+      [ipAddress],
+    );
+    if (row && row.n >= FRAUD_IP_ACCOUNTS_THRESHOLD) {
+      await openFraudFlag('user', listenerId, 'multi_account_same_ip', 'medium', {
+        ip_address: ipAddress, distinct_accounts_24h: row.n,
+      });
+    }
+  }
+}
+
+// ---------- Revue anti-fraude (admin) ----------
+// Liste des signalements en attente, du plus récent au plus ancien. Ne renvoie jamais
+// l'IP/l'appareil bruts dans une réponse publique — cette route est protégée par la clé admin.
+app.get('/api/admin/fraud/flags', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const status = ['open', 'reviewed', 'dismissed'].includes(req.query.status) ? req.query.status : 'open';
+  const flags = await db.query(
+    `SELECT ff.*, u.email AS subject_email, u.first_name, u.last_name, u.trust_score
+     FROM fraud_flags ff
+     LEFT JOIN users u ON u.id = ff.subject_id AND ff.subject_type = 'user'
+     WHERE ff.status = $1
+     ORDER BY ff.detected_at DESC LIMIT 200`,
+    [status],
+  );
+  res.json({ flags });
+}));
+
+// Trancher un signalement : 'reviewed' (fraude confirmée, le score reste diminué) ou
+// 'dismissed' (faux positif — restaure le score retiré par ce signalement précis).
+app.post('/api/admin/fraud/flags/:id/resolve', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const { decision, note } = req.body || {};
+  if (!['reviewed', 'dismissed'].includes(decision)) {
+    return res.status(400).json({ error: "decision doit être 'reviewed' ou 'dismissed'." });
+  }
+  const flag = await db.get('SELECT * FROM fraud_flags WHERE id = $1', [req.params.id]);
+  if (!flag) return res.status(404).json({ error: 'Signalement introuvable.' });
+  if (flag.status !== 'open') return res.status(400).json({ error: 'Ce signalement a déjà été traité.' });
+
+  await db.run(
+    `UPDATE fraud_flags SET status = $2, review_note = $3, reviewed_at = NOW() WHERE id = $1`,
+    [flag.id, decision, note || null],
+  );
+  if (decision === 'dismissed' && flag.subject_type === 'user') {
+    await db.run(
+      `UPDATE users SET trust_score = LEAST(100, trust_score + $2) WHERE id = $1`,
+      [flag.subject_id, FRAUD_TRUST_SCORE_PENALTY],
+    );
+  }
+  res.json({ resolved: true });
+}));
+
 // ---------- Accès réel au streaming (correctif sécurité) ----------
 // Avant : GET /api/tracks et GET /api/playlists/:id étaient entièrement publics et
 // renvoyaient audio_url (le vrai lien Cloudinary du morceau) à N'IMPORTE QUELLE requête —
@@ -2789,14 +2890,22 @@ app.post('/api/tracks/:id/play', rateLimit(30, 60000), h(async (req, res) => {
   // Insertion atomique (la base garantit maintenant l'unicité track_id+listener_id) — plus de
   // vérification séparée avant l'insertion, qui laissait une petite fenêtre pour compter deux
   // fois la même écoute en cas de requêtes simultanées.
+  // ip_address / device_fingerprint : capturés uniquement pour la détection anti-fraude
+  // (voir flagSuspiciousPlayPatterns plus bas) — ne changent rien au comptage du stream
+  // lui-même, ni à la rémunération de l'artiste, qui restent exactement comme avant.
+  const ipAddress = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
+  const deviceFingerprint = (req.headers['x-device-id'] || '').trim() || null;
   const inserted = await db.run(
-    'INSERT INTO plays (track_id, listener_id) VALUES ($1,$2) ON CONFLICT (track_id, listener_id) WHERE listener_id IS NOT NULL DO NOTHING',
-    [trackId, listenerId],
+    'INSERT INTO plays (track_id, listener_id, ip_address, device_fingerprint) VALUES ($1,$2,$3,$4) ON CONFLICT (track_id, listener_id) WHERE listener_id IS NOT NULL DO NOTHING',
+    [trackId, listenerId, ipAddress, deviceFingerprint],
   );
   if (!inserted.rowCount) {
     return res.json({ counted: false, reason: 'Déjà compté lors de votre première écoute de ce morceau.', streams: track.streams });
   }
   await db.run('UPDATE tracks SET streams = streams + 1 WHERE id = $1', [trackId]);
+  // Jamais bloquant pour l'auditeur (pas d'attente, pas d'échec renvoyé si la détection
+  // plante) — la détection est un signal pour l'équipe NUNI, jamais un blocage en direct.
+  flagSuspiciousPlayPatterns(deviceFingerprint, ipAddress, listenerId).catch(() => {});
   // Le vrai stream ci-dessus compte toujours pour la rémunération de l'artiste, sans plafond —
   // seule la RÉCOMPENSE de gamification (XP/points/défis) est limitée à 40 écoutes par jour,
   // pour empêcher un script d'enchaîner des écoutes en boucle uniquement pour farmer de l'XP.
