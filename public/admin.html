@@ -189,6 +189,7 @@
       <div class="nav-group-label">Paiements artistes</div>
       <button class="tab-btn" data-tab="payouts"><span class="tab-icon">💸</span> Reversements</button>
       <button class="tab-btn" data-tab="collab-disputes"><span class="tab-icon">🤝</span> Litiges collaborations</button>
+      <button class="tab-btn" data-tab="fraud"><span class="tab-icon">🛡️</span> Anti-fraude</button>
     </div>
 
     <div class="nav-group">
@@ -444,6 +445,32 @@
       <button class="primary" style="margin-top:12px;" onclick="loadCollabDisputes()">Charger la file</button>
     </div>
     <div id="collab-disputes-list" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="pane" id="pane-fraud">
+    <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🛡️ Anti-fraude — signalements en attente</b>
+      <div class="muted" style="margin-top:4px;">
+        Un signalement ne bloque jamais un compte automatiquement — il diminue seulement son score de confiance
+        et attend une vraie décision humaine ici. « Fraude confirmée » laisse le score diminué. « Faux positif »
+        restaure les points retirés par ce signalement précis.
+      </div>
+      <button class="primary" style="margin-top:12px;" onclick="loadFraudFlags()">Charger les signalements</button>
+    </div>
+    <div id="fraud-flags-list" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- ===== Anti-fraude — modal de résolution d'un signalement ===== -->
+  <div id="fraud-resolve-modal" style="display:none; position:fixed; inset:0; z-index:200; background:rgba(0,0,0,.6); align-items:center; justify-content:center;" onclick="if(event.target===this) closeFraudResolveModal()">
+    <div class="card" style="max-width:480px; width:92%;">
+      <div id="fraud-resolve-body"></div>
+      <div id="fraud-resolve-msg" style="margin-top:10px; font-size:13px;"></div>
+      <div style="margin-top:16px; display:flex; flex-wrap:wrap; gap:8px;">
+        <button class="secondary" onclick="promptFraudResolve('dismissed')">✅ Faux positif — restaurer le score</button>
+        <button class="secondary" style="color:#ff9a9d;" onclick="promptFraudResolve('reviewed')">🔴 Fraude confirmée — laisser le score diminué</button>
+        <button class="secondary" onclick="closeFraudResolveModal()">Fermer</button>
+      </div>
+    </div>
   </div>
 
   <!-- ===== N2 — modal de résolution d'un dossier ===== -->
@@ -1838,6 +1865,96 @@
       if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
       msg.innerHTML = '<span style="color:#7ee6a8;">✅ Accord définitivement rejeté.</span>';
       setTimeout(()=>{ closeCollabResolveModal(); loadCollabDisputes(); }, 900);
+    }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  // ============================================================
+  // ANTI-FRAUDE — file des signalements + résolution (voir fraud_flags
+  // dans db.js et /api/admin/fraud/flags dans server.js). Même logique
+  // que les litiges de collaboration ci-dessus : rien n'est recalculé
+  // ici, seulement affiché et tranché.
+  // ============================================================
+  const fraudSeverityLabels = {
+    high: '<span class="pill" style="background:rgba(242,85,90,.16); color:#ff9a9d;">🔴 Élevée</span>',
+    medium: '<span class="pill pending">🟡 Moyenne</span>',
+    low: '<span class="pill" style="background:rgba(255,255,255,.06); color:#B8AA96;">⚪ Faible</span>',
+  };
+  const fraudReasonLabels = {
+    multi_account_same_device: 'Plusieurs comptes depuis le même appareil',
+    multi_account_same_ip: 'Plusieurs comptes depuis la même IP',
+  };
+  let fraudResolveTarget = null;
+
+  async function loadFraudFlags(){
+    const wrap = document.getElementById('fraud-flags-list');
+    wrap.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/fraud/flags?status=open', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ wrap.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      const flags = data.flags || [];
+      if(!flags.length){ wrap.innerHTML = '<p class="muted">Aucun signalement en attente pour le moment.</p>'; return; }
+      let html = '<table><tr><th>Compte</th><th>Motif</th><th>Gravité</th><th>Score de confiance</th><th>Détecté le</th><th></th></tr>';
+      flags.forEach(f=>{
+        const who = f.subject_type === 'user'
+          ? (f.subject_email ? `${esc(f.first_name||'')} ${esc(f.last_name||'')} <span class="muted">(${esc(f.subject_email)})</span>` : `Utilisateur #${f.subject_id}`)
+          : `Morceau #${f.subject_id}`;
+        html += `<tr>
+          <td>${who}</td>
+          <td>${fraudReasonLabels[f.reason] || esc(f.reason)}</td>
+          <td>${fraudSeverityLabels[f.severity] || esc(f.severity)}</td>
+          <td>${f.trust_score != null ? Number(f.trust_score).toFixed(0) + ' / 100' : '—'}</td>
+          <td class="muted">${new Date(f.detected_at).toLocaleString('fr-FR')}</td>
+          <td><button class="secondary" onclick='openFraudResolveModal(${JSON.stringify(f).replace(/'/g, "&#39;")})'>Examiner</button></td>
+        </tr>`;
+      });
+      html += '</table>';
+      wrap.innerHTML = html;
+    }catch(e){ wrap.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
+
+  function openFraudResolveModal(flag){
+    fraudResolveTarget = flag;
+    const who = flag.subject_type === 'user'
+      ? (flag.subject_email ? `${esc(flag.first_name||'')} ${esc(flag.last_name||'')} (${esc(flag.subject_email)})` : `Utilisateur #${flag.subject_id}`)
+      : `Morceau #${flag.subject_id}`;
+    const body = document.getElementById('fraud-resolve-body');
+    body.innerHTML = `
+      <b style="color:#D4AF6A; font-size:14px;">🛡️ Signalement #${flag.id}</b>
+      <div class="muted" style="margin-top:4px;">${who}</div>
+      <div style="margin-top:14px; display:flex; flex-direction:column; gap:6px; font-size:13px;">
+        <div><b>Motif :</b> ${fraudReasonLabels[flag.reason] || esc(flag.reason)}</div>
+        <div><b>Gravité :</b> ${fraudSeverityLabels[flag.severity] || esc(flag.severity)}</div>
+        <div><b>Score de confiance actuel :</b> ${flag.trust_score != null ? Number(flag.trust_score).toFixed(0) + ' / 100' : '—'}</div>
+        <div><b>Détecté le :</b> ${new Date(flag.detected_at).toLocaleString('fr-FR')}</div>
+        <div><b>Détail technique :</b> <code style="font-size:11px; color:#B8AA96;">${esc(JSON.stringify(flag.detail_json || {}))}</code></div>
+      </div>`;
+    document.getElementById('fraud-resolve-msg').innerHTML = '';
+    document.getElementById('fraud-resolve-modal').style.display = 'flex';
+  }
+  function closeFraudResolveModal(){
+    document.getElementById('fraud-resolve-modal').style.display = 'none';
+    fraudResolveTarget = null;
+  }
+
+  function promptFraudResolve(decision){
+    if(!fraudResolveTarget) return;
+    const label = decision === 'dismissed' ? 'faux positif (restaure le score)' : 'fraude confirmée (score laissé diminué)';
+    const note = prompt(`Note de résolution pour ce signalement (${label}) — optionnelle :`, '') || '';
+    if(!confirm(`Confirmer : ${label} ?`)) return;
+    resolveFraud(decision, note.trim() || null);
+  }
+  async function resolveFraud(decision, note){
+    const msg = document.getElementById('fraud-resolve-msg');
+    try{
+      const res = await fetch('/api/admin/fraud/flags/' + fraudResolveTarget.id + '/resolve', {
+        method:'POST', headers:{'Content-Type':'application/json','x-admin-key':getKey()},
+        body: JSON.stringify({ decision, note }),
+      });
+      const data = await res.json();
+      if(!res.ok){ msg.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      msg.innerHTML = '<span style="color:#7ee6a8;">✅ Signalement traité.</span>';
+      setTimeout(()=>{ closeFraudResolveModal(); loadFraudFlags(); }, 900);
     }catch(e){ msg.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
   }
 
