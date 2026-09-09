@@ -999,6 +999,43 @@ async function requireValidatedLabel(req, res, minRole = 'assistant') {
   return { ...label, myRole };
 }
 
+// ---------- Alertes roster — relie le score de confiance (anti-fraude) et les litiges de
+// collaboration à la vue Label. N'invente rien : agrège des lignes déjà existantes dans
+// fraud_flags et collaboration_disputes, ne recalcule aucun montant. Jamais un blocage —
+// seulement un signal visuel dans la liste des artistes (voir label-artists-list côté front).
+app.get('/api/label/alerts', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT
+      u.id AS artist_id,
+      -- Litiges de collaboration ouverts sur un morceau où cet artiste est impliqué
+      COALESCE((
+        SELECT COUNT(DISTINCT cd.id)::int
+        FROM collaboration_disputes cd
+        JOIN collaboration_terms ct ON ct.id = cd.collaboration_terms_id
+        JOIN track_collaborators tc ON tc.id = ct.collaborator_id
+        WHERE tc.artist_id = u.id AND cd.status = 'open'
+      ), 0) AS open_disputes_count,
+      -- Écoutes des 30 derniers jours sur ses morceaux, venant d'un compte auditeur
+      -- actuellement signalé (fraud_flags ouvert) — un signal d'alerte, jamais une accusation
+      -- portée sur l'artiste lui-même : ces comptes peuvent tout autant être de faux fans
+      -- recrutés sans le savoir par un tiers que de la triche organisée.
+      COALESCE((
+        SELECT COUNT(*)::int
+        FROM plays p
+        JOIN tracks t ON t.id = p.track_id
+        JOIN fraud_flags ff ON ff.subject_type = 'user' AND ff.subject_id = p.listener_id AND ff.status = 'open'
+        WHERE t.artist_id = u.id AND p.created_at >= NOW() - INTERVAL '30 days'
+      ), 0) AS flagged_listener_streams_30d,
+      u.trust_score AS artist_trust_score
+    FROM label_artists la
+    JOIN users u ON u.id = la.artist_id
+    WHERE la.label_id = $1 AND la.status != 'removed'
+  `, [label.id]);
+  res.json({ alerts: rows });
+}));
+
 // ---------- Liste des artistes gérés par le Label, avec leurs vraies stats ----------
 app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
   const label = await requireValidatedLabel(req, res, 'assistant');
