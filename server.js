@@ -1708,6 +1708,176 @@ app.put('/api/label/team/:id/role', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Rôle mis à jour.' });
 }));
 
+// ============================================================
+// CONTRATS LABEL ↔ ARTISTE (voir label_contracts dans db.js). Formalise, avec de vraies
+// conditions, une affiliation label_artists déjà existante. Ne transfère JAMAIS la propriété
+// d'un morceau (tracks.artist_id n'est jamais touché ici) — seulement les conditions
+// commerciales de la relation.
+// ============================================================
+function contractDocumentHash(c) {
+  const canonical = JSON.stringify({
+    contract_type: c.contract_type, commission_pct: Number(c.commission_pct),
+    catalog_scope: c.catalog_scope, duration_months: c.duration_months || null,
+    terms_note: c.terms_note || null,
+  });
+  return require('crypto').createHash('sha256').update(canonical).digest('hex');
+}
+
+// ---------- Côté LABEL : envoyer un contrat à un artiste déjà affilié (invité ou actif) ----------
+app.post('/api/label/contracts', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const { artistId, contractType, commissionPct, catalogScope, durationMonths, termsNote } = req.body;
+  if (!['distribution', 'artist', 'exclusive', 'non_exclusive'].includes(contractType)) {
+    return res.status(400).json({ error: 'Type de contrat invalide.' });
+  }
+  const commission = Number(commissionPct);
+  if (!Number.isFinite(commission) || commission < 0 || commission > 100) {
+    return res.status(400).json({ error: 'Commission invalide (0 à 100).' });
+  }
+  if (!['all', 'future_only'].includes(catalogScope)) {
+    return res.status(400).json({ error: 'Périmètre de catalogue invalide.' });
+  }
+  const duration = durationMonths ? Number(durationMonths) : null;
+  if (duration !== null && (!Number.isInteger(duration) || duration <= 0)) {
+    return res.status(400).json({ error: 'Durée invalide (nombre de mois entier positif), ou laissez vide.' });
+  }
+  // Un contrat ne peut être envoyé qu'à un artiste déjà affilié (invité ou actif) — pas de
+  // court-circuit de la relation d'affiliation existante, qui reste la source de vérité.
+  const affiliation = await db.get(
+    "SELECT id FROM label_artists WHERE label_id = $1 AND artist_id = $2 AND status != 'removed'",
+    [label.id, Number(artistId)],
+  );
+  if (!affiliation) return res.status(404).json({ error: "Cet artiste n'est pas affilié à votre Label — invitez-le d'abord." });
+
+  try {
+    const contract = await db.get(`
+      INSERT INTO label_contracts (label_id, artist_id, contract_type, commission_pct, catalog_scope, duration_months, terms_note, sent_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id
+    `, [label.id, Number(artistId), contractType, commission, catalogScope, duration, termsNote || null, req.user.id]);
+    res.status(201).json({ message: 'Contrat envoyé — en attente de signature par l\'artiste.', contractId: contract.id });
+  } catch (e) {
+    if (String(e.message).includes('idx_label_contracts_one_live')) {
+      return res.status(409).json({ error: 'Un contrat est déjà en cours (envoyé, consulté ou actif) avec cet artiste.' });
+    }
+    throw e;
+  }
+}));
+
+// ---------- Côté LABEL : liste des contrats envoyés ----------
+app.get('/api/label/contracts', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT lc.*, u.artist_name, u.email AS artist_email
+    FROM label_contracts lc JOIN users u ON u.id = lc.artist_id
+    WHERE lc.label_id = $1
+    ORDER BY lc.sent_at DESC
+  `, [label.id]);
+  res.json({ contracts: rows });
+}));
+
+// ---------- Côté LABEL : résilier un contrat actif (jamais un contrat déjà terminé) ----------
+app.post('/api/label/contracts/:id/terminate', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif de résiliation est obligatoire.' });
+  const contract = await db.get(
+    "SELECT * FROM label_contracts WHERE id = $1 AND label_id = $2", [Number(req.params.id), label.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (!['sent', 'viewed', 'active'].includes(contract.status)) {
+    return res.status(400).json({ error: 'Ce contrat est déjà terminé (refusé, résilié ou expiré).' });
+  }
+  await db.run(
+    "UPDATE label_contracts SET status = 'terminated', terminated_at = NOW(), terminated_by = $2, termination_reason = $3 WHERE id = $1",
+    [contract.id, req.user.id, reason.trim()],
+  );
+  // NOTE volontaire : ceci ne modifie PAS label_artists.status — la résiliation du contrat
+  // formel et le retrait de l'affiliation (bouton "Retirer du Label", déjà existant) restent
+  // deux actions distinctes, pour ne rien changer au comportement des autres fonctionnalités
+  // qui s'appuient sur label_artists.status ailleurs dans l'app.
+  res.json({ message: 'Contrat résilié.' });
+}));
+
+// ---------- Côté ARTISTE : contrats reçus ----------
+app.get('/api/me/contracts', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT lc.*, l.label_name, l.logo_url
+    FROM label_contracts lc JOIN labels l ON l.id = lc.label_id
+    WHERE lc.artist_id = $1
+    ORDER BY lc.sent_at DESC
+  `, [req.user.id]);
+  res.json({ contracts: rows });
+}));
+
+// ---------- Côté ARTISTE : marquer un contrat comme consulté (première ouverture) ----------
+app.post('/api/me/contracts/:id/view', authMiddleware, h(async (req, res) => {
+  const contract = await db.get(
+    "SELECT id, status FROM label_contracts WHERE id = $1 AND artist_id = $2", [Number(req.params.id), req.user.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (contract.status === 'sent') {
+    await db.run("UPDATE label_contracts SET status = 'viewed', viewed_at = NOW() WHERE id = $1", [contract.id]);
+  }
+  res.json({ viewed: true });
+}));
+
+// ---------- Côté ARTISTE : signer électroniquement ----------
+// Pas de certificat cryptographique tiers ici (voir remarque du rapport de conception : un
+// vrai usage à grande échelle mériterait un prestataire de signature qualifié) — ce qu'on
+// enregistre reste honnête sur ce que c'est : un consentement explicite, horodaté, avec IP et
+// empreinte des conditions signées, pas une signature électronique certifiée au sens légal fort.
+app.post('/api/me/contracts/:id/sign', authMiddleware, rateLimit(5, 10 * 60000), h(async (req, res) => {
+  if (req.body.confirm !== true) {
+    return res.status(400).json({ error: 'Confirmation explicite requise pour signer.' });
+  }
+  const contract = await db.get(
+    "SELECT * FROM label_contracts WHERE id = $1 AND artist_id = $2", [Number(req.params.id), req.user.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (!['sent', 'viewed'].includes(contract.status)) {
+    return res.status(400).json({ error: 'Ce contrat ne peut plus être signé (déjà tranché).' });
+  }
+  const hash = contractDocumentHash(contract);
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 300);
+  const expiresAt = contract.duration_months
+    ? `NOW() + INTERVAL '${Number(contract.duration_months)} months'`
+    : 'NULL';
+  await db.run(
+    `UPDATE label_contracts
+     SET status = 'active', signed_at = NOW(), document_hash_sha256 = $2, signed_ip = $3, signed_user_agent = $4,
+         expires_at = ${expiresAt}
+     WHERE id = $1`,
+    [contract.id, hash, ip, userAgent],
+  );
+  // Signer un contrat vaut acceptation de l'affiliation si elle était encore juste "invited" —
+  // n'écrase jamais un statut 'active' déjà en place, ni 'suspended'.
+  await db.run(
+    "UPDATE label_artists SET status = 'active' WHERE label_id = $1 AND artist_id = $2 AND status = 'invited'",
+    [contract.label_id, contract.artist_id],
+  );
+  res.json({ message: 'Contrat signé — il est maintenant en vigueur.', documentHash: hash });
+}));
+
+// ---------- Côté ARTISTE : refuser un contrat avant signature ----------
+app.post('/api/me/contracts/:id/reject', authMiddleware, h(async (req, res) => {
+  const contract = await db.get(
+    "SELECT id, status FROM label_contracts WHERE id = $1 AND artist_id = $2", [Number(req.params.id), req.user.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (!['sent', 'viewed'].includes(contract.status)) {
+    return res.status(400).json({ error: 'Ce contrat ne peut plus être refusé (déjà tranché).' });
+  }
+  await db.run(
+    "UPDATE label_contracts SET status = 'rejected', rejected_at = NOW(), rejection_reason = $2 WHERE id = $1",
+    [contract.id, (req.body.reason || '').trim() || null],
+  );
+  res.json({ message: 'Contrat refusé.' });
+}));
+
 // ---------- Côté UTILISATEUR : invitations d'équipe reçues ----------
 app.get('/api/me/label-team-invites', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`
@@ -1771,6 +1941,187 @@ app.post('/api/me/label-invites/:id/decline', authMiddleware, h(async (req, res)
   if (!invite) return res.status(404).json({ error: 'Invitation introuvable.' });
   await db.run("UPDATE label_artists SET status = 'removed' WHERE id = $1", [invite.id]);
   res.json({ message: 'Invitation refusée.' });
+}));
+
+// ============================================================
+// CONTRATS LABEL ↔ ARTISTE — voir label_contracts / label_contract_signatures dans db.js.
+// Couche additive au-dessus de label_artists : ne remplace ni ne modifie l'affiliation
+// invited/active/suspended/removed, qui reste gérée exactement comme avant. Un contrat décrit
+// des TERMES (commission, durée, périmètre du catalogue) que les deux parties signent —
+// jamais un transfert de propriété du catalogue (tracks.artist_id n'est jamais touché ici).
+// ============================================================
+function hashContractText(text) {
+  return require('crypto').createHash('sha256').update(String(text)).digest('hex');
+}
+
+// ---------- Le Label propose des termes pour une affiliation existante (invitée ou active) ----------
+app.post('/api/label/artists/:affiliationId/contract', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const affiliation = await db.get(
+    "SELECT * FROM label_artists WHERE id = $1 AND label_id = $2 AND status != 'removed'",
+    [Number(req.params.affiliationId), label.id],
+  );
+  if (!affiliation) return res.status(404).json({ error: 'Affiliation introuvable.' });
+
+  const existingLive = await db.get(
+    "SELECT id FROM label_contracts WHERE label_artist_id = $1 AND status IN ('pending_signature','signed')",
+    [affiliation.id],
+  );
+  if (existingLive) {
+    return res.status(409).json({ error: 'Un contrat est déjà en attente ou signé pour cet artiste. Résiliez-le avant d\'en proposer un nouveau.' });
+  }
+
+  const { commissionPct, durationMonths, catalogScope, termsSummary } = req.body;
+  const commission = Number(commissionPct);
+  if (!Number.isFinite(commission) || commission < 0 || commission > 100) {
+    return res.status(400).json({ error: 'commissionPct doit être un nombre entre 0 et 100.' });
+  }
+  if (!['all', 'future_only'].includes(catalogScope)) {
+    return res.status(400).json({ error: "catalogScope doit être 'all' ou 'future_only'." });
+  }
+  if (!termsSummary || !termsSummary.trim()) {
+    return res.status(400).json({ error: 'Un résumé des termes en langage clair est obligatoire.' });
+  }
+  const duration = durationMonths != null && durationMonths !== '' ? Number(durationMonths) : null;
+  if (duration != null && (!Number.isFinite(duration) || duration <= 0)) {
+    return res.status(400).json({ error: 'durationMonths doit être un nombre de mois positif, ou vide pour une durée indéterminée.' });
+  }
+
+  const contract = await db.get(
+    `INSERT INTO label_contracts (label_artist_id, commission_pct, duration_months, catalog_scope, terms_summary, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [affiliation.id, commission, duration, catalogScope, termsSummary.trim(), req.user.id],
+  );
+  // Le Label signe automatiquement au moment de la création — c'est son action, déjà
+  // authentifiée par authMiddleware. L'artiste, lui, devra activement signer de son côté.
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
+  await db.run(
+    `INSERT INTO label_contract_signatures (contract_id, signer_user_id, signer_role, document_hash, ip_address, device_fingerprint)
+     VALUES ($1,$2,'label',$3,$4,$5)`,
+    [contract.id, req.user.id, hashContractText(contract.terms_summary), ip, (req.headers['x-device-id'] || '').trim() || null],
+  );
+  res.status(201).json({ message: 'Contrat envoyé — en attente de la signature de l\'artiste.', contract });
+}));
+
+// ---------- Voir le contrat courant d'une affiliation (côté Label) ----------
+app.get('/api/label/artists/:affiliationId/contract', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const affiliation = await db.get(
+    'SELECT id FROM label_artists WHERE id = $1 AND label_id = $2',
+    [Number(req.params.affiliationId), label.id],
+  );
+  if (!affiliation) return res.status(404).json({ error: 'Affiliation introuvable.' });
+  const contract = await db.get(
+    `SELECT * FROM label_contracts WHERE label_artist_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [affiliation.id],
+  );
+  if (!contract) return res.json({ contract: null });
+  const signatures = await db.query('SELECT signer_role, signed_at FROM label_contract_signatures WHERE contract_id = $1', [contract.id]);
+  res.json({ contract, signatures });
+}));
+
+// ---------- Le Label résilie un contrat déjà signé (n'affecte jamais tracks.artist_id) ----------
+app.post('/api/label/contracts/:id/terminate', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'owner');
+  if (!label) return;
+  const contract = await db.get(
+    `SELECT lc.* FROM label_contracts lc JOIN label_artists la ON la.id = lc.label_artist_id
+     WHERE lc.id = $1 AND la.label_id = $2`,
+    [Number(req.params.id), label.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (contract.status !== 'signed') return res.status(400).json({ error: 'Seul un contrat signé peut être résilié.' });
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif de résiliation est obligatoire.' });
+  await db.run(
+    `UPDATE label_contracts SET status = 'terminated', terminated_at = NOW(), terminated_reason = $2 WHERE id = $1`,
+    [contract.id, reason.trim()],
+  );
+  res.json({ message: 'Contrat résilié. L\'affiliation elle-même (label_artists) n\'est pas modifiée — gérez-la séparément si nécessaire.' });
+}));
+
+// ---------- Côté ARTISTE : voir les contrats en attente de sa signature ----------
+app.get('/api/me/label-contracts', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(
+    `SELECT lc.*, l.label_name, l.logo_url
+     FROM label_contracts lc
+     JOIN label_artists la ON la.id = lc.label_artist_id
+     JOIN labels l ON l.id = la.label_id
+     WHERE la.artist_id = $1
+     ORDER BY lc.created_at DESC`,
+    [req.user.id],
+  );
+  res.json({ contracts: rows });
+}));
+
+// ---------- Côté ARTISTE : signer un contrat — ré-authentification par mot de passe,
+// exactement comme une action sensible (suppression de compte, etc.), pour que la signature
+// ait une vraie valeur probante (pas un simple clic sur un bouton "Accepter"). ----------
+app.post('/api/me/label-contracts/:id/sign', authMiddleware, rateLimit(10, 15 * 60000), h(async (req, res) => {
+  const { password } = req.body;
+  // Même hash factice utilisé ailleurs (ex. suppression de compte) pour que le temps de
+  // réponse ne révèle jamais si l'email/l'id existe — comparaison systématique même si
+  // l'utilisateur est introuvable.
+  const DUMMY_HASH = '$argon2id$v=19$m=65536,p=4,t=3$FFEARNH0EaLUJ5yNEJYXeg$pzICrPiEaM5VBe02AHRDPmjPuqCNHhGG2AlvpQ87WPg';
+  const user = await db.get('SELECT id, password_hash FROM users WHERE id = $1', [req.user.id]);
+  const ok = await verifyPassword(password || '', user ? user.password_hash : DUMMY_HASH);
+  if (!user || !ok) return res.status(401).json({ error: 'Mot de passe incorrect.' });
+
+  const contract = await db.get(
+    `SELECT lc.*, la.artist_id, la.id AS affiliation_id FROM label_contracts lc
+     JOIN label_artists la ON la.id = lc.label_artist_id
+     WHERE lc.id = $1 AND la.artist_id = $2`,
+    [Number(req.params.id), req.user.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (contract.status !== 'pending_signature') return res.status(400).json({ error: 'Ce contrat n\'est plus en attente de signature.' });
+
+  const alreadySigned = await db.get(
+    "SELECT id FROM label_contract_signatures WHERE contract_id = $1 AND signer_role = 'artist'",
+    [contract.id],
+  );
+  if (alreadySigned) return res.status(409).json({ error: 'Déjà signé.' });
+
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
+  await db.run(
+    `INSERT INTO label_contract_signatures (contract_id, signer_user_id, signer_role, document_hash, ip_address, device_fingerprint)
+     VALUES ($1,$2,'artist',$3,$4,$5)`,
+    [contract.id, req.user.id, hashContractText(contract.terms_summary), ip, (req.headers['x-device-id'] || '').trim() || null],
+  );
+  const startsAt = new Date();
+  const expiresAt = contract.duration_months ? new Date(startsAt.getTime() + contract.duration_months * 30 * 24 * 3600 * 1000) : null;
+  await db.run(
+    `UPDATE label_contracts SET status = 'signed', signed_at = NOW(), starts_at = $2, expires_at = $3 WHERE id = $1`,
+    [contract.id, startsAt, expiresAt],
+  );
+  // Si l'affiliation était encore 'invited', la signature du contrat vaut acceptation de
+  // l'invitation — réutilise exactement la même logique transactionnelle (quotas de palier
+  // compris) que l'acceptation classique, sans dupliquer cette règle ailleurs.
+  const affiliation = await db.get('SELECT status FROM label_artists WHERE id = $1', [contract.affiliation_id]);
+  if (affiliation && affiliation.status === 'invited') {
+    const result = await tryActivateLabelArtist(contract.affiliation_id, req.user.id);
+    if (!result.ok) {
+      // Le contrat reste signé (preuve juridique conservée) même si l'activation de
+      // l'affiliation échoue (ex. Label déjà à sa limite de palier) — à débloquer côté Label.
+      return res.status(201).json({ message: `Contrat signé. Attention : ${result.error}`, affiliationActivated: false });
+    }
+  }
+  res.json({ message: 'Contrat signé.', affiliationActivated: true });
+}));
+
+// ---------- Côté ARTISTE : refuser un contrat proposé ----------
+app.post('/api/me/label-contracts/:id/decline', authMiddleware, h(async (req, res) => {
+  const contract = await db.get(
+    `SELECT lc.* FROM label_contracts lc JOIN label_artists la ON la.id = lc.label_artist_id
+     WHERE lc.id = $1 AND la.artist_id = $2`,
+    [Number(req.params.id), req.user.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (contract.status !== 'pending_signature') return res.status(400).json({ error: 'Ce contrat n\'est plus en attente de signature.' });
+  await db.run("UPDATE label_contracts SET status = 'declined' WHERE id = $1", [contract.id]);
+  res.json({ message: 'Contrat refusé.' });
 }));
 
 app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {

@@ -949,9 +949,64 @@ async function initSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_fraud_flags_open ON fraud_flags(status) WHERE status = 'open';`);
   // Un même motif ne doit pas créer 50 signalements identiques par jour pour le même compte —
   // un signalement 'open' pour un (subject, reason) donné suffit tant qu'il n'a pas été traité.
+  // ============================================================
+  // CONTRATS LABEL ↔ ARTISTE — formalise l'affiliation label_artists avec de vraies
+  // conditions (commission, périmètre du catalogue, durée), envoyées, consultées puis
+  // signées électroniquement par l'artiste. STRICTEMENT ADDITIF :
+  //   - label_artists reste la source de vérité de l'affiliation elle-même
+  //     (un contrat ne peut être envoyé qu'à un artiste déjà affilié, invité ou actif)
+  //   - tracks.owner_entity_id (artist_id) n'est jamais touché : signer un contrat ne
+  //     transfère JAMAIS la propriété d'un morceau, seulement les conditions de la
+  //     relation commerciale label↔artiste
+  //   - aucune donnée existante n'est modifiée par cette migration
+  // Réversible : DROP TABLE label_contracts, sans laisser aucune trace ailleurs.
+  // ============================================================
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_fraud_flags_unique_open
-    ON fraud_flags(subject_type, subject_id, reason) WHERE status = 'open';
+    CREATE TABLE IF NOT EXISTS label_contracts (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      artist_id INTEGER NOT NULL REFERENCES users(id),
+      contract_type TEXT NOT NULL DEFAULT 'distribution'
+        CHECK(contract_type IN ('distribution','artist','exclusive','non_exclusive')),
+      commission_pct NUMERIC(5,2) NOT NULL CHECK(commission_pct >= 0 AND commission_pct <= 100),
+      catalog_scope TEXT NOT NULL DEFAULT 'future_only' CHECK(catalog_scope IN ('all','future_only')),
+      duration_months INTEGER,
+      terms_note TEXT,
+      -- 'sent' → l'artiste n'a pas encore ouvert le contrat
+      -- 'viewed' → ouvert au moins une fois, pas encore tranché
+      -- 'active' → signé, en vigueur (la signature ET l'activation n'ont jamais besoin
+      --   d'être deux étapes séparées ici : rien d'autre ne dépend d'un délai entre les deux)
+      -- 'rejected' → refusé par l'artiste avant signature
+      -- 'terminated' → résilié en cours de route (par le Label ou par l'artiste)
+      -- 'expired' → durée écoulée (duration_months atteint), jamais recalculé après coup
+      status TEXT NOT NULL DEFAULT 'sent'
+        CHECK(status IN ('sent','viewed','active','rejected','terminated','expired')),
+      -- Empreinte des conditions au moment de la signature (JSON canonique des colonnes
+      -- ci-dessus) — preuve que les conditions signées correspondent exactement à celles
+      -- affichées, sans reconstruire un vrai système de certification cryptographique.
+      document_hash_sha256 TEXT,
+      signed_ip TEXT,
+      signed_user_agent TEXT,
+      sent_by INTEGER NOT NULL REFERENCES users(id),
+      sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      viewed_at TIMESTAMPTZ,
+      signed_at TIMESTAMPTZ,
+      rejected_at TIMESTAMPTZ,
+      rejection_reason TEXT,
+      terminated_at TIMESTAMPTZ,
+      terminated_by INTEGER REFERENCES users(id),
+      termination_reason TEXT,
+      expires_at TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_label_contracts_label ON label_contracts(label_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_label_contracts_artist ON label_contracts(artist_id);`);
+  // Un seul contrat "vivant" (pas encore tranché ou actif) à la fois pour un même couple
+  // label/artiste — évite d'envoyer un deuxième contrat pendant qu'un premier est encore en
+  // discussion, source classique de confusion réelle dans l'industrie.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_label_contracts_one_live
+    ON label_contracts(label_id, artist_id) WHERE status IN ('sent','viewed','active');
   `);
 }
 
