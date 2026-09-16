@@ -1703,13 +1703,17 @@
       </div>`;
       if(!payouts.length){ wrap.innerHTML = '<p class="muted">Aucun artiste avec des streams pour le moment.</p>'; return; }
       const statusPill = (s)=> s==='à jour' ? '<span class="pill verified">à jour</span>' : (s==='prêt à payer' ? '<span class="pill pending">prêt à payer</span>' : '<span class="pill">en attente</span>');
-      let html = '<table><tr><th>Pseudo</th><th>Streams totaux</th><th>Période en cours</th><th>Montant dû</th><th>Statut</th><th>Dernier paiement</th><th></th></tr>';
+      let html = '<table><tr><th>Pseudo</th><th>Streams totaux</th><th>Période en cours</th><th>Dont fraude confirmée</th><th>Montant dû (brut)</th><th>Statut</th><th>Dernier paiement</th><th></th></tr>';
       payouts.forEach(p=>{
+        const fraudCell = p.fraud_flagged_streams > 0
+          ? `<span style="color:#ff9a9d;">-${p.fraud_flagged_streams.toLocaleString('fr-FR')} streams<br>(-${p.fraud_deduction_fcfa.toLocaleString('fr-FR')} FCFA)</span>`
+          : '<span class="muted">—</span>';
         html += `<tr>
           <td><b>${esc(p.pseudo)}</b><br><span class="muted">${esc(p.email)}</span></td>
           <td>${p.total_streams.toLocaleString('fr-FR')}</td>
           <td>${p.current_period_streams.toLocaleString('fr-FR')}</td>
-          <td><b style="color:#D4AF6A;">${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA</b></td>
+          <td>${fraudCell}</td>
+          <td><b style="color:#D4AF6A;">${p.amount_due_fcfa.toLocaleString('fr-FR')} FCFA</b>${p.fraud_deduction_fcfa > 0 ? `<div class="muted" style="font-size:11px;">la fraude confirmée sera déduite au moment du paiement</div>` : ''}</td>
           <td>${statusPill(p.status)}</td>
           <td class="muted">${p.last_payment_at ? new Date(p.last_payment_at).toLocaleDateString('fr-FR') : '—'}</td>
           <td>

@@ -5000,6 +5000,33 @@ async function computeArtistPayout(artistId, settings) {
   };
 }
 
+// ============================================================
+// DÉDUCTION ANTI-FRAUDE — même logique de composition que applyCollaborationSplits :
+// computeArtistPayout() ci-dessus reste INCHANGÉE et continue d'être appelée telle quelle ;
+// cette fonction calcule séparément un montant à retrancher, sur le même modèle que la
+// déduction des parts collaborateurs juste en dessous.
+// IMPORTANT — ne déduit QUE les écoutes venant d'un compte dont la fraude a été CONFIRMÉE
+// par une vraie revue humaine (fraud_flags.status = 'reviewed', voir le panneau Anti-fraude
+// de admin.html) — jamais un simple signalement 'open' non encore tranché. Un signalement
+// ouvert fait déjà baisser le trust_score du compte auditeur, mais ne prive jamais un
+// artiste d'argent tant qu'une personne n'a pas confirmé qu'il s'agissait bien de fraude.
+// periodStart/periodEnd bornent EXACTEMENT la même fenêtre que celle déjà utilisée pour
+// écrire payment_history (period_start = fin de la période précédente, period_end = maintenant)
+// — aucun risque de déduire deux fois les mêmes écoutes sur deux versements différents.
+async function computeFraudDeduction(client, artistId, settings, periodStart) {
+  const sql = `
+    SELECT COUNT(*)::int AS n
+    FROM plays p
+    JOIN tracks t ON t.id = p.track_id
+    JOIN fraud_flags ff ON ff.subject_type = 'user' AND ff.subject_id = p.listener_id AND ff.status = 'reviewed'
+    WHERE t.artist_id = $1 AND p.created_at > $2 AND p.created_at <= NOW()
+  `;
+  const rows = client ? (await client.query(sql, [artistId, periodStart])).rows : await db.query(sql, [artistId, periodStart]);
+  const fraudulentStreams = rows[0] ? rows[0].n : 0;
+  const deductionFcfa = Math.round(fraudulentStreams * settings.price_per_stream_fcfa * settings.artist_share_pct / 100);
+  return { fraudulent_streams: fraudulentStreams, deduction_fcfa: deductionFcfa };
+}
+
 app.get('/api/admin/artist-payouts', h(async (req, res) => {
   if (!checkAdminKey(req, res)) return;
   const settings = await getRoyaltySettings();
@@ -5011,9 +5038,19 @@ app.get('/api/admin/artist-payouts', h(async (req, res) => {
   const payouts = [];
   for (const a of artists) {
     const p = await computeArtistPayout(a.id, settings);
+    // Aperçu de la déduction anti-fraude — même fenêtre de période que celle qui sera
+    // vraiment utilisée au moment du paiement (voir POST .../pay ci-dessous), pour que ce
+    // qui s'affiche ici corresponde exactement à ce qui sera déduit lors du vrai versement.
+    const lastPeriod = await db.get(
+      'SELECT period_end FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 1', [a.id],
+    );
+    const periodStart = lastPeriod ? lastPeriod.period_end : (await db.get('SELECT created_at FROM users WHERE id = $1', [a.id])).created_at;
+    const fraud = await computeFraudDeduction(null, a.id, settings, periodStart);
     payouts.push({
       id: a.id, pseudo: a.artist_name || a.first_name, real_name: `${a.first_name}`, email: a.email,
       account_status: a.account_status, ...p,
+      fraud_flagged_streams: fraud.fraudulent_streams,
+      fraud_deduction_fcfa: fraud.deduction_fcfa,
     });
   }
   payouts.sort((x, y) => y.amount_due_fcfa - x.amount_due_fcfa);
@@ -5070,17 +5107,27 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
       throw e;
     }
 
-    const netAmountFcfa = Math.max(0, p.amount_due_fcfa - collabResult.totalDeductionFcfa);
-
     const lastPaymentRow = await client.query(
       'SELECT period_end FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 1', [artistId],
     );
     const lastPayment = lastPaymentRow.rows[0];
+    const periodStart = lastPayment ? lastPayment.period_end : artist.created_at;
+
+    // Déduction anti-fraude — voir computeFraudDeduction : ne retire QUE les écoutes venant
+    // d'un compte dont la fraude a été confirmée par une revue humaine, jamais un simple
+    // signalement ouvert.
+    const fraud = await computeFraudDeduction(client, artistId, settings, periodStart);
+
+    const netAmountFcfa = Math.max(0, p.amount_due_fcfa - collabResult.totalDeductionFcfa - fraud.deduction_fcfa);
+
     const insertedRow = await client.query(
       `INSERT INTO payment_history (artist_id, amount_fcfa, streams_covered, period_start, period_end, method, reference, note)
        VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7) RETURNING id`,
-      [artistId, netAmountFcfa, p.current_period_streams, lastPayment ? lastPayment.period_end : artist.created_at,
-        method || 'Manuel', reference || null, note || null],
+      [artistId, netAmountFcfa, p.current_period_streams, periodStart,
+        method || 'Manuel', reference || null,
+        fraud.fraudulent_streams > 0
+          ? `${note || ''}${note ? ' — ' : ''}${fraud.fraudulent_streams} écoute(s) frauduleuse(s) confirmée(s) exclue(s) (-${fraud.deduction_fcfa.toLocaleString('fr-FR')} FCFA).`.trim()
+          : (note || null)],
     );
     const inserted = insertedRow.rows[0];
 
@@ -5088,7 +5135,7 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
 
     sendArtistPaymentEmail({
       user: artist, amountFcfa: netAmountFcfa, streamsCovered: p.current_period_streams,
-      periodStart: lastPayment ? lastPayment.period_end : artist.created_at, periodEnd: new Date(),
+      periodStart, periodEnd: new Date(),
     }).catch((e) => console.error('[artist-payouts] échec envoi email de versement :', e.message));
 
     // Notification "paiement reçu" pour le Label, si cet artiste lui est affilié.
@@ -5104,6 +5151,8 @@ app.post('/api/admin/artist-payouts/:artistId/pay', h(async (req, res) => {
       payment_id: inserted.id,
       gross_amount_fcfa: p.amount_due_fcfa,
       collaborators_deduction_fcfa: collabResult.totalDeductionFcfa,
+      fraud_deduction_fcfa: fraud.deduction_fcfa,
+      fraud_flagged_streams_excluded: fraud.fraudulent_streams,
       net_amount_fcfa: netAmountFcfa,
       collaborator_payouts_created: collabResult.createdPayoutIds.length,
     });
