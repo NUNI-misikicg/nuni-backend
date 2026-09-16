@@ -1878,6 +1878,80 @@ app.post('/api/me/contracts/:id/reject', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Contrat refusé.' });
 }));
 
+// ============================================================
+// PIPELINE DE RECRUTEMENT (label_prospects, voir db.js) — vue Trello côté Label, pour suivre
+// des artistes potentiels avant qu'ils n'aient un vrai compte NUNI. Un prospect peut être relié
+// à un compte artiste existant (linked_artist_id) ou à un contrat déjà envoyé
+// (linked_contract_id), mais n'en dépend jamais : on peut créer/déplacer un prospect qui n'a
+// encore aucun compte NUNI.
+// ============================================================
+const PROSPECT_STAGES = ['prospect', 'premier_contact', 'negociation', 'contrat_envoye', 'contrat_signe', 'artiste_actif', 'top_artiste'];
+
+app.get('/api/label/prospects', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(
+    `SELECT p.*, u.artist_name AS linked_artist_name
+     FROM label_prospects p LEFT JOIN users u ON u.id = p.linked_artist_id
+     WHERE p.label_id = $1 ORDER BY p.updated_at DESC`,
+    [label.id],
+  );
+  res.json({ prospects: rows });
+}));
+
+app.post('/api/label/prospects', authMiddleware, rateLimit(30, 60 * 60000), h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const { name, email, photoDataUri, trackCount, potentialNote, notes } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Le nom est obligatoire.' });
+  const photoUrl = await uploadIfDataUri(photoDataUri, 'image');
+  const prospect = await db.get(
+    `INSERT INTO label_prospects (label_id, name, email, photo_url, track_count, potential_note, notes, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [label.id, name.trim(), (email || '').trim() || null, photoUrl, trackCount ? Number(trackCount) : null,
+      (potentialNote || '').trim() || null, (notes || '').trim() || null, req.user.id],
+  );
+  res.status(201).json({ message: 'Prospect ajouté.', prospectId: prospect.id });
+}));
+
+app.put('/api/label/prospects/:id', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const existing = await db.get('SELECT id, photo_url FROM label_prospects WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!existing) return res.status(404).json({ error: 'Prospect introuvable.' });
+  const { name, email, photoDataUri, trackCount, potentialNote, notes } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Le nom est obligatoire.' });
+  const photoUrl = photoDataUri ? (await uploadIfDataUri(photoDataUri, 'image')) || existing.photo_url : existing.photo_url;
+  await db.run(
+    `UPDATE label_prospects SET name=$2, email=$3, photo_url=$4, track_count=$5, potential_note=$6, notes=$7, updated_at=NOW()
+     WHERE id = $1`,
+    [existing.id, name.trim(), (email || '').trim() || null, photoUrl, trackCount ? Number(trackCount) : null,
+      (potentialNote || '').trim() || null, (notes || '').trim() || null],
+  );
+  res.json({ message: 'Prospect mis à jour.' });
+}));
+
+// ---------- Déplacer un prospect d'une colonne à l'autre (glisser-déposer) ----------
+app.post('/api/label/prospects/:id/stage', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const { stage } = req.body;
+  if (!PROSPECT_STAGES.includes(stage)) return res.status(400).json({ error: 'Colonne invalide.' });
+  const existing = await db.get('SELECT id FROM label_prospects WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!existing) return res.status(404).json({ error: 'Prospect introuvable.' });
+  await db.run('UPDATE label_prospects SET stage = $2, updated_at = NOW() WHERE id = $1', [existing.id, stage]);
+  res.json({ message: 'Déplacé.' });
+}));
+
+app.delete('/api/label/prospects/:id', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const existing = await db.get('SELECT id FROM label_prospects WHERE id = $1 AND label_id = $2', [Number(req.params.id), label.id]);
+  if (!existing) return res.status(404).json({ error: 'Prospect introuvable.' });
+  await db.run('DELETE FROM label_prospects WHERE id = $1', [existing.id]);
+  res.json({ message: 'Prospect supprimé.' });
+}));
+
 // ---------- Côté UTILISATEUR : invitations d'équipe reçues ----------
 app.get('/api/me/label-team-invites', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`

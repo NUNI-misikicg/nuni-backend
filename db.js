@@ -1008,6 +1008,36 @@ async function initSchema() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_label_contracts_one_live
     ON label_contracts(label_id, artist_id) WHERE status IN ('sent','viewed','active');
   `);
+
+  // ============================================================
+  // PIPELINE DE RECRUTEMENT (vue Trello du Label) — suivi des artistes potentiels avant
+  // qu'ils ne deviennent (ou non) un vrai compte NUNI affilié. STRICTEMENT ADDITIF, ne touche
+  // à rien d'existant. Un prospect n'est PAS un compte utilisateur — juste une fiche de suivi
+  // interne au Label, éventuellement reliée plus tard à un vrai compte artiste
+  // (linked_artist_id) et/ou à un contrat formel (linked_contract_id) une fois envoyé.
+  // Réversible : DROP TABLE label_prospects, sans laisser de trace ailleurs.
+  // ============================================================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS label_prospects (
+      id SERIAL PRIMARY KEY,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      email TEXT,
+      photo_url TEXT,
+      track_count INTEGER,
+      potential_note TEXT,
+      notes TEXT,
+      stage TEXT NOT NULL DEFAULT 'prospect' CHECK(stage IN (
+        'prospect','premier_contact','negociation','contrat_envoye','contrat_signe','artiste_actif','top_artiste'
+      )),
+      linked_artist_id INTEGER REFERENCES users(id),
+      linked_contract_id INTEGER REFERENCES label_contracts(id),
+      created_by INTEGER NOT NULL REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_label_prospects_label ON label_prospects(label_id, stage);`);
 }
 
 module.exports = { pool, query, get, run, initSchema };
