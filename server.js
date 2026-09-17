@@ -1053,6 +1053,57 @@ app.get('/api/label/artists', authMiddleware, h(async (req, res) => {
   res.json({ artists: rows, plan: label.plan, maxArtists: planSettings2.maxArtists[label.plan] });
 }));
 
+// ---------- Fiche artiste dédiée : tout ce qu'un Label peut voir sur UN de ses artistes, en
+// un seul appel (vue d'ensemble, catalogue, contrats, royalties, croissance, versements). ----------
+app.get('/api/label/artists/:artistId/detail', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistId = Number(req.params.artistId);
+  const affiliation = await db.get(
+    "SELECT id, status, created_at FROM label_artists WHERE label_id = $1 AND artist_id = $2 AND status != 'removed'",
+    [label.id, artistId],
+  );
+  if (!affiliation) return res.status(404).json({ error: "Cet artiste n'est pas affilié à votre Label." });
+
+  const artist = await db.get(
+    'SELECT id, artist_name, first_name, email, avatar_url, banner_url, bio, is_verified, created_at, trust_score FROM users WHERE id = $1',
+    [artistId],
+  );
+  if (!artist) return res.status(404).json({ error: 'Artiste introuvable.' });
+
+  const followerCount = (await db.get('SELECT COUNT(*)::int AS c FROM follows WHERE artist_id = $1', [artistId])).c;
+
+  const catalogue = await db.query(`
+    SELECT id, title, cover_url, streams, likes, release_type, release_date, published, review_status, created_at
+    FROM tracks WHERE artist_id = $1 ORDER BY created_at DESC
+  `, [artistId]);
+
+  const contracts = await db.query(`
+    SELECT id, contract_type, commission_pct, catalog_scope, duration_months, status, sent_at, signed_at, expires_at, terminated_at
+    FROM label_contracts WHERE label_id = $1 AND artist_id = $2 ORDER BY sent_at DESC
+  `, [label.id, artistId]);
+
+  const payments = await db.query(`
+    SELECT id, amount_fcfa, streams_covered, period_start, period_end, method, created_at
+    FROM payment_history WHERE artist_id = $1 ORDER BY created_at DESC LIMIT 24
+  `, [artistId]);
+
+  // Croissance : somme des streams de tous les morceaux de l'artiste, jour par jour, sur les
+  // 30 derniers jours — même table que le reste des analytics NUNI (track_streams_history),
+  // rien de recalculé différemment ici.
+  const growth = await db.query(`
+    SELECT h.recorded_date, SUM(h.streams_snapshot)::bigint AS total_streams
+    FROM track_streams_history h JOIN tracks t ON t.id = h.track_id
+    WHERE t.artist_id = $1 AND h.recorded_date >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY h.recorded_date ORDER BY h.recorded_date ASC
+  `, [artistId]);
+
+  res.json({
+    artist: { ...artist, follower_count: followerCount, joined_label_at: affiliation.created_at, affiliation_status: affiliation.status },
+    catalogue, contracts, payments, growth,
+  });
+}));
+
 // ---------- Créer un nouvel artiste directement sous le Label ----------
 app.post('/api/label/artists/create', authMiddleware, rateLimit(10, 60 * 60000), h(async (req, res) => {
   const label = await requireValidatedLabel(req, res, 'manager');
