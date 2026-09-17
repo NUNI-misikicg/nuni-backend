@@ -1038,6 +1038,26 @@ async function initSchema() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_label_prospects_label ON label_prospects(label_id, stage);`);
+
+  // ============================================================
+  // VALIDATION DES SORTIES — un Label sous contrat avec `requires_release_approval = true`
+  // peut exiger d'approuver chaque sortie avant publication. STRICTEMENT ADDITIF :
+  //   - tracks.published garde exactement son fonctionnement actuel (0/1, contrôlé par la
+  //     tâche planifiée existante) — on y ajoute seulement une CONDITION supplémentaire
+  //   - un artiste indépendant, ou signé à un Label qui n'exige pas cette validation,
+  //     publie exactement comme avant (review_status reste 'none', aucun changement de
+  //     comportement pour lui)
+  // ============================================================
+  await pool.query(`ALTER TABLE label_contracts ADD COLUMN IF NOT EXISTS requires_release_approval BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'none'
+      CHECK (review_status IN ('none','pending','approved','changes_requested','rejected'));
+  `);
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS review_checklist_json JSONB;`);
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS review_note TEXT;`);
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id);`);
+  await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracks_review_status ON tracks(review_status) WHERE review_status = 'pending';`);
 }
 
 module.exports = { pool, query, get, run, initSchema };

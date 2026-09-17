@@ -1801,6 +1801,24 @@ app.post('/api/label/contracts/:id/terminate', authMiddleware, h(async (req, res
   res.json({ message: 'Contrat résilié.' });
 }));
 
+// ---------- Côté LABEL : activer/désactiver l'exigence de validation des sorties sur un
+// contrat actif — désactivée par défaut pour ne jamais bloquer un artiste sans que le Label
+// l'ait explicitement demandé. ----------
+app.put('/api/label/contracts/:id/require-approval', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'admin');
+  if (!label) return;
+  const contract = await db.get(
+    "SELECT id, status FROM label_contracts WHERE id = $1 AND label_id = $2", [Number(req.params.id), label.id],
+  );
+  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
+  if (contract.status !== 'active') return res.status(400).json({ error: 'Seul un contrat actif peut exiger la validation des sorties.' });
+  await db.run(
+    'UPDATE label_contracts SET requires_release_approval = $2 WHERE id = $1',
+    [contract.id, req.body.requiresApproval === true],
+  );
+  res.json({ message: req.body.requiresApproval === true ? 'Validation des sorties activée pour cet artiste.' : 'Validation des sorties désactivée pour cet artiste.' });
+}));
+
 // ---------- Côté ARTISTE : contrats reçus ----------
 app.get('/api/me/contracts', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`
@@ -1952,6 +1970,97 @@ app.delete('/api/label/prospects/:id', authMiddleware, h(async (req, res) => {
   res.json({ message: 'Prospect supprimé.' });
 }));
 
+// ============================================================
+// VALIDATION DES SORTIES — voir POST /api/tracks (blocage à la création) et le job planifié
+// plus bas (jamais de publication automatique tant que review_status='pending'). Un Label ne
+// peut agir QUE sur les morceaux d'un artiste qui lui est activement affilié ET dont le
+// contrat actif exige cette validation — jamais sur un morceau hors de son périmètre réel.
+// ============================================================
+app.get('/api/label/releases/pending', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.album, t.genre, t.release_type, t.cover_url, t.audio_url, t.lyrics,
+           t.credits, t.scheduled_release_at, t.review_status, t.created_at,
+           u.artist_name, u.id AS artist_id
+    FROM tracks t
+    JOIN label_artists la ON la.artist_id = t.artist_id AND la.label_id = $1 AND la.status = 'active'
+    WHERE t.review_status = 'pending'
+    ORDER BY t.created_at ASC
+  `, [label.id]);
+  res.json({ releases: rows });
+}));
+
+async function assertLabelControlsTrack(label, trackId) {
+  return db.get(`
+    SELECT t.* FROM tracks t
+    JOIN label_artists la ON la.artist_id = t.artist_id AND la.label_id = $1 AND la.status = 'active'
+    WHERE t.id = $2
+  `, [label.id, trackId]);
+}
+
+app.post('/api/label/releases/:trackId/approve', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const track = await assertLabelControlsTrack(label, Number(req.params.trackId));
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable ou hors de votre roster.' });
+  if (track.review_status !== 'pending') return res.status(400).json({ error: 'Ce morceau n\'est plus en attente de validation.' });
+  const checklist = req.body.checklist && typeof req.body.checklist === 'object' ? req.body.checklist : {};
+  // Publication immédiate seulement si aucune date programmée future — sinon le job planifié
+  // existant s'en charge normalement le moment venu (review_status='approved' le débloque).
+  const shouldPublishNow = !track.scheduled_release_at || new Date(track.scheduled_release_at) <= new Date();
+  await db.run(
+    `UPDATE tracks SET review_status = 'approved', review_checklist_json = $2, reviewed_by = $3, reviewed_at = NOW(), published = $4
+     WHERE id = $1`,
+    [track.id, JSON.stringify(checklist), req.user.id, shouldPublishNow ? 1 : 0],
+  );
+  createNotification(track.artist_id, 'release_approved', 'Sortie validée', `${label.label_name} a validé « ${track.title} ».`, null).catch(() => {});
+  res.json({ message: shouldPublishNow ? 'Sortie validée et publiée.' : 'Sortie validée — sera publiée à la date programmée.' });
+}));
+
+app.post('/api/label/releases/:trackId/reject', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif de refus est obligatoire.' });
+  const track = await assertLabelControlsTrack(label, Number(req.params.trackId));
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable ou hors de votre roster.' });
+  if (track.review_status !== 'pending') return res.status(400).json({ error: 'Ce morceau n\'est plus en attente de validation.' });
+  await db.run(
+    "UPDATE tracks SET review_status = 'rejected', review_note = $2, reviewed_by = $3, reviewed_at = NOW() WHERE id = $1",
+    [track.id, reason.trim(), req.user.id],
+  );
+  createNotification(track.artist_id, 'release_rejected', 'Sortie refusée', `${label.label_name} a refusé « ${track.title} » : ${reason.trim()}`, null).catch(() => {});
+  res.json({ message: 'Sortie refusée.' });
+}));
+
+app.post('/api/label/releases/:trackId/request-changes', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'manager');
+  if (!label) return;
+  const { note } = req.body;
+  if (!note || !note.trim()) return res.status(400).json({ error: 'Précisez ce qui doit être modifié.' });
+  const track = await assertLabelControlsTrack(label, Number(req.params.trackId));
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable ou hors de votre roster.' });
+  if (track.review_status !== 'pending') return res.status(400).json({ error: 'Ce morceau n\'est plus en attente de validation.' });
+  await db.run(
+    "UPDATE tracks SET review_status = 'changes_requested', review_note = $2, reviewed_by = $3, reviewed_at = NOW() WHERE id = $1",
+    [track.id, note.trim(), req.user.id],
+  );
+  createNotification(track.artist_id, 'release_changes_requested', 'Modifications demandées', `${label.label_name} demande des modifications sur « ${track.title} » : ${note.trim()}`, null).catch(() => {});
+  res.json({ message: 'Modifications demandées à l\'artiste.' });
+}));
+
+// ---------- Côté ARTISTE : renvoyer un morceau en attente après modifications ----------
+app.post('/api/me/tracks/:id/resubmit-for-review', authMiddleware, h(async (req, res) => {
+  const track = await db.get('SELECT id, review_status FROM tracks WHERE id = $1 AND artist_id = $2', [Number(req.params.id), req.user.id]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  if (!['changes_requested', 'rejected'].includes(track.review_status)) {
+    return res.status(400).json({ error: 'Ce morceau n\'a pas besoin d\'être renvoyé en validation.' });
+  }
+  await db.run("UPDATE tracks SET review_status = 'pending', review_note = NULL WHERE id = $1", [track.id]);
+  res.json({ message: 'Renvoyé au Label pour validation.' });
+}));
+
 // ---------- Côté UTILISATEUR : invitations d'équipe reçues ----------
 app.get('/api/me/label-team-invites', authMiddleware, h(async (req, res) => {
   const rows = await db.query(`
@@ -2018,185 +2127,15 @@ app.post('/api/me/label-invites/:id/decline', authMiddleware, h(async (req, res)
 }));
 
 // ============================================================
-// CONTRATS LABEL ↔ ARTISTE — voir label_contracts / label_contract_signatures dans db.js.
-// Couche additive au-dessus de label_artists : ne remplace ni ne modifie l'affiliation
-// invited/active/suspended/removed, qui reste gérée exactement comme avant. Un contrat décrit
-// des TERMES (commission, durée, périmètre du catalogue) que les deux parties signent —
-// jamais un transfert de propriété du catalogue (tracks.artist_id n'est jamais touché ici).
+// (Bloc dupliqué supprimé ici — voir plus haut la section CONTRATS LABEL ↔ ARTISTE, qui est
+// la version réellement branchée sur le schéma actuel de label_contracts (label_id/artist_id
+// directs, statuts sent/viewed/active/rejected/terminated/expired). Une deuxième
+// implémentation, incompatible, avait été introduite par erreur à cet endroit — elle
+// référençait une colonne label_artist_id qui n'existe pas dans le vrai schéma et aurait
+// provoqué une vraie erreur SQL au premier appel. Supprimée entièrement (5 routes, dont 2
+// dupliquaient déjà des chemins existants ailleurs), sans aucune perte : rien d'autre dans le
+// code ne dépendait de cette version.
 // ============================================================
-function hashContractText(text) {
-  return require('crypto').createHash('sha256').update(String(text)).digest('hex');
-}
-
-// ---------- Le Label propose des termes pour une affiliation existante (invitée ou active) ----------
-app.post('/api/label/artists/:affiliationId/contract', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res, 'manager');
-  if (!label) return;
-  const affiliation = await db.get(
-    "SELECT * FROM label_artists WHERE id = $1 AND label_id = $2 AND status != 'removed'",
-    [Number(req.params.affiliationId), label.id],
-  );
-  if (!affiliation) return res.status(404).json({ error: 'Affiliation introuvable.' });
-
-  const existingLive = await db.get(
-    "SELECT id FROM label_contracts WHERE label_artist_id = $1 AND status IN ('pending_signature','signed')",
-    [affiliation.id],
-  );
-  if (existingLive) {
-    return res.status(409).json({ error: 'Un contrat est déjà en attente ou signé pour cet artiste. Résiliez-le avant d\'en proposer un nouveau.' });
-  }
-
-  const { commissionPct, durationMonths, catalogScope, termsSummary } = req.body;
-  const commission = Number(commissionPct);
-  if (!Number.isFinite(commission) || commission < 0 || commission > 100) {
-    return res.status(400).json({ error: 'commissionPct doit être un nombre entre 0 et 100.' });
-  }
-  if (!['all', 'future_only'].includes(catalogScope)) {
-    return res.status(400).json({ error: "catalogScope doit être 'all' ou 'future_only'." });
-  }
-  if (!termsSummary || !termsSummary.trim()) {
-    return res.status(400).json({ error: 'Un résumé des termes en langage clair est obligatoire.' });
-  }
-  const duration = durationMonths != null && durationMonths !== '' ? Number(durationMonths) : null;
-  if (duration != null && (!Number.isFinite(duration) || duration <= 0)) {
-    return res.status(400).json({ error: 'durationMonths doit être un nombre de mois positif, ou vide pour une durée indéterminée.' });
-  }
-
-  const contract = await db.get(
-    `INSERT INTO label_contracts (label_artist_id, commission_pct, duration_months, catalog_scope, terms_summary, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [affiliation.id, commission, duration, catalogScope, termsSummary.trim(), req.user.id],
-  );
-  // Le Label signe automatiquement au moment de la création — c'est son action, déjà
-  // authentifiée par authMiddleware. L'artiste, lui, devra activement signer de son côté.
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
-  await db.run(
-    `INSERT INTO label_contract_signatures (contract_id, signer_user_id, signer_role, document_hash, ip_address, device_fingerprint)
-     VALUES ($1,$2,'label',$3,$4,$5)`,
-    [contract.id, req.user.id, hashContractText(contract.terms_summary), ip, (req.headers['x-device-id'] || '').trim() || null],
-  );
-  res.status(201).json({ message: 'Contrat envoyé — en attente de la signature de l\'artiste.', contract });
-}));
-
-// ---------- Voir le contrat courant d'une affiliation (côté Label) ----------
-app.get('/api/label/artists/:affiliationId/contract', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res, 'assistant');
-  if (!label) return;
-  const affiliation = await db.get(
-    'SELECT id FROM label_artists WHERE id = $1 AND label_id = $2',
-    [Number(req.params.affiliationId), label.id],
-  );
-  if (!affiliation) return res.status(404).json({ error: 'Affiliation introuvable.' });
-  const contract = await db.get(
-    `SELECT * FROM label_contracts WHERE label_artist_id = $1 ORDER BY created_at DESC LIMIT 1`,
-    [affiliation.id],
-  );
-  if (!contract) return res.json({ contract: null });
-  const signatures = await db.query('SELECT signer_role, signed_at FROM label_contract_signatures WHERE contract_id = $1', [contract.id]);
-  res.json({ contract, signatures });
-}));
-
-// ---------- Le Label résilie un contrat déjà signé (n'affecte jamais tracks.artist_id) ----------
-app.post('/api/label/contracts/:id/terminate', authMiddleware, h(async (req, res) => {
-  const label = await requireValidatedLabel(req, res, 'owner');
-  if (!label) return;
-  const contract = await db.get(
-    `SELECT lc.* FROM label_contracts lc JOIN label_artists la ON la.id = lc.label_artist_id
-     WHERE lc.id = $1 AND la.label_id = $2`,
-    [Number(req.params.id), label.id],
-  );
-  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
-  if (contract.status !== 'signed') return res.status(400).json({ error: 'Seul un contrat signé peut être résilié.' });
-  const { reason } = req.body;
-  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Un motif de résiliation est obligatoire.' });
-  await db.run(
-    `UPDATE label_contracts SET status = 'terminated', terminated_at = NOW(), terminated_reason = $2 WHERE id = $1`,
-    [contract.id, reason.trim()],
-  );
-  res.json({ message: 'Contrat résilié. L\'affiliation elle-même (label_artists) n\'est pas modifiée — gérez-la séparément si nécessaire.' });
-}));
-
-// ---------- Côté ARTISTE : voir les contrats en attente de sa signature ----------
-app.get('/api/me/label-contracts', authMiddleware, h(async (req, res) => {
-  const rows = await db.query(
-    `SELECT lc.*, l.label_name, l.logo_url
-     FROM label_contracts lc
-     JOIN label_artists la ON la.id = lc.label_artist_id
-     JOIN labels l ON l.id = la.label_id
-     WHERE la.artist_id = $1
-     ORDER BY lc.created_at DESC`,
-    [req.user.id],
-  );
-  res.json({ contracts: rows });
-}));
-
-// ---------- Côté ARTISTE : signer un contrat — ré-authentification par mot de passe,
-// exactement comme une action sensible (suppression de compte, etc.), pour que la signature
-// ait une vraie valeur probante (pas un simple clic sur un bouton "Accepter"). ----------
-app.post('/api/me/label-contracts/:id/sign', authMiddleware, rateLimit(10, 15 * 60000), h(async (req, res) => {
-  const { password } = req.body;
-  // Même hash factice utilisé ailleurs (ex. suppression de compte) pour que le temps de
-  // réponse ne révèle jamais si l'email/l'id existe — comparaison systématique même si
-  // l'utilisateur est introuvable.
-  const DUMMY_HASH = '$argon2id$v=19$m=65536,p=4,t=3$FFEARNH0EaLUJ5yNEJYXeg$pzICrPiEaM5VBe02AHRDPmjPuqCNHhGG2AlvpQ87WPg';
-  const user = await db.get('SELECT id, password_hash FROM users WHERE id = $1', [req.user.id]);
-  const ok = await verifyPassword(password || '', user ? user.password_hash : DUMMY_HASH);
-  if (!user || !ok) return res.status(401).json({ error: 'Mot de passe incorrect.' });
-
-  const contract = await db.get(
-    `SELECT lc.*, la.artist_id, la.id AS affiliation_id FROM label_contracts lc
-     JOIN label_artists la ON la.id = lc.label_artist_id
-     WHERE lc.id = $1 AND la.artist_id = $2`,
-    [Number(req.params.id), req.user.id],
-  );
-  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
-  if (contract.status !== 'pending_signature') return res.status(400).json({ error: 'Ce contrat n\'est plus en attente de signature.' });
-
-  const alreadySigned = await db.get(
-    "SELECT id FROM label_contract_signatures WHERE contract_id = $1 AND signer_role = 'artist'",
-    [contract.id],
-  );
-  if (alreadySigned) return res.status(409).json({ error: 'Déjà signé.' });
-
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
-  await db.run(
-    `INSERT INTO label_contract_signatures (contract_id, signer_user_id, signer_role, document_hash, ip_address, device_fingerprint)
-     VALUES ($1,$2,'artist',$3,$4,$5)`,
-    [contract.id, req.user.id, hashContractText(contract.terms_summary), ip, (req.headers['x-device-id'] || '').trim() || null],
-  );
-  const startsAt = new Date();
-  const expiresAt = contract.duration_months ? new Date(startsAt.getTime() + contract.duration_months * 30 * 24 * 3600 * 1000) : null;
-  await db.run(
-    `UPDATE label_contracts SET status = 'signed', signed_at = NOW(), starts_at = $2, expires_at = $3 WHERE id = $1`,
-    [contract.id, startsAt, expiresAt],
-  );
-  // Si l'affiliation était encore 'invited', la signature du contrat vaut acceptation de
-  // l'invitation — réutilise exactement la même logique transactionnelle (quotas de palier
-  // compris) que l'acceptation classique, sans dupliquer cette règle ailleurs.
-  const affiliation = await db.get('SELECT status FROM label_artists WHERE id = $1', [contract.affiliation_id]);
-  if (affiliation && affiliation.status === 'invited') {
-    const result = await tryActivateLabelArtist(contract.affiliation_id, req.user.id);
-    if (!result.ok) {
-      // Le contrat reste signé (preuve juridique conservée) même si l'activation de
-      // l'affiliation échoue (ex. Label déjà à sa limite de palier) — à débloquer côté Label.
-      return res.status(201).json({ message: `Contrat signé. Attention : ${result.error}`, affiliationActivated: false });
-    }
-  }
-  res.json({ message: 'Contrat signé.', affiliationActivated: true });
-}));
-
-// ---------- Côté ARTISTE : refuser un contrat proposé ----------
-app.post('/api/me/label-contracts/:id/decline', authMiddleware, h(async (req, res) => {
-  const contract = await db.get(
-    `SELECT lc.* FROM label_contracts lc JOIN label_artists la ON la.id = lc.label_artist_id
-     WHERE lc.id = $1 AND la.artist_id = $2`,
-    [Number(req.params.id), req.user.id],
-  );
-  if (!contract) return res.status(404).json({ error: 'Contrat introuvable.' });
-  if (contract.status !== 'pending_signature') return res.status(400).json({ error: 'Ce contrat n\'est plus en attente de signature.' });
-  await db.run("UPDATE label_contracts SET status = 'declined' WHERE id = $1", [contract.id]);
-  res.json({ message: 'Contrat refusé.' });
-}));
 
 app.post('/api/ads/request', rateLimit(5, 15 * 60000), h(async (req, res) => {
   const { name, desc, link, contact, duration } = req.body;
@@ -3185,6 +3124,19 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   }
   const isFuture = scheduledReleaseAt && new Date(scheduledReleaseAt) > new Date();
 
+  // ---- Validation des sorties : un Label sous contrat avec requires_release_approval=true
+  // bloque la publication tant qu'il n'a pas validé — voir VALIDATION DES SORTIES dans db.js.
+  // N'affecte JAMAIS un artiste indépendant, ni un artiste signé dont le Label n'exige pas
+  // cette étape (comportement exactement inchangé dans ces deux cas).
+  const approvalLabel = await db.get(`
+    SELECT lc.label_id FROM label_contracts lc
+    JOIN label_artists la ON la.label_id = lc.label_id AND la.artist_id = lc.artist_id
+    WHERE lc.artist_id = $1 AND lc.status = 'active' AND lc.requires_release_approval = true AND la.status = 'active'
+    LIMIT 1
+  `, [req.user.id]);
+  const reviewStatus = approvalLabel ? 'pending' : 'none';
+  const publishedValue = approvalLabel ? 0 : (isFuture ? 0 : 1);
+
   const [finalCoverUrl, finalAudioUrl] = await Promise.all([
     uploadIfDataUri(coverUrl, 'image'),
     uploadIfDataUri(audioUrl, 'video'),
@@ -3193,15 +3145,16 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
   const inserted = await db.get(`
     INSERT INTO tracks (
       artist_id, title, album, genre, release_type, cover_url, audio_url, lyrics, scheduled_release_at, published,
-      composer, featuring, studio, description, release_date, credits
+      composer, featuring, studio, description, release_date, credits, review_status
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
     RETURNING id
   `, [
     req.user.id, title, album || null, genre || null, releaseType || 'Single',
     finalCoverUrl || null, finalAudioUrl || null, lyrics || null,
-    scheduledReleaseAt || null, isFuture ? 0 : 1,
+    scheduledReleaseAt || null, publishedValue,
     composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
+    reviewStatus,
   ]);
   // Ambiances — entièrement optionnel, ne bloque jamais la publication si absent ou si une
   // clé envoyée ne correspond à aucune ambiance réelle du vocabulaire NUNI.
@@ -5697,8 +5650,12 @@ setInterval(async () => {
   try {
     // Repérer AVANT publication ce qui va sortir, pour notifier les vrais abonnés
     // (l'UPDATE seul ne permettrait pas de savoir quels morceaux/clips viennent de changer).
+    // review_status : ne jamais publier automatiquement un morceau encore en attente de
+    // validation Label, refusé, ou pour lequel des modifications ont été demandées — voir
+    // VALIDATION DES SORTIES. 'none' (pas concerné) et 'approved' (déjà validé) seuls publiables.
     const newlyPublished = await db.query(`
-      SELECT id, artist_id, title FROM tracks WHERE published = 0 AND scheduled_release_at <= NOW()
+      SELECT id, artist_id, title FROM tracks
+      WHERE published = 0 AND scheduled_release_at <= NOW() AND review_status IN ('none','approved')
     `);
     // Avant : les clips programmés se publiaient bien automatiquement (UPDATE plus bas),
     // mais contrairement aux morceaux, aucune notification n'était jamais envoyée aux
@@ -5706,7 +5663,10 @@ setInterval(async () => {
     const newlyPublishedClips = await db.query(`
       SELECT id, artist_id, title FROM clips WHERE published = 0 AND scheduled_release_at <= NOW()
     `);
-    await db.run(`UPDATE tracks SET published = 1 WHERE published = 0 AND scheduled_release_at <= NOW()`);
+    await db.run(`
+      UPDATE tracks SET published = 1
+      WHERE published = 0 AND scheduled_release_at <= NOW() AND review_status IN ('none','approved')
+    `);
     await db.run(`UPDATE clips SET published = 1 WHERE published = 0 AND scheduled_release_at <= NOW()`);
 
     for (const track of newlyPublished) {
