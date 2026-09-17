@@ -4012,6 +4012,24 @@ app.get('/api/tracks/:id/moods', h(async (req, res) => {
   res.json({ moods: rows });
 }));
 
+// Liste COMPLÈTE (pas juste les 8 plus récents comme GET /api/moods, pensé pour la vignette
+// d'accueil) des morceaux publiés taggés d'une ambiance — utilisée pour alimenter une vraie
+// station de radio par ambiance, pas juste un aperçu.
+app.get('/api/moods/:key/tracks', h(async (req, res) => {
+  const mood = await db.get('SELECT id, label FROM moods WHERE key = $1', [req.params.key]);
+  if (!mood) return res.status(404).json({ error: 'Ambiance introuvable.' });
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.genre, t.streams, t.likes, t.cover_url, t.audio_url, t.release_type,
+           u.artist_name, u.first_name, u.id AS artist_id, u.is_verified
+    FROM track_moods tm
+    JOIN tracks t ON t.id = tm.track_id AND t.published = 1
+    JOIN users u ON u.id = t.artist_id
+    WHERE tm.mood_id = $1
+    ORDER BY t.streams DESC
+  `, [mood.id]);
+  res.json({ label: mood.label, tracks: rows });
+}));
+
 // ---------- "En ce moment" — vrais nouveaux auditeurs uniques du jour, par morceau. NUNI ne
 // garde qu'une ligne par (morceau, auditeur) au tout premier passage (plays), donc aucune
 // notion réelle d'écoute "en direct" n'existe — ceci reste honnête : "X personnes ont
