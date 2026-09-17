@@ -1612,6 +1612,68 @@ app.get('/api/label/analytics', authMiddleware, h(async (req, res) => {
   res.json({ streamsByMonth, topCountries, topCities, growthPct, retentionPct });
 }));
 
+// ---------- Prévisions financières — extrapolation simple à partir du rythme réel des 14
+// derniers jours, jamais un modèle prédictif complexe. Honnête sur ce que c'est : une
+// projection linéaire, pas une garantie — le front doit toujours l'afficher comme une
+// estimation. ----------
+app.get('/api/label/forecast', authMiddleware, h(async (req, res) => {
+  const label = await requireValidatedLabel(req, res, 'assistant');
+  if (!label) return;
+  const artistIds = (await db.query(
+    "SELECT artist_id FROM label_artists WHERE label_id = $1 AND status = 'active'", [label.id],
+  )).map((r) => r.artist_id);
+  if (!artistIds.length) {
+    return res.json({ hasData: false });
+  }
+
+  // Rythme quotidien réel : streams des 14 derniers jours ÷ nombre de jours avec au moins une
+  // écoute (pas ÷14 fixe, pour ne pas sous-estimer un label tout juste actif depuis peu de jours).
+  const recentDaily = await db.query(`
+    SELECT DATE(p.created_at) AS day, COUNT(*)::int AS streams
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE t.artist_id = ANY($1) AND p.created_at >= NOW() - INTERVAL '14 days'
+    GROUP BY DATE(p.created_at)
+  `, [artistIds]);
+  const totalRecentStreams = recentDaily.reduce((s, r) => s + r.streams, 0);
+  const avgDailyStreams = recentDaily.length ? totalRecentStreams / recentDaily.length : 0;
+
+  if (avgDailyStreams === 0) {
+    return res.json({ hasData: false });
+  }
+
+  const settings = await getRoyaltySettings();
+  // Commission moyenne pondérée des contrats ACTIFS avec ce Label — 0 si aucun contrat actif
+  // (le Label n'a alors droit à aucune commission automatique, juste l'estimation streaming brute).
+  const activeContracts = await db.query(
+    "SELECT commission_pct FROM label_contracts WHERE label_id = $1 AND status = 'active'", [label.id],
+  );
+  const avgCommissionPct = activeContracts.length
+    ? activeContracts.reduce((s, c) => s + Number(c.commission_pct), 0) / activeContracts.length
+    : 0;
+
+  const now = new Date();
+  const daysLeftInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() - now.getDate();
+  const daysLeftInQuarter = Math.ceil((new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3 + 3, 0) - now) / 86400000);
+  const daysLeftInYear = Math.ceil((new Date(now.getFullYear(), 11, 31) - now) / 86400000);
+
+  const projectFor = (daysAhead) => {
+    const projectedStreams = Math.round(avgDailyStreams * daysAhead);
+    const grossFcfa = Math.round(projectedStreams * settings.price_per_stream_fcfa);
+    const artistShareFcfa = Math.round(grossFcfa * settings.artist_share_pct / 100);
+    const labelCommissionFcfa = Math.round(artistShareFcfa * avgCommissionPct / 100);
+    return { projectedStreams, grossFcfa, artistShareFcfa, labelCommissionFcfa };
+  };
+
+  res.json({
+    hasData: true,
+    avgDailyStreams: Math.round(avgDailyStreams * 10) / 10,
+    avgCommissionPct: Math.round(avgCommissionPct * 10) / 10,
+    endOfMonth: projectFor(daysLeftInMonth),
+    endOfQuarter: projectFor(daysLeftInQuarter),
+    endOfYear: projectFor(daysLeftInYear),
+  });
+}));
+
 // ---------- Catalogue consolidé (tous les artistes du Label) ----------
 app.get('/api/label/catalog', authMiddleware, h(async (req, res) => {
   const label = await requireValidatedLabel(req, res, 'assistant');
