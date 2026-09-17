@@ -2639,6 +2639,7 @@ function checkAdminKey(req, res) {
 const FRAUD_DEVICE_ACCOUNTS_THRESHOLD = 5;   // comptes distincts depuis un même appareil, sur 24h
 const FRAUD_IP_ACCOUNTS_THRESHOLD = 8;       // comptes distincts depuis une même IP, sur 24h
 const FRAUD_TRUST_SCORE_PENALTY = 15;
+const FRAUD_LOW_COMPLETION_COUNT_THRESHOLD = 10; // écoutes 'fraudulent' distinctes/24h avant signalement
 
 async function openFraudFlag(subjectType, subjectId, reason, severity, detail) {
   const inserted = await db.run(
@@ -2684,6 +2685,62 @@ async function flagSuspiciousPlayPatterns(deviceFingerprint, ipAddress, listener
     }
   }
 }
+
+// ============================================================
+// SCORE DE CONFIANCE PAR ÉCOUTE — voir plays.duration_played_seconds/validation_status dans
+// db.js. Règles simples et lisibles (PAS de Machine Learning réel) : le taux de complétion
+// réel de l'écoute est le signal principal. Documenté honnêtement comme tel plutôt que
+// présenté comme une "IA" qui n'existe pas.
+// ============================================================
+function computePlayConfidence(durationPlayedSeconds, trackDurationSeconds) {
+  const played = Math.max(0, Number(durationPlayedSeconds) || 0);
+  const total = Number(trackDurationSeconds) || 0;
+  // Sans durée totale connue (métadonnée manquante), on se base sur un seuil absolu : 30s
+  // d'écoute réelle est déjà un bon signal indépendamment de la durée du morceau.
+  const completion = total > 0 ? Math.min(1, played / total) : Math.min(1, played / 30);
+  const score = Math.round(completion * 100);
+  let status;
+  if (score >= 60) status = 'valid';
+  else if (score >= 25) status = 'suspect';
+  else status = 'fraudulent';
+  return { score, status };
+}
+
+// ---------- Rapport de progression d'écoute — appelé par le lecteur quand le morceau se
+// termine naturellement, quand l'auditeur passe au suivant, ou quand il quitte la page. Ne
+// change JAMAIS le comptage du stream déjà effectué au lancement de la lecture (voir POST
+// /api/tracks/:id/play) — seulement le signal de confiance associé à cette écoute précise. ----------
+app.post('/api/tracks/:id/play-progress', authMiddleware, h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const { durationPlayedSeconds, trackDurationSeconds } = req.body;
+  if (durationPlayedSeconds == null || !Number.isFinite(Number(durationPlayedSeconds))) {
+    return res.status(400).json({ error: 'durationPlayedSeconds requis.' });
+  }
+  const { score, status } = computePlayConfidence(durationPlayedSeconds, trackDurationSeconds);
+  const updated = await db.run(
+    `UPDATE plays SET duration_played_seconds = $3, track_duration_seconds = $4, confidence_score = $5, validation_status = $6
+     WHERE track_id = $1 AND listener_id = $2`,
+    [trackId, req.user.id, Math.round(Number(durationPlayedSeconds)), trackDurationSeconds ? Math.round(Number(trackDurationSeconds)) : null, score, status],
+  );
+  if (!updated.rowCount) return res.status(404).json({ error: 'Écoute introuvable pour ce morceau.' });
+
+  // Un seul skip précoce ne veut rien dire (mauvais morceau, appel téléphonique...) — seul un
+  // PATTERN répété de complétions très faibles sur beaucoup de morceaux différents dans la
+  // même journée mérite un signalement pour revue humaine.
+  if (status === 'fraudulent') {
+    const recentLowCompletion = await db.get(
+      `SELECT COUNT(DISTINCT track_id)::int AS n FROM plays
+       WHERE listener_id = $1 AND validation_status = 'fraudulent' AND created_at >= NOW() - INTERVAL '24 hours'`,
+      [req.user.id],
+    );
+    if (recentLowCompletion && recentLowCompletion.n >= FRAUD_LOW_COMPLETION_COUNT_THRESHOLD) {
+      await openFraudFlag('user', req.user.id, 'repeated_low_completion', 'medium', {
+        distinct_tracks_low_completion_24h: recentLowCompletion.n,
+      });
+    }
+  }
+  res.json({ recorded: true, confidenceScore: score, validationStatus: status });
+}));
 
 // ---------- Revue anti-fraude (admin) ----------
 // Liste des signalements en attente, du plus récent au plus ancien. Ne renvoie jamais

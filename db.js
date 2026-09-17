@@ -1058,6 +1058,25 @@ async function initSchema() {
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id);`);
   await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_tracks_review_status ON tracks(review_status) WHERE review_status = 'pending';`);
+
+  // ============================================================
+  // SCORE DE CONFIANCE PAR ÉCOUTE — étend le module anti-fraude existant (plays.ip_address/
+  // device_fingerprint, users.trust_score, fraud_flags) avec un signal supplémentaire : la
+  // durée RÉELLEMENT écoutée, rapportée par le lecteur après coup (voir POST
+  // /api/tracks/:id/play-progress). STRICTEMENT ADDITIF :
+  //   - le comptage du stream lui-même (tracks.streams, la ligne dans plays) ne change pas,
+  //     ne se fait toujours qu'une fois par (morceau, auditeur) à vie, exactement comme avant
+  //   - validation_status est un signal pour la revue humaine (comme fraud_flags), jamais un
+  //     retrait automatique d'argent déjà compté — cohérent avec le reste du module anti-fraude
+  // ============================================================
+  await pool.query(`ALTER TABLE plays ADD COLUMN IF NOT EXISTS duration_played_seconds INTEGER;`);
+  await pool.query(`ALTER TABLE plays ADD COLUMN IF NOT EXISTS track_duration_seconds INTEGER;`);
+  await pool.query(`ALTER TABLE plays ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(5,2);`);
+  await pool.query(`
+    ALTER TABLE plays ADD COLUMN IF NOT EXISTS validation_status TEXT
+      CHECK (validation_status IN ('valid','suspect','fraudulent'));
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_plays_validation_status ON plays(validation_status) WHERE validation_status IN ('suspect','fraudulent');`);
 }
 
 module.exports = { pool, query, get, run, initSchema };
