@@ -1077,6 +1077,17 @@ async function initSchema() {
       CHECK (validation_status IN ('valid','suspect','fraudulent'));
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_plays_validation_status ON plays(validation_status) WHERE validation_status IN ('suspect','fraudulent');`);
+
+  // ============================================================
+  // DÉTECTION DE FERMES DE COMPTES — signal pris à l'INSCRIPTION, pas seulement à l'écoute
+  // (voir flagSuspiciousPlayPatterns, qui ne se déclenche qu'une fois que les comptes ont déjà
+  // commencé à streamer). Beaucoup de comptes créés depuis le même appareil/la même IP en peu
+  // de temps est un signal plus précoce et plus net qu'attendre qu'ils écoutent.
+  // ============================================================
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_ip TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_device_fingerprint TEXT;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_signup_ip ON users(signup_ip);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_signup_device ON users(signup_device_fingerprint);`);
 }
 
 module.exports = { pool, query, get, run, initSchema };

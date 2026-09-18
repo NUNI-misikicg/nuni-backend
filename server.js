@@ -400,6 +400,12 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
     labelDescription, socialLinks, responsibleName, responsibleIdDocUrl, labelDocUrl, labelPlan,
   } = req.body;
 
+  // Capturés uniquement à des fins anti-fraude (détection de fermes de comptes créés en masse
+  // depuis un même appareil/une même IP, voir flagMassAccountCreation plus bas) — jamais
+  // utilisés pour identifier la personne elle-même.
+  const signupIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null;
+  const signupDeviceFingerprint = (req.headers['x-device-id'] || '').trim() || null;
+
   if (!['consumer', 'artist', 'label'].includes(accountType)) {
     return res.status(400).json({ error: 'Type de compte invalide (consumer, artist ou label).' });
   }
@@ -425,10 +431,11 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
     // page des tarifs pour tout compte dont subscription_status n'est pas 'active' ET dont
     // plan est 'discovery', ce qui décrivait alors n'importe quel compte Label par erreur).
     const insertedUser = await db.get(`
-      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country, plan)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'label')
+      INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, address, city, country, plan, signup_ip, signup_device_fingerprint)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'label',$10,$11)
       RETURNING id
-    `, [accountType, firstName, lastName, email, phone || null, password_hash, address, city, country]);
+    `, [accountType, firstName, lastName, email, phone || null, password_hash, address, city, country, signupIp, signupDeviceFingerprint]);
+    flagMassAccountCreation(signupIp, signupDeviceFingerprint, insertedUser.id).catch(() => {});
     const validPlan = ['start', 'pro', 'premium', 'elite'].includes(labelPlan) ? labelPlan : 'start';
     // Fichiers reçus en base64 (aucun jeton disponible avant que le compte existe, donc pas
     // d'upload direct signé possible) — le serveur les envoie lui-même à Cloudinary.
@@ -480,14 +487,16 @@ app.post('/api/register', rateLimit(10, 60 * 60000), h(async (req, res) => {
 
   const password_hash = await hashPassword(password);
   const inserted = await db.get(`
-    INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, age, address, city, country, artist_name, label_or_manager, email_verified)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE)
+    INSERT INTO users (account_type, first_name, last_name, email, phone, password_hash, age, address, city, country, artist_name, label_or_manager, email_verified, signup_ip, signup_device_fingerprint)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,$13,$14)
     RETURNING id
   `, [
     accountType, firstName, lastName, email, phone || null, password_hash, Number(age), address, city, country,
     accountType === 'artist' ? artistName : null,
     accountType === 'artist' ? (labelOrManager || null) : null,
+    signupIp, signupDeviceFingerprint,
   ]);
+  flagMassAccountCreation(signupIp, signupDeviceFingerprint, inserted.id).catch(() => {});
 
   const user = await db.get('SELECT * FROM users WHERE id = $1', [inserted.id]);
   issueEmailVerification(user).catch((e) => console.error('[register] échec envoi vérification email :', e.message));
@@ -2655,6 +2664,8 @@ const FRAUD_DEVICE_ACCOUNTS_THRESHOLD = 5;   // comptes distincts depuis un mêm
 const FRAUD_IP_ACCOUNTS_THRESHOLD = 8;       // comptes distincts depuis une même IP, sur 24h
 const FRAUD_TRUST_SCORE_PENALTY = 15;
 const FRAUD_LOW_COMPLETION_COUNT_THRESHOLD = 10; // écoutes 'fraudulent' distinctes/24h avant signalement
+const FRAUD_SIGNUP_DEVICE_THRESHOLD = 4;     // nouveaux COMPTES créés depuis un même appareil, sur 24h
+const FRAUD_SIGNUP_IP_THRESHOLD = 6;         // nouveaux comptes créés depuis une même IP, sur 24h
 
 async function openFraudFlag(subjectType, subjectId, reason, severity, detail) {
   const inserted = await db.run(
@@ -2696,6 +2707,38 @@ async function flagSuspiciousPlayPatterns(deviceFingerprint, ipAddress, listener
     if (row && row.n >= FRAUD_IP_ACCOUNTS_THRESHOLD) {
       await openFraudFlag('user', listenerId, 'multi_account_same_ip', 'medium', {
         ip_address: ipAddress, distinct_accounts_24h: row.n,
+      });
+    }
+  }
+}
+
+// ---------- Fermes de comptes — signal pris dès l'INSCRIPTION (voir users.signup_ip/
+// signup_device_fingerprint), plus précoce que d'attendre que les comptes se mettent à
+// streamer. Un signalement ici est ouvert sur le compte VENANT d'être créé — jamais sur les
+// comptes précédents du même groupe (déjà signalés individuellement à leur propre création
+// si le seuil était atteint à ce moment-là). ----------
+async function flagMassAccountCreation(signupIp, signupDeviceFingerprint, newUserId) {
+  if (signupDeviceFingerprint) {
+    const row = await db.get(
+      `SELECT COUNT(*)::int AS n FROM users
+       WHERE signup_device_fingerprint = $1 AND created_at >= NOW() - INTERVAL '24 hours'`,
+      [signupDeviceFingerprint],
+    );
+    if (row && row.n >= FRAUD_SIGNUP_DEVICE_THRESHOLD) {
+      await openFraudFlag('user', newUserId, 'mass_signup_same_device', 'high', {
+        device_fingerprint: signupDeviceFingerprint, accounts_created_24h: row.n,
+      });
+    }
+  }
+  if (signupIp) {
+    const row = await db.get(
+      `SELECT COUNT(*)::int AS n FROM users
+       WHERE signup_ip = $1 AND created_at >= NOW() - INTERVAL '24 hours'`,
+      [signupIp],
+    );
+    if (row && row.n >= FRAUD_SIGNUP_IP_THRESHOLD) {
+      await openFraudFlag('user', newUserId, 'mass_signup_same_ip', 'medium', {
+        ip_address: signupIp, accounts_created_24h: row.n,
       });
     }
   }
@@ -2755,6 +2798,33 @@ app.post('/api/tracks/:id/play-progress', authMiddleware, h(async (req, res) => 
     }
   }
   res.json({ recorded: true, confidenceScore: score, validationStatus: status });
+}));
+
+// ---------- Vue d'ensemble anti-fraude (admin) — compteurs globaux + répartition par pays.
+// Toutes les valeurs viennent de compteurs déjà tenus ailleurs (plays.validation_status,
+// fraud_flags, users.country déclaré) — rien n'est recalculé différemment ici. ----------
+app.get('/api/admin/fraud/overview', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const [byStatus, flagCounts, byCountry] = await Promise.all([
+    db.query(`
+      SELECT COALESCE(validation_status, 'non_rapporté') AS status, COUNT(*)::int AS n
+      FROM plays WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY validation_status
+    `),
+    db.query(`SELECT status, COUNT(*)::int AS n FROM fraud_flags GROUP BY status`),
+    db.query(`
+      SELECT u.country,
+        COUNT(*) FILTER (WHERE p.validation_status = 'valid')::int AS valid,
+        COUNT(*) FILTER (WHERE p.validation_status = 'suspect')::int AS suspect,
+        COUNT(*) FILTER (WHERE p.validation_status = 'fraudulent')::int AS fraudulent,
+        COUNT(*)::int AS total
+      FROM plays p JOIN users u ON u.id = p.listener_id
+      WHERE p.created_at >= NOW() - INTERVAL '30 days' AND u.country IS NOT NULL AND u.country != ''
+      GROUP BY u.country ORDER BY total DESC LIMIT 15
+    `),
+  ]);
+  const accountsBlocked = (await db.get("SELECT COUNT(*)::int AS n FROM users WHERE account_status = 'suspended'")).n;
+  res.json({ byStatus, flagCounts, byCountry, accountsBlocked });
 }));
 
 // ---------- Revue anti-fraude (admin) ----------

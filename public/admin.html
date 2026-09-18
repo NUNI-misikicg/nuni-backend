@@ -449,6 +449,15 @@
 
   <div class="pane" id="pane-fraud">
     <div class="card">
+      <b style="color:#D4AF6A; font-size:13px;">🛡️ Anti-fraude — vue d'ensemble (30 derniers jours)</b>
+      <div class="muted" style="margin-top:4px;">
+        Compteurs réels — aucune valeur estimée. "Non rapporté" = écoutes pour lesquelles le lecteur n'a pas
+        encore renvoyé de durée réelle (voir score de confiance par écoute).
+      </div>
+      <button class="primary" style="margin-top:12px;" onclick="loadFraudOverview()">Charger la vue d'ensemble</button>
+      <div id="fraud-overview-content" style="margin-top:14px;"></div>
+    </div>
+    <div class="card" style="margin-top:16px;">
       <b style="color:#D4AF6A; font-size:13px;">🛡️ Anti-fraude — signalements en attente</b>
       <div class="muted" style="margin-top:4px;">
         Un signalement ne bloque jamais un compte automatiquement — il diminue seulement son score de confiance
@@ -1886,8 +1895,42 @@
   const fraudReasonLabels = {
     multi_account_same_device: 'Plusieurs comptes depuis le même appareil',
     multi_account_same_ip: 'Plusieurs comptes depuis la même IP',
+    mass_signup_same_device: 'Inscriptions en masse depuis le même appareil',
+    mass_signup_same_ip: 'Inscriptions en masse depuis la même IP',
+    repeated_low_completion: 'Écoutes à très faible complétion répétées',
   };
   let fraudResolveTarget = null;
+
+  // ---------- Vue d'ensemble anti-fraude (compteurs + répartition par pays) ----------
+  const playStatusLabels = { valid: '✅ Valides', suspect: '🟡 Suspectes', fraudulent: '🔴 Frauduleuses', non_rapporté: '⚪ Non rapportées' };
+  async function loadFraudOverview(){
+    const el = document.getElementById('fraud-overview-content');
+    el.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/fraud/overview', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ el.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      const statusCounts = {}; (data.byStatus||[]).forEach(s=>{ statusCounts[s.status] = s.n; });
+      const flagCounts = {}; (data.flagCounts||[]).forEach(f=>{ flagCounts[f.status] = f.n; });
+      let html = '<div style="display:flex; flex-wrap:wrap; gap:16px; margin-bottom:16px;">';
+      Object.keys(playStatusLabels).forEach(k=>{
+        html += `<div><div class="muted" style="font-size:11px;">${playStatusLabels[k]}</div><div style="font-size:20px; font-weight:700;">${(statusCounts[k]||0).toLocaleString('fr-FR')}</div></div>`;
+      });
+      html += `<div><div class="muted" style="font-size:11px;">🚩 Signalements ouverts</div><div style="font-size:20px; font-weight:700; color:#ff9a9d;">${(flagCounts.open||0).toLocaleString('fr-FR')}</div></div>`;
+      html += `<div><div class="muted" style="font-size:11px;">🔒 Comptes suspendus</div><div style="font-size:20px; font-weight:700;">${(data.accountsBlocked||0).toLocaleString('fr-FR')}</div></div>`;
+      html += '</div>';
+      if((data.byCountry||[]).length){
+        html += '<table><tr><th>Pays</th><th>Valides</th><th>Suspectes</th><th>Frauduleuses</th><th>Total</th></tr>';
+        data.byCountry.forEach(c=>{
+          html += `<tr><td>${esc(c.country)}</td><td>${c.valid}</td><td style="color:#e8c77e;">${c.suspect}</td><td style="color:#ff9a9d;">${c.fraudulent}</td><td>${c.total}</td></tr>`;
+        });
+        html += '</table>';
+      } else {
+        html += '<p class="muted">Pas encore assez de pays déclarés pour une répartition.</p>';
+      }
+      el.innerHTML = html;
+    }catch(e){ el.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
 
   async function loadFraudFlags(){
     const wrap = document.getElementById('fraud-flags-list');
