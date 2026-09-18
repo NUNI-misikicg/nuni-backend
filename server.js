@@ -3236,11 +3236,15 @@ app.get('/api/artist/:id/scheduled-releases', h(async (req, res) => {
 // sur un mauvais identifiant. Ici, req.user.id vient directement du token de connexion.
 app.get('/api/artist/scheduled-releases', authMiddleware, h(async (req, res) => {
   if (req.user.accountType !== 'artist') return res.status(403).json({ error: 'Réservé aux comptes Artiste.' });
+  // Élargi pour inclure aussi les morceaux bloqués en attente de validation par le Label
+  // (review_status), pas seulement ceux avec une date de sortie programmée — sinon un artiste
+  // dont le morceau est refusé/en attente n'avait aucun moyen de le voir dans son dashboard.
   const rows = await db.query(`
-    SELECT id, title, release_type, scheduled_release_at
+    SELECT id, title, release_type, scheduled_release_at, review_status, review_note
     FROM tracks
-    WHERE artist_id = $1 AND published = 0 AND scheduled_release_at IS NOT NULL
-    ORDER BY scheduled_release_at ASC
+    WHERE artist_id = $1 AND published = 0
+      AND (scheduled_release_at IS NOT NULL OR review_status IN ('pending','changes_requested'))
+    ORDER BY scheduled_release_at ASC NULLS LAST, created_at DESC
     LIMIT 20
   `, [req.user.id]);
   res.json({ releases: rows });
