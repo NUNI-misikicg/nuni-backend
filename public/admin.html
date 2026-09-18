@@ -458,6 +458,17 @@
       <div id="fraud-overview-content" style="margin-top:14px;"></div>
     </div>
     <div class="card" style="margin-top:16px;">
+      <b style="color:#D4AF6A; font-size:13px;">🛡️ Playlists suspectes</b>
+      <div class="muted" style="margin-top:4px;">
+        NUNI ne rattache pas (encore) une écoute à la playlist d'où elle vient — impossible donc de détecter un
+        vrai "pic de streams via une playlist". Ce qui suit reste honnête sur cette limite : une croissance du
+        nombre de titres largement plus rapide qu'un usage humain normal, et les playlists de comptes déjà à
+        faible score de confiance.
+      </div>
+      <button class="primary" style="margin-top:12px;" onclick="loadSuspiciousPlaylists()">Charger</button>
+      <div id="suspicious-playlists-content" style="margin-top:14px;"></div>
+    </div>
+    <div class="card" style="margin-top:16px;">
       <b style="color:#D4AF6A; font-size:13px;">🛡️ Anti-fraude — signalements en attente</b>
       <div class="muted" style="margin-top:4px;">
         Un signalement ne bloque jamais un compte automatiquement — il diminue seulement son score de confiance
@@ -1900,6 +1911,36 @@
     repeated_low_completion: 'Écoutes à très faible complétion répétées',
   };
   let fraudResolveTarget = null;
+
+  // ---------- Playlists suspectes ----------
+  async function loadSuspiciousPlaylists(){
+    const el = document.getElementById('suspicious-playlists-content');
+    el.innerHTML = 'Chargement…';
+    try{
+      const res = await fetch('/api/admin/fraud/suspicious-playlists', { headers:{'x-admin-key':getKey()} });
+      const data = await res.json();
+      if(!res.ok){ el.innerHTML = '<span class="urgent">❌ ' + (data.error||'Erreur.') + '</span>'; return; }
+      let html = '';
+      if((data.rapidGrowth||[]).length){
+        html += '<b style="font-size:12px;">Croissance anormalement rapide</b><table><tr><th>Playlist</th><th>Propriétaire</th><th>Titres ajoutés</th><th>En combien de temps</th></tr>';
+        data.rapidGrowth.forEach(p=>{
+          const seconds = Math.max(1, (new Date(p.window_end) - new Date(p.window_start))/1000);
+          html += `<tr><td>${esc(p.title)}</td><td>${esc(p.owner_email)}</td><td>${p.tracks_in_window}</td><td>${Math.round(seconds)}s</td></tr>`;
+        });
+        html += '</table>';
+      } else {
+        html += '<p class="muted">Aucune croissance anormale détectée sur les 30 derniers jours.</p>';
+      }
+      if((data.lowTrustOwners||[]).length){
+        html += '<b style="font-size:12px; display:block; margin-top:14px;">Playlists de comptes à faible score de confiance</b><table><tr><th>Playlist</th><th>Propriétaire</th><th>Score de confiance</th><th>Titres</th></tr>';
+        data.lowTrustOwners.forEach(p=>{
+          html += `<tr><td>${esc(p.title)}</td><td>${esc(p.owner_email)}</td><td>${Number(p.trust_score).toFixed(0)}/100</td><td>${p.track_count}</td></tr>`;
+        });
+        html += '</table>';
+      }
+      el.innerHTML = html;
+    }catch(e){ el.innerHTML = '<span class="urgent">❌ Impossible de contacter le serveur.</span>'; }
+  }
 
   // ---------- Vue d'ensemble anti-fraude (compteurs + répartition par pays) ----------
   const playStatusLabels = { valid: '✅ Valides', suspect: '🟡 Suspectes', fraudulent: '🔴 Frauduleuses', non_rapporté: '⚪ Non rapportées' };

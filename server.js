@@ -2827,6 +2827,40 @@ app.get('/api/admin/fraud/overview', h(async (req, res) => {
   res.json({ byStatus, flagCounts, byCountry, accountsBlocked });
 }));
 
+// ---------- Playlists suspectes — signal honnête compte tenu de ce que NUNI peut vraiment
+// mesurer : aucune écoute n'est aujourd'hui rattachée à la playlist d'où elle vient (le
+// schéma ne garde pas ce lien), donc impossible de détecter un "pic de streams via une
+// playlist" au sens strict. Ce qui EST mesurable et reste un vrai signal : une croissance du
+// nombre de titres largement plus rapide qu'un usage humain normal ("20 titres ajoutés en
+// moins de 5 minutes" = plus vraisemblablement un script qu'une personne qui construit sa
+// playlist), et les playlists appartenant à un compte déjà à faible score de confiance.
+// Calculé à la demande (pas de tâche de fond) — reste simple, honnête sur ses limites. ----------
+app.get('/api/admin/fraud/suspicious-playlists', h(async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+  const rapidGrowth = await db.query(`
+    SELECT up.id, up.title, u.email AS owner_email, u.trust_score,
+      COUNT(upt.id)::int AS tracks_in_window, MIN(upt.added_at) AS window_start, MAX(upt.added_at) AS window_end
+    FROM user_playlists up
+    JOIN user_playlist_tracks upt ON upt.playlist_id = up.id
+    JOIN users u ON u.id = up.user_id
+    WHERE upt.added_at >= NOW() - INTERVAL '30 days'
+    GROUP BY up.id, up.title, u.email, u.trust_score
+    HAVING COUNT(upt.id) >= 20 AND MAX(upt.added_at) - MIN(upt.added_at) < INTERVAL '5 minutes'
+    ORDER BY tracks_in_window DESC LIMIT 30
+  `);
+  const lowTrustOwners = await db.query(`
+    SELECT up.id, up.title, u.email AS owner_email, u.trust_score, COUNT(upt.id)::int AS track_count
+    FROM user_playlists up
+    JOIN user_playlist_tracks upt ON upt.playlist_id = up.id
+    JOIN users u ON u.id = up.user_id
+    WHERE u.trust_score < 50
+    GROUP BY up.id, up.title, u.email, u.trust_score
+    HAVING COUNT(upt.id) >= 5
+    ORDER BY u.trust_score ASC LIMIT 30
+  `);
+  res.json({ rapidGrowth, lowTrustOwners });
+}));
+
 // ---------- Revue anti-fraude (admin) ----------
 // Liste des signalements en attente, du plus récent au plus ancien. Ne renvoie jamais
 // l'IP/l'appareil bruts dans une réponse publique — cette route est protégée par la clé admin.
