@@ -4199,6 +4199,32 @@ app.get('/api/tracks/:id/similar', h(async (req, res) => {
   res.json({ tracks: picks });
 }));
 
+// ---------- "Les gens qui écoutent ça écoutent aussi" — vraie co-écoute calculée depuis
+// l'historique réel (plays), pas un genre ou une ambiance partagée (voir /similar juste
+// au-dessus, qui sert un but différent : l'autoplay quand rien d'autre n'est disponible).
+// Règle simple : parmi les auditeurs qui ont écouté ce morceau, quels AUTRES morceaux
+// reviennent le plus souvent dans leur propre historique. Exige au moins 3 auditeurs communs
+// pour un morceau candidat, afin de ne jamais faire une recommandation sur un échantillon d'UNE
+// seule personne (pas un vrai signal, juste du bruit statistique).
+app.get('/api/tracks/:id/also-listened', h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const limit = Math.min(10, Number(req.query.limit) || 5);
+  const rows = await db.query(`
+    SELECT t.id, t.title, t.genre, t.streams, t.cover_url, t.audio_url, t.release_type,
+           u.artist_name, u.first_name, u.id AS artist_id, u.is_verified,
+           COUNT(DISTINCT p2.listener_id)::int AS co_listeners
+    FROM plays p1
+    JOIN plays p2 ON p2.listener_id = p1.listener_id AND p2.track_id != p1.track_id
+    JOIN tracks t ON t.id = p2.track_id AND t.published = 1
+    JOIN users u ON u.id = t.artist_id
+    WHERE p1.track_id = $1
+    GROUP BY t.id, t.title, t.genre, t.streams, t.cover_url, t.audio_url, t.release_type, u.artist_name, u.first_name, u.id, u.is_verified
+    HAVING COUNT(DISTINCT p2.listener_id) >= 3
+    ORDER BY co_listeners DESC LIMIT $2
+  `, [trackId, limit]);
+  res.json({ tracks: rows });
+}));
+
 // ---------- "En ce moment" — vrais nouveaux auditeurs uniques du jour, par morceau. NUNI ne
 // garde qu'une ligne par (morceau, auditeur) au tout premier passage (plays), donc aucune
 // notion réelle d'écoute "en direct" n'existe — ceci reste honnête : "X personnes ont
