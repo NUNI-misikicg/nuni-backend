@@ -2279,6 +2279,21 @@ app.get('/api/me/following', authMiddleware, h(async (req, res) => {
   res.json({ following: rows });
 }));
 
+// ---------- Genre le plus écouté — utilisé pour personnaliser "Extraits populaires" (voir
+// app.js, renderSearchViewBrowse). Règle simple, pas de ML : le genre qui revient le plus
+// souvent dans les vrais morceaux déjà écoutés. Retourne null si pas assez d'historique pour
+// que ce soit un vrai signal (moins de 3 écoutes dans un même genre) — jamais un genre
+// inventé faute de données. ----------
+app.get('/api/me/top-genre', authMiddleware, h(async (req, res) => {
+  const row = await db.get(`
+    SELECT t.genre, COUNT(*)::int AS n
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE p.listener_id = $1 AND t.genre IS NOT NULL
+    GROUP BY t.genre ORDER BY n DESC LIMIT 1
+  `, [req.user.id]);
+  res.json({ genre: row && row.n >= 3 ? row.genre : null });
+}));
+
 app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   const user = await db.get('SELECT id, xp, streak_days, created_at FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
