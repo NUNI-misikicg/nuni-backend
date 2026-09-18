@@ -4153,6 +4153,52 @@ app.get('/api/moods/:key/tracks', h(async (req, res) => {
   res.json({ label: mood.label, tracks: rows });
 }));
 
+// ---------- Morceaux similaires — pour l'autoplay "NUNI Radio" en fin de lecture (voir
+// nextTrack() dans app.js). Règles simples, pas de Machine Learning : même genre en priorité
+// (signal le plus fort), puis morceaux partageant au moins une ambiance en commun, puis
+// complété par les tendances globales — jamais un vrai silence en fin de morceau. Documenté
+// honnêtement comme des règles, pas une "IA qui comprend le son".
+app.get('/api/tracks/:id/similar', h(async (req, res) => {
+  const trackId = Number(req.params.id);
+  const track = await db.get('SELECT id, genre FROM tracks WHERE id = $1', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Morceau introuvable.' });
+  const limit = Math.min(10, Number(req.query.limit) || 5);
+
+  const sameGenre = track.genre ? await db.query(`
+    SELECT t.id, t.title, t.genre, t.streams, t.cover_url, t.audio_url, t.release_type,
+           u.artist_name, u.first_name, u.id AS artist_id, u.is_verified
+    FROM tracks t JOIN users u ON u.id = t.artist_id
+    WHERE t.published = 1 AND t.genre = $1 AND t.id != $2
+    ORDER BY t.streams DESC LIMIT $3
+  `, [track.genre, trackId, limit]) : [];
+
+  let picks = sameGenre;
+  if (picks.length < limit) {
+    const sharedMood = await db.query(`
+      SELECT DISTINCT t.id, t.title, t.genre, t.streams, t.cover_url, t.audio_url, t.release_type,
+             u.artist_name, u.first_name, u.id AS artist_id, u.is_verified
+      FROM track_moods tm1
+      JOIN track_moods tm2 ON tm2.mood_id = tm1.mood_id AND tm2.track_id != tm1.track_id
+      JOIN tracks t ON t.id = tm2.track_id AND t.published = 1
+      JOIN users u ON u.id = t.artist_id
+      WHERE tm1.track_id = $1 AND t.id != ALL($2::int[])
+      ORDER BY t.streams DESC LIMIT $3
+    `, [trackId, [trackId, ...picks.map((p) => p.id)], limit - picks.length]);
+    picks = picks.concat(sharedMood);
+  }
+  if (picks.length < limit) {
+    const fallback = await db.query(`
+      SELECT t.id, t.title, t.genre, t.streams, t.cover_url, t.audio_url, t.release_type,
+             u.artist_name, u.first_name, u.id AS artist_id, u.is_verified
+      FROM tracks t JOIN users u ON u.id = t.artist_id
+      WHERE t.published = 1 AND t.id != ALL($1::int[])
+      ORDER BY t.streams DESC LIMIT $2
+    `, [[trackId, ...picks.map((p) => p.id)], limit - picks.length]);
+    picks = picks.concat(fallback);
+  }
+  res.json({ tracks: picks });
+}));
+
 // ---------- "En ce moment" — vrais nouveaux auditeurs uniques du jour, par morceau. NUNI ne
 // garde qu'une ligne par (morceau, auditeur) au tout premier passage (plays), donc aucune
 // notion réelle d'écoute "en direct" n'existe — ceci reste honnête : "X personnes ont
