@@ -2303,6 +2303,22 @@ app.get('/api/me/top-genre', authMiddleware, h(async (req, res) => {
   res.json({ genre: row && row.n >= 3 ? row.genre : null });
 }));
 
+// ---------- Profil musical — répartition réelle par genre de l'historique d'écoute. Sert à la
+// fois l'affichage "Votre profil musical" (Bibliothèque) et la station radio personnalisée
+// "NUNI Pour vous" (voir app.js). Jamais un profil inventé quand il n'y a pas assez d'écoutes.
+app.get('/api/me/music-profile', authMiddleware, h(async (req, res) => {
+  const rows = await db.query(`
+    SELECT t.genre, COUNT(*)::int AS n
+    FROM plays p JOIN tracks t ON t.id = p.track_id
+    WHERE p.listener_id = $1 AND t.genre IS NOT NULL
+    GROUP BY t.genre ORDER BY n DESC
+  `, [req.user.id]);
+  const totalPlays = rows.reduce((s, r) => s + r.n, 0);
+  const genres = rows.map((r) => ({ genre: r.genre, count: r.n, pct: totalPlays ? Math.round((r.n / totalPlays) * 100) : 0 }));
+  const followingCount = (await db.get('SELECT COUNT(*)::int AS n FROM follows WHERE follower_id = $1', [req.user.id])).n;
+  res.json({ genres, totalPlays, followingCount, hasEnoughData: totalPlays >= 5 });
+}));
+
 app.get('/api/me/progress', authMiddleware, h(async (req, res) => {
   const user = await db.get('SELECT id, xp, streak_days, created_at FROM users WHERE id = $1', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
