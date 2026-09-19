@@ -3342,7 +3342,7 @@ app.delete('/api/releases/:trackId/notify-me', authMiddleware, h(async (req, res
 app.get('/api/artist/:id/scheduled-releases', h(async (req, res) => {
   const artistId = Number(req.params.id);
   const rows = await db.query(`
-    SELECT title, release_type, scheduled_release_at
+    SELECT id, title, release_type, scheduled_release_at, featuring, cover_url
     FROM tracks
     WHERE artist_id = $1 AND published = 0 AND scheduled_release_at IS NOT NULL AND scheduled_release_at > NOW()
     ORDER BY scheduled_release_at ASC
