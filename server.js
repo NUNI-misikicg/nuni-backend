@@ -1999,6 +1999,11 @@ app.post('/api/me/contracts/:id/sign', authMiddleware, rateLimit(5, 10 * 60000),
     "UPDATE label_artists SET status = 'active' WHERE label_id = $1 AND artist_id = $2 AND status = 'invited'",
     [contract.label_id, contract.artist_id],
   );
+  // Activité en temps réel côté Label — "Nouveau contrat signé", exactement comme les autres
+  // notifications déjà en place pour les sorties/paiements (même mécanisme, aucun doublon).
+  db.get('SELECT user_id FROM labels WHERE id = $1', [contract.label_id]).then((row) => {
+    if (row) createNotification(row.user_id, 'label_contract_signed', 'Contrat signé', `Un artiste a signé le contrat que vous lui avez envoyé.`, null).catch(() => {});
+  }).catch(() => {});
   res.json({ message: 'Contrat signé — il est maintenant en vigueur.', documentHash: hash });
 }));
 
@@ -3465,6 +3470,14 @@ app.post('/api/tracks', authMiddleware, h(async (req, res) => {
     composer || null, featuring || null, studio || null, description || null, releaseDate || null, credits || null,
     reviewStatus,
   ]);
+  // Activité en temps réel côté Label — "Validation en attente", envoyée uniquement quand ce
+  // morceau nécessite vraiment une décision du Label (jamais pour les artistes indépendants
+  // ou signés dont le Label n'exige pas cette étape).
+  if (approvalLabel) {
+    db.get('SELECT user_id FROM labels WHERE id = $1', [approvalLabel.label_id]).then((row) => {
+      if (row) createNotification(row.user_id, 'label_review_pending', 'Validation en attente', `« ${title} » attend votre validation avant publication.`, null).catch(() => {});
+    }).catch(() => {});
+  }
   // Ambiances — entièrement optionnel, ne bloque jamais la publication si absent ou si une
   // clé envoyée ne correspond à aucune ambiance réelle du vocabulaire NUNI.
   if (Array.isArray(moodKeys) && moodKeys.length) {
